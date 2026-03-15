@@ -6,7 +6,7 @@ import pandas as pd
 import time, os
 from datetime import datetime, timedelta
 
-app = FastAPI(title=“DhanScreen API”, version=“1.0”)
+app = FastAPI(title="DhanScreen API", version="1.0")
 
 app.add_middleware(
 CORSMiddleware,
