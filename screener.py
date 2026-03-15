@@ -25,8 +25,9 @@ cache = {
     "status": "idle",
     "count": 0,
     "errors": [],
-    "progress": 0,        # NEW: track % done during fetch
+    "progress": 0,
     "total": 0,
+    "symbol_source": "none",   # "csv" or "seed" — helps debug
 }
 
 CREDS = {
@@ -35,11 +36,11 @@ CREDS = {
 }
 
 SYMBOLS = []
-_screener_lock = threading.Lock()   # prevent overlapping runs
+_screener_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
-# SEED LIST — 185 NSE FNO stocks (fallback if master CSV unreachable)
+# SEED LIST — 185 NSE FNO stocks
 # ---------------------------------------------------------------------------
 SEED_SYMBOLS = [
     {"symbol": "ABBOTINDIA",  "security_id": "788",   "exchange": "NSE"},
@@ -244,36 +245,62 @@ SEED_SYMBOLS = [
 
 
 # ---------------------------------------------------------------------------
-# Fetch FNO symbols from Dhan master CSV
+# Fetch FNO symbols — always guaranteed to return something
 # ---------------------------------------------------------------------------
 def fetch_fno_symbols():
+    """
+    Try Dhan master CSV first.
+    Always falls back to SEED_SYMBOLS so SYMBOLS is never empty.
+    """
     global SYMBOLS
+
+    # Always pre-load seed so SYMBOLS is never [] even if CSV hangs
+    SYMBOLS = list(SEED_SYMBOLS)
+    cache["symbol_source"] = "seed"
+
     try:
+        print("Fetching Dhan master CSV...")
         resp = requests.get(
             "https://images.dhan.co/api-data/api-scrip-master.csv",
-            timeout=20,
+            timeout=15,
         )
         resp.raise_for_status()
 
         df = pd.read_csv(StringIO(resp.text), low_memory=False)
         df.columns = [c.strip().upper() for c in df.columns]
 
-        seg_col  = next(c for c in df.columns if "EXCH_SEG" in c or "SEGMENT" in c)
-        sym_col  = next(c for c in df.columns if "TRADING_SYMBOL" in c or "SYMBOL_NAME" in c)
-        id_col   = next(c for c in df.columns if "SECURITY_ID" in c or "SCRIP_ID" in c or "SM_SYMBOL_ID" in c)
+        print(f"CSV columns: {list(df.columns)}")   # log so we can debug column names
+
+        seg_col  = next((c for c in df.columns if "EXCH_SEG" in c or "SEGMENT" in c), None)
+        sym_col  = next((c for c in df.columns if "TRADING_SYMBOL" in c or "SYMBOL_NAME" in c), None)
+        id_col   = next((c for c in df.columns if "SECURITY_ID" in c or "SCRIP_ID" in c or "SM_SYMBOL_ID" in c), None)
         inst_col = next((c for c in df.columns if "INSTRUMENT" in c), None)
+
+        if not all([seg_col, sym_col, id_col]):
+            print(f"CSV column mismatch — seg={seg_col} sym={sym_col} id={id_col}. Using seed.")
+            return
 
         eq_df  = df[df[seg_col].str.upper().str.strip() == "NSE_EQ"].copy()
         fno_df = df[df[seg_col].str.upper().str.strip() == "NSE_FNO"].copy()
+
         if inst_col:
             fno_df = fno_df[fno_df[inst_col].str.upper().str.strip() == "FUTSTK"]
 
         fno_syms = set(fno_df[sym_col].str.strip().unique())
-        matched  = eq_df[eq_df[sym_col].str.strip().isin(fno_syms)][
+
+        if not fno_syms:
+            print("No FUTSTK symbols found in CSV. Using seed.")
+            return
+
+        matched = eq_df[eq_df[sym_col].str.strip().isin(fno_syms)][
             [id_col, sym_col]
         ].drop_duplicates(subset=[sym_col])
 
-        SYMBOLS = [
+        if matched.empty:
+            print("No NSE_EQ matches found. Using seed.")
+            return
+
+        csv_symbols = [
             {
                 "symbol":      row[sym_col].strip(),
                 "security_id": str(int(row[id_col])),
@@ -281,15 +308,17 @@ def fetch_fno_symbols():
             }
             for _, row in matched.iterrows()
         ]
+
+        SYMBOLS = csv_symbols
+        cache["symbol_source"] = "csv"
         print(f"Loaded {len(SYMBOLS)} FNO stocks from Dhan master CSV.")
 
     except Exception as e:
-        print(f"Warning: Could not fetch FNO instrument list ({e}). Using seed list.")
-        SYMBOLS = SEED_SYMBOLS
+        print(f"CSV fetch failed ({e}) — using seed list of {len(SYMBOLS)} stocks.")
 
 
 # ---------------------------------------------------------------------------
-# Single stock historical fetch with retry
+# Single stock historical fetch
 # ---------------------------------------------------------------------------
 def get_historical(security_id, access_token, retries=3):
     today     = datetime.today()
@@ -316,13 +345,13 @@ def get_historical(security_id, access_token, retries=3):
             resp = requests.post(url, json=payload, headers=headers, timeout=10)
 
             if resp.status_code == 429:
-                wait = 2 ** (attempt + 1)   # 2s, 4s, 8s
-                print(f"  429 rate limit — sleeping {wait}s")
+                wait = 2 ** (attempt + 1)
+                print(f"  429 — sleeping {wait}s")
                 time.sleep(wait)
                 continue
 
             if resp.status_code in (400, 401, 403):
-                print(f"  HTTP {resp.status_code} for id={security_id}: {resp.text[:80]}")
+                print(f"  HTTP {resp.status_code} id={security_id}: {resp.text[:80]}")
                 return None
 
             resp.raise_for_status()
@@ -345,20 +374,22 @@ def get_historical(security_id, access_token, retries=3):
             print(f"  Timeout id={security_id} attempt {attempt+1}")
             time.sleep(1)
         except requests.exceptions.RequestException as e:
-            print(f"  Error id={security_id}: {e}")
+            print(f"  ReqError id={security_id}: {e}")
             time.sleep(1)
 
     return None
 
 
 # ---------------------------------------------------------------------------
-# Background screener — runs in its own thread, NEVER blocks API responses
+# Background screener worker
 # ---------------------------------------------------------------------------
 def _run_screener(tok):
-    """Internal worker — called in a background thread."""
     global cache
 
+    # FIX: always reload symbols inside the worker so the thread
+    # is guaranteed to see the populated SYMBOLS list
     if not SYMBOLS:
+        print("SYMBOLS empty inside worker — reloading...")
         fetch_fno_symbols()
 
     results = []
@@ -369,7 +400,7 @@ def _run_screener(tok):
     cache["progress"] = 0
     cache["total"]    = total
 
-    print(f"Screener started — {total} stocks")
+    print(f"Screener started — {total} stocks (source: {cache['symbol_source']})")
 
     for i, sym in enumerate(SYMBOLS):
         try:
@@ -403,10 +434,8 @@ def _run_screener(tok):
             print(f"  Error {err}")
             errors.append(err)
 
-        # Update live progress so /api/health shows % done
         cache["progress"] = round((i + 1) / total * 100)
 
-        # Pacing: 0.3s per stock + 1.5s cooldown every 20 stocks
         time.sleep(0.3)
         if (i + 1) % 20 == 0:
             print(f"  {i+1}/{total} done — pausing 1.5s")
@@ -425,11 +454,6 @@ def _run_screener(tok):
 
 
 def fetch_screener(client_id=None, access_token=None):
-    """
-    Public entry point.
-    Spawns a background thread so the HTTP request returns immediately.
-    Uses a lock so only one scan runs at a time.
-    """
     cid = client_id or CREDS["client_id"]
     tok = access_token or CREDS["access_token"]
 
@@ -438,24 +462,22 @@ def fetch_screener(client_id=None, access_token=None):
         print("Screener skipped: no credentials.")
         return
 
-    # Store latest creds
     CREDS["client_id"]    = cid
     CREDS["access_token"] = tok
 
     if _screener_lock.locked():
-        print("Screener already running — skipping duplicate trigger.")
+        print("Screener already running — skipping.")
         return
 
     def _worker():
         with _screener_lock:
             _run_screener(tok)
 
-    t = threading.Thread(target=_worker, daemon=True)
-    t.start()
+    threading.Thread(target=_worker, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
-# Scheduler — refresh every 5 minutes automatically
+# Scheduler
 # ---------------------------------------------------------------------------
 scheduler = BackgroundScheduler()
 scheduler.add_job(fetch_screener, "interval", seconds=300, id="screener")
@@ -463,12 +485,13 @@ scheduler.start()
 
 
 # ---------------------------------------------------------------------------
-# Startup — non-blocking
+# Startup — FIX: fetch symbols synchronously first, THEN start screener thread
 # ---------------------------------------------------------------------------
 @app.on_event("startup")
 async def startup():
-    fetch_fno_symbols()          # fast CSV fetch (~1s)
-    fetch_screener()             # launches background thread, returns immediately
+    fetch_fno_symbols()    # BLOCKING — must complete before screener fires
+    print(f"Symbols loaded: {len(SYMBOLS)} (source: {cache['symbol_source']})")
+    fetch_screener()       # now safe — launches background thread
 
 
 # ---------------------------------------------------------------------------
@@ -485,7 +508,6 @@ def ping_dhan(
     x_client_id: str = Header(None),
     x_access_token: str = Header(None),
 ):
-    """Verify Dhan token is valid before running screener."""
     tok = x_access_token or CREDS["access_token"]
     if not tok:
         return {"connected": False, "error": "No access token provided"}
@@ -507,15 +529,10 @@ def get_screener(
     x_client_id: str = Header(None),
     x_access_token: str = Header(None),
 ):
-    """
-    Returns cached data immediately.
-    If credentials are passed and no scan is running, triggers a fresh background scan.
-    """
     if x_client_id and x_access_token:
         CREDS["client_id"]    = x_client_id
         CREDS["access_token"] = x_access_token
         fetch_screener(x_client_id, x_access_token)
-
     return cache
 
 
@@ -546,17 +563,22 @@ def top(limit: int = 20):
 
 @app.get("/api/symbols")
 def list_symbols():
-    return {"count": len(SYMBOLS), "symbols": SYMBOLS}
+    return {
+        "count":  len(SYMBOLS),
+        "source": cache.get("symbol_source", "unknown"),
+        "symbols": SYMBOLS,
+    }
 
 
 @app.get("/api/health")
 def health():
     return {
-        "status":        "ok",
-        "cache_status":  cache["status"],
-        "last_refresh":  cache["updated_at"],
-        "symbol_count":  len(SYMBOLS),
-        "result_count":  cache["count"],
-        "error_count":   len(cache.get("errors", [])),
-        "progress_pct":  cache.get("progress", 0),   # shows % during active scan
+        "status":         "ok",
+        "cache_status":   cache["status"],
+        "last_refresh":   cache["updated_at"],
+        "symbol_count":   len(SYMBOLS),
+        "symbol_source":  cache.get("symbol_source", "unknown"),
+        "result_count":   cache["count"],
+        "error_count":    len(cache.get("errors", [])),
+        "progress_pct":   cache.get("progress", 0),
     }
