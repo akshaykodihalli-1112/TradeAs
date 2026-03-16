@@ -6,6 +6,7 @@ import pandas as pd
 import threading
 import time, os
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from io import StringIO
 
 app = FastAPI(title="DhanScreen API", version="1.0")
@@ -18,6 +19,7 @@ app.add_middleware(
 )
 
 DHAN_BASE = "https://api.dhan.co"
+IST = ZoneInfo("Asia/Kolkata")
 
 cache = {
     "data": [],
@@ -27,7 +29,8 @@ cache = {
     "errors": [],
     "progress": 0,
     "total": 0,
-    "symbol_source": "none",   # "csv" or "seed" — helps debug
+    "symbol_source": "none",
+    "market_open": False,
 }
 
 CREDS = {
@@ -40,7 +43,25 @@ _screener_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
-# SEED LIST — 185 NSE FNO stocks
+# Market hours helpers (IST)
+# ---------------------------------------------------------------------------
+def is_market_open() -> bool:
+    """Returns True if current IST time is within NSE market hours on a weekday."""
+    now = datetime.now(IST)
+    if now.weekday() >= 5:          # Saturday=5, Sunday=6
+        return False
+    market_start = now.replace(hour=9,  minute=15, second=0, microsecond=0)
+    market_end   = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    return market_start <= now <= market_end
+
+
+def is_market_day() -> bool:
+    """True on weekdays (ignores time)."""
+    return datetime.now(IST).weekday() < 5
+
+
+# ---------------------------------------------------------------------------
+# SEED LIST — 198 NSE FNO stocks
 # ---------------------------------------------------------------------------
 SEED_SYMBOLS = [
     {"symbol": "ABBOTINDIA",  "security_id": "788",   "exchange": "NSE"},
@@ -245,17 +266,11 @@ SEED_SYMBOLS = [
 
 
 # ---------------------------------------------------------------------------
-# Fetch FNO symbols — always guaranteed to return something
+# Fetch FNO symbols from Dhan master CSV
 # ---------------------------------------------------------------------------
 def fetch_fno_symbols():
-    """
-    Try Dhan master CSV first.
-    Always falls back to SEED_SYMBOLS so SYMBOLS is never empty.
-    """
     global SYMBOLS
-
-    # Always pre-load seed so SYMBOLS is never [] even if CSV hangs
-    SYMBOLS = list(SEED_SYMBOLS)
+    SYMBOLS = list(SEED_SYMBOLS)          # always pre-load seed first
     cache["symbol_source"] = "seed"
 
     try:
@@ -268,8 +283,7 @@ def fetch_fno_symbols():
 
         df = pd.read_csv(StringIO(resp.text), low_memory=False)
         df.columns = [c.strip().upper() for c in df.columns]
-
-        print(f"CSV columns: {list(df.columns)}")   # log so we can debug column names
+        print(f"CSV columns: {list(df.columns)}")
 
         seg_col  = next((c for c in df.columns if "EXCH_SEG" in c or "SEGMENT" in c), None)
         sym_col  = next((c for c in df.columns if "TRADING_SYMBOL" in c or "SYMBOL_NAME" in c), None)
@@ -277,19 +291,17 @@ def fetch_fno_symbols():
         inst_col = next((c for c in df.columns if "INSTRUMENT" in c), None)
 
         if not all([seg_col, sym_col, id_col]):
-            print(f"CSV column mismatch — seg={seg_col} sym={sym_col} id={id_col}. Using seed.")
+            print(f"CSV column mismatch — using seed.")
             return
 
         eq_df  = df[df[seg_col].str.upper().str.strip() == "NSE_EQ"].copy()
         fno_df = df[df[seg_col].str.upper().str.strip() == "NSE_FNO"].copy()
-
         if inst_col:
             fno_df = fno_df[fno_df[inst_col].str.upper().str.strip() == "FUTSTK"]
 
         fno_syms = set(fno_df[sym_col].str.strip().unique())
-
         if not fno_syms:
-            print("No FUTSTK symbols found in CSV. Using seed.")
+            print("No FUTSTK symbols in CSV — using seed.")
             return
 
         matched = eq_df[eq_df[sym_col].str.strip().isin(fno_syms)][
@@ -297,10 +309,10 @@ def fetch_fno_symbols():
         ].drop_duplicates(subset=[sym_col])
 
         if matched.empty:
-            print("No NSE_EQ matches found. Using seed.")
+            print("No matches found — using seed.")
             return
 
-        csv_symbols = [
+        SYMBOLS = [
             {
                 "symbol":      row[sym_col].strip(),
                 "security_id": str(int(row[id_col])),
@@ -308,20 +320,29 @@ def fetch_fno_symbols():
             }
             for _, row in matched.iterrows()
         ]
-
-        SYMBOLS = csv_symbols
         cache["symbol_source"] = "csv"
-        print(f"Loaded {len(SYMBOLS)} FNO stocks from Dhan master CSV.")
+        print(f"Loaded {len(SYMBOLS)} FNO stocks from CSV.")
 
     except Exception as e:
-        print(f"CSV fetch failed ({e}) — using seed list of {len(SYMBOLS)} stocks.")
+        print(f"CSV fetch failed ({e}) — using seed ({len(SYMBOLS)} stocks).")
 
 
 # ---------------------------------------------------------------------------
-# Single stock historical fetch
+# Historical data fetch
 # ---------------------------------------------------------------------------
 def get_historical(security_id, access_token, retries=3):
-    today     = datetime.today()
+    today     = datetime.now(IST)
+    # Use last trading day if market is closed
+    if not is_market_open():
+        # go back to last weekday
+        days_back = 1
+        while True:
+            candidate = today - timedelta(days=days_back)
+            if candidate.weekday() < 5:
+                today = candidate
+                break
+            days_back += 1
+
     from_date = (today - timedelta(days=25)).strftime("%Y-%m-%d")
     to_date   = today.strftime("%Y-%m-%d")
 
@@ -386,21 +407,20 @@ def get_historical(security_id, access_token, retries=3):
 def _run_screener(tok):
     global cache
 
-    # FIX: always reload symbols inside the worker so the thread
-    # is guaranteed to see the populated SYMBOLS list
     if not SYMBOLS:
-        print("SYMBOLS empty inside worker — reloading...")
         fetch_fno_symbols()
 
     results = []
     errors  = []
     total   = len(SYMBOLS)
+    now_ist = datetime.now(IST)
 
-    cache["status"]   = "fetching"
-    cache["progress"] = 0
-    cache["total"]    = total
+    cache["status"]      = "fetching"
+    cache["progress"]    = 0
+    cache["total"]       = total
+    cache["market_open"] = is_market_open()
 
-    print(f"Screener started — {total} stocks (source: {cache['symbol_source']})")
+    print(f"Screener started — {total} stocks | IST: {now_ist.strftime('%H:%M:%S')} | market_open={cache['market_open']}")
 
     for i, sym in enumerate(SYMBOLS):
         try:
@@ -438,19 +458,21 @@ def _run_screener(tok):
 
         time.sleep(0.3)
         if (i + 1) % 20 == 0:
-            print(f"  {i+1}/{total} done — pausing 1.5s")
+            print(f"  {i+1}/{total} done")
             time.sleep(1.5)
 
     results.sort(key=lambda x: x["volumeRatio"], reverse=True)
 
-    cache["data"]       = results
-    cache["updated_at"] = time.strftime("%H:%M:%S")
-    cache["status"]     = "ok"
-    cache["count"]      = len(results)
-    cache["errors"]     = errors
-    cache["progress"]   = 100
+    now_ist = datetime.now(IST)
+    cache["data"]        = results
+    cache["updated_at"]  = now_ist.strftime("%H:%M:%S IST")
+    cache["status"]      = "ok"
+    cache["count"]       = len(results)
+    cache["errors"]      = errors
+    cache["progress"]    = 100
+    cache["market_open"] = is_market_open()
 
-    print(f"Screener done — {len(results)} OK, {len(errors)} errors")
+    print(f"Screener done — {len(results)} OK, {len(errors)} errors | {cache['updated_at']}")
 
 
 def fetch_screener(client_id=None, access_token=None):
@@ -477,21 +499,35 @@ def fetch_screener(client_id=None, access_token=None):
 
 
 # ---------------------------------------------------------------------------
-# Scheduler
+# Scheduler — runs every 5 min during market hours, every 60 min otherwise
 # ---------------------------------------------------------------------------
+def scheduled_refresh():
+    """Called by scheduler — only triggers during market hours on weekdays."""
+    if not CREDS["client_id"] or not CREDS["access_token"]:
+        return
+    if is_market_open():
+        print("Scheduled refresh — market is OPEN")
+        fetch_screener()
+    else:
+        now = datetime.now(IST)
+        print(f"Scheduled refresh skipped — market CLOSED ({now.strftime('%H:%M IST, %A')})")
+
+
 scheduler = BackgroundScheduler()
-scheduler.add_job(fetch_screener, "interval", seconds=300, id="screener")
+# Check every 5 minutes — scheduled_refresh() skips if market is closed
+scheduler.add_job(scheduled_refresh, "interval", minutes=5, id="screener")
 scheduler.start()
 
 
 # ---------------------------------------------------------------------------
-# Startup — FIX: fetch symbols synchronously first, THEN start screener thread
+# Startup
 # ---------------------------------------------------------------------------
 @app.on_event("startup")
 async def startup():
-    fetch_fno_symbols()    # BLOCKING — must complete before screener fires
+    fetch_fno_symbols()
     print(f"Symbols loaded: {len(SYMBOLS)} (source: {cache['symbol_source']})")
-    fetch_screener()       # now safe — launches background thread
+    # Always run once on startup to populate cache with latest available data
+    fetch_screener()
 
 
 # ---------------------------------------------------------------------------
@@ -500,7 +536,14 @@ async def startup():
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "DhanScreen API", "docs": "/docs"}
+    now_ist = datetime.now(IST)
+    return {
+        "status":      "ok",
+        "service":     "DhanScreen API",
+        "docs":        "/docs",
+        "time_ist":    now_ist.strftime("%H:%M:%S"),
+        "market_open": is_market_open(),
+    }
 
 
 @app.get("/api/ping-dhan")
@@ -564,21 +607,25 @@ def top(limit: int = 20):
 @app.get("/api/symbols")
 def list_symbols():
     return {
-        "count":  len(SYMBOLS),
-        "source": cache.get("symbol_source", "unknown"),
+        "count":   len(SYMBOLS),
+        "source":  cache.get("symbol_source", "unknown"),
         "symbols": SYMBOLS,
     }
 
 
 @app.get("/api/health")
 def health():
+    now_ist = datetime.now(IST)
     return {
-        "status":         "ok",
-        "cache_status":   cache["status"],
-        "last_refresh":   cache["updated_at"],
-        "symbol_count":   len(SYMBOLS),
-        "symbol_source":  cache.get("symbol_source", "unknown"),
-        "result_count":   cache["count"],
-        "error_count":    len(cache.get("errors", [])),
-        "progress_pct":   cache.get("progress", 0),
+        "status":        "ok",
+        "cache_status":  cache["status"],
+        "last_refresh":  cache["updated_at"],
+        "symbol_count":  len(SYMBOLS),
+        "symbol_source": cache.get("symbol_source", "unknown"),
+        "result_count":  cache["count"],
+        "error_count":   len(cache.get("errors", [])),
+        "progress_pct":  cache.get("progress", 0),
+        "market_open":   is_market_open(),
+        "time_ist":      now_ist.strftime("%H:%M:%S"),
+        "day":           now_ist.strftime("%A"),
     }
