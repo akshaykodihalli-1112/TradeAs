@@ -19,26 +19,17 @@ app.add_middleware(
 )
 
 DHAN_BASE = "https://api.dhan.co"
-IST = ZoneInfo("Asia/Kolkata")
-
-# Self URL for keep-alive ping (set RENDER_EXTERNAL_URL env var on Render)
-SELF_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+IST       = ZoneInfo("Asia/Kolkata")
+SELF_URL  = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 
 cache = {
-    "data": [],
-    "updated_at": None,
-    "status": "idle",
-    "count": 0,
-    "errors": [],
-    "progress": 0,
-    "total": 0,
-    "symbol_source": "none",
-    "market_open": False,
-    "debug": {},
+    "data": [], "updated_at": None, "status": "idle",
+    "count": 0, "errors": [], "progress": 0, "total": 0,
+    "symbol_source": "none", "market_open": False, "debug": {},
 }
 
 CREDS = {
-    "client_id": os.getenv("DHAN_CLIENT_ID", ""),
+    "client_id":    os.getenv("DHAN_CLIENT_ID", ""),
     "access_token": os.getenv("DHAN_ACCESS_TOKEN", ""),
 }
 
@@ -46,34 +37,27 @@ SYMBOLS = []
 _screener_lock = threading.Lock()
 
 
-# ---------------------------------------------------------------------------
-# Market hours helpers (IST)
-# ---------------------------------------------------------------------------
+# ── market hours ──────────────────────────────────────────────────
 def is_market_open() -> bool:
     now = datetime.now(IST)
     if now.weekday() >= 5:
         return False
-    market_start = now.replace(hour=9,  minute=15, second=0, microsecond=0)
-    market_end   = now.replace(hour=15, minute=30, second=0, microsecond=0)
-    return market_start <= now <= market_end
+    return now.replace(hour=9, minute=15, second=0, microsecond=0) <= now \
+        <= now.replace(hour=15, minute=30, second=0, microsecond=0)
 
 
-# ---------------------------------------------------------------------------
-# Keep-alive ping — prevents Render free tier from spinning down
-# ---------------------------------------------------------------------------
+# ── keep-alive (prevents Render free tier spin-down) ─────────────
 def keep_alive():
     if not SELF_URL:
         return
     try:
         requests.get(f"{SELF_URL}/api/health", timeout=10)
-        print(f"Keep-alive ping OK ({datetime.now(IST).strftime('%H:%M IST')})")
+        print(f"Keep-alive OK ({datetime.now(IST).strftime('%H:%M IST')})")
     except Exception as e:
         print(f"Keep-alive failed: {e}")
 
 
-# ---------------------------------------------------------------------------
-# SEED LIST — 198 NSE FNO stocks
-# ---------------------------------------------------------------------------
+# ── seed list ─────────────────────────────────────────────────────
 SEED_SYMBOLS = [
     {"symbol": "ABBOTINDIA",  "security_id": "788",   "exchange": "NSE"},
     {"symbol": "ABCAPITAL",   "security_id": "20904", "exchange": "NSE"},
@@ -276,29 +260,23 @@ SEED_SYMBOLS = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# Fetch FNO symbols from Dhan master CSV
-# ---------------------------------------------------------------------------
+# ── fetch FNO symbols from Dhan master CSV ────────────────────────
 def fetch_fno_symbols():
     global SYMBOLS
     SYMBOLS = list(SEED_SYMBOLS)
     cache["symbol_source"] = "seed"
-
     try:
         print("Fetching Dhan master CSV...")
         resp = requests.get(
-            "https://images.dhan.co/api-data/api-scrip-master.csv",
-            timeout=15,
-        )
+            "https://images.dhan.co/api-data/api-scrip-master.csv", timeout=15)
         resp.raise_for_status()
-
         df = pd.read_csv(StringIO(resp.text), low_memory=False)
         df.columns = [c.strip().upper() for c in df.columns]
         print(f"CSV columns: {list(df.columns)}")
 
-        seg_col  = next((c for c in df.columns if "EXCH_SEG" in c or "SEGMENT" in c), None)
+        seg_col  = next((c for c in df.columns if "EXCH_SEG"  in c or "SEGMENT"        in c), None)
         sym_col  = next((c for c in df.columns if "TRADING_SYMBOL" in c or "SYMBOL_NAME" in c), None)
-        id_col   = next((c for c in df.columns if "SECURITY_ID" in c or "SCRIP_ID" in c or "SM_SYMBOL_ID" in c), None)
+        id_col   = next((c for c in df.columns if "SECURITY_ID"    in c or "SCRIP_ID"    in c or "SM_SYMBOL_ID" in c), None)
         inst_col = next((c for c in df.columns if "INSTRUMENT" in c), None)
 
         if not all([seg_col, sym_col, id_col]):
@@ -312,53 +290,35 @@ def fetch_fno_symbols():
 
         fno_syms = set(fno_df[sym_col].str.strip().unique())
         if not fno_syms:
-            print("No FUTSTK symbols in CSV — using seed.")
+            print("No FUTSTK symbols — using seed.")
             return
 
         matched = eq_df[eq_df[sym_col].str.strip().isin(fno_syms)][
-            [id_col, sym_col]
-        ].drop_duplicates(subset=[sym_col])
+            [id_col, sym_col]].drop_duplicates(subset=[sym_col])
 
         if matched.empty:
             print("No matches — using seed.")
             return
 
-        SYMBOLS = [
-            {
-                "symbol":      row[sym_col].strip(),
-                "security_id": str(int(row[id_col])),
-                "exchange":    "NSE",
-            }
-            for _, row in matched.iterrows()
-        ]
+        SYMBOLS = [{"symbol": r[sym_col].strip(), "security_id": str(int(r[id_col])), "exchange": "NSE"}
+                   for _, r in matched.iterrows()]
         cache["symbol_source"] = "csv"
         print(f"Loaded {len(SYMBOLS)} FNO stocks from CSV.")
-
     except Exception as e:
         print(f"CSV fetch failed ({e}) — using seed ({len(SYMBOLS)} stocks).")
 
 
-# ---------------------------------------------------------------------------
-# Historical data fetch
-# ---------------------------------------------------------------------------
+# ── historical OHLCV fetch ────────────────────────────────────────
 def get_historical(security_id, access_token, retries=3, capture_debug=False):
     today     = datetime.now(IST)
     from_date = (today - timedelta(days=30)).strftime("%Y-%m-%d")
     to_date   = today.strftime("%Y-%m-%d")
-
-    url     = f"{DHAN_BASE}/v2/charts/historical"
-    headers = {
-        "access-token": access_token,
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "securityId":      security_id,
-        "exchangeSegment": "NSE_EQ",
-        "instrument":      "EQUITY",
-        "expiryCode":      0,
-        "oi":              False,
-        "fromDate":        from_date,
-        "toDate":          to_date,
+    url       = f"{DHAN_BASE}/v2/charts/historical"
+    headers   = {"access-token": access_token, "Content-Type": "application/json"}
+    payload   = {
+        "securityId": security_id, "exchangeSegment": "NSE_EQ",
+        "instrument": "EQUITY",    "expiryCode": 0,
+        "oi": False, "fromDate": from_date, "toDate": to_date,
     }
 
     for attempt in range(retries):
@@ -366,38 +326,28 @@ def get_historical(security_id, access_token, retries=3, capture_debug=False):
             resp = requests.post(url, json=payload, headers=headers, timeout=10)
 
             if capture_debug:
-                try:
-                    raw_keys = list(resp.json().keys())
-                except Exception:
-                    raw_keys = []
+                try:    raw_keys = list(resp.json().keys())
+                except: raw_keys = []
                 cache["debug"] = {
-                    "security_id": security_id,
-                    "status_code": resp.status_code,
-                    "from_date":   from_date,
-                    "to_date":     to_date,
-                    "raw_keys":    raw_keys,
-                    "raw_sample":  resp.text[:300],
+                    "security_id": security_id, "status_code": resp.status_code,
+                    "from_date": from_date, "to_date": to_date,
+                    "raw_keys": raw_keys, "raw_sample": resp.text[:300],
                 }
 
             if resp.status_code == 429:
                 wait = 2 ** (attempt + 1)
-                print(f"  429 — sleeping {wait}s")
-                time.sleep(wait)
-                continue
-
+                print(f"  429 — sleeping {wait}s"); time.sleep(wait); continue
             if resp.status_code in (400, 401, 403):
                 print(f"  HTTP {resp.status_code} id={security_id}: {resp.text[:80]}")
                 return None
 
             resp.raise_for_status()
             data = resp.json()
-
-            timestamps = data.get("timestamp", [])
-            if not timestamps:
+            if not data.get("timestamp"):
                 return None
 
             df = pd.DataFrame({
-                "date":   timestamps,
+                "date":   data["timestamp"],
                 "open":   data.get("open",   []),
                 "high":   data.get("high",   []),
                 "low":    data.get("low",    []),
@@ -407,37 +357,25 @@ def get_historical(security_id, access_token, retries=3, capture_debug=False):
             return df.sort_values("date").reset_index(drop=True)
 
         except requests.exceptions.Timeout:
-            print(f"  Timeout id={security_id} attempt {attempt+1}")
-            time.sleep(1)
+            print(f"  Timeout id={security_id} attempt {attempt+1}"); time.sleep(1)
         except requests.exceptions.RequestException as e:
-            print(f"  ReqError id={security_id}: {e}")
-            time.sleep(1)
-
+            print(f"  ReqError id={security_id}: {e}"); time.sleep(1)
     return None
 
 
-# ---------------------------------------------------------------------------
-# Background screener worker
-# ---------------------------------------------------------------------------
+# ── screener worker ───────────────────────────────────────────────
 def _run_screener(tok):
     global cache
-
     if not SYMBOLS:
         fetch_fno_symbols()
 
-    results    = []
-    errors     = []
-    skipped    = []
+    results, errors, skipped = [], [], []
     total      = len(SYMBOLS)
     first_call = True
 
-    cache["status"]      = "fetching"
-    cache["progress"]    = 0
-    cache["total"]       = total
-    cache["market_open"] = is_market_open()
-
-    now_ist = datetime.now(IST)
-    print(f"Screener started — {total} stocks | {now_ist.strftime('%H:%M:%S IST')} | market={cache['market_open']}")
+    cache.update({"status": "fetching", "progress": 0, "total": total,
+                  "market_open": is_market_open()})
+    print(f"Screener started — {total} stocks | {datetime.now(IST).strftime('%H:%M:%S IST')}")
 
     for i, sym in enumerate(SYMBOLS):
         try:
@@ -446,42 +384,27 @@ def _run_screener(tok):
 
             if df is None:
                 skipped.append(f"{sym['symbol']}:None")
-                cache["progress"] = round((i + 1) / total * 100)
-                time.sleep(0.3)
-                continue
-
-            rows = len(df)
-            if rows < 2:
-                skipped.append(f"{sym['symbol']}:{rows}rows")
-                cache["progress"] = round((i + 1) / total * 100)
-                time.sleep(0.3)
-                continue
-
-            today_vol  = df["volume"].iloc[-1]
-            hist_rows  = min(rows - 1, 7)
-            avg_vol_7d = df["volume"].iloc[-(hist_rows + 1):-1].mean()
-            vol_ratio  = round(today_vol / avg_vol_7d, 2) if avg_vol_7d > 0 else 0
-
-            close_now  = df["close"].iloc[-1]
-            close_prev = df["close"].iloc[-2]
-            day_chg    = round(((close_now - close_prev) / close_prev) * 100, 2) if close_prev else 0
-
-            lookback   = min(rows - 1, 5)
-            close_ago  = df["close"].iloc[-(lookback + 1)]
-            momentum5d = round(((close_now - close_ago) / close_ago) * 100, 2) if close_ago else 0
-
-            results.append({
-                "symbol":      sym["symbol"],
-                "exchange":    sym["exchange"],
-                "ltp":         round(float(close_now), 2),
-                "change":      day_chg,
-                "momentum5d":  momentum5d,
-                "volumeRatio": vol_ratio,
-                "todayVol":    int(today_vol),
-                "avgVol7d":    int(avg_vol_7d),
-                "candles":     rows,
-            })
-
+            elif len(df) < 2:
+                skipped.append(f"{sym['symbol']}:{len(df)}rows")
+            else:
+                rows       = len(df)
+                today_vol  = df["volume"].iloc[-1]
+                hist_rows  = min(rows - 1, 7)
+                avg_vol_7d = df["volume"].iloc[-(hist_rows+1):-1].mean()
+                vol_ratio  = round(today_vol / avg_vol_7d, 2) if avg_vol_7d > 0 else 0
+                close_now  = df["close"].iloc[-1]
+                close_prev = df["close"].iloc[-2]
+                day_chg    = round(((close_now - close_prev) / close_prev) * 100, 2) if close_prev else 0
+                lookback   = min(rows - 1, 5)
+                close_ago  = df["close"].iloc[-(lookback+1)]
+                momentum5d = round(((close_now - close_ago) / close_ago) * 100, 2) if close_ago else 0
+                results.append({
+                    "symbol": sym["symbol"], "exchange": sym["exchange"],
+                    "ltp": round(float(close_now), 2), "change": day_chg,
+                    "momentum5d": momentum5d, "volumeRatio": vol_ratio,
+                    "todayVol": int(today_vol), "avgVol7d": int(avg_vol_7d),
+                    "candles": rows,
+                })
         except Exception as e:
             errors.append(f"{sym['symbol']}: {e}")
             print(f"  Error {sym['symbol']}: {e}")
@@ -489,122 +412,79 @@ def _run_screener(tok):
         cache["progress"] = round((i + 1) / total * 100)
         time.sleep(0.3)
         if (i + 1) % 20 == 0:
-            print(f"  {i+1}/{total} | results={len(results)} skipped={len(skipped)}")
+            print(f"  {i+1}/{total} | ok={len(results)} skip={len(skipped)}")
             time.sleep(1.5)
 
     results.sort(key=lambda x: x["volumeRatio"], reverse=True)
-
     now_ist = datetime.now(IST)
-    cache["data"]        = results
-    cache["updated_at"]  = now_ist.strftime("%H:%M:%S IST")
-    cache["status"]      = "ok"
-    cache["count"]       = len(results)
-    cache["errors"]      = errors
-    cache["skipped"]     = skipped[:20]
-    cache["progress"]    = 100
-    cache["market_open"] = is_market_open()
-
+    cache.update({
+        "data": results, "updated_at": now_ist.strftime("%H:%M:%S IST"),
+        "status": "ok", "count": len(results), "errors": errors,
+        "skipped": skipped[:20], "progress": 100, "market_open": is_market_open(),
+    })
     print(f"Done — {len(results)} OK | {len(skipped)} skipped | {len(errors)} errors")
 
 
 def fetch_screener(client_id=None, access_token=None):
     cid = client_id or CREDS["client_id"]
     tok = access_token or CREDS["access_token"]
-
     if not cid or not tok:
-        cache["status"] = "no_credentials"
-        return
-
-    CREDS["client_id"]    = cid
-    CREDS["access_token"] = tok
-
+        cache["status"] = "no_credentials"; return
+    CREDS["client_id"] = cid; CREDS["access_token"] = tok
     if _screener_lock.locked():
-        print("Screener already running — skipping.")
-        return
-
+        print("Screener already running — skipping."); return
     def _worker():
-        with _screener_lock:
-            _run_screener(tok)
-
+        with _screener_lock: _run_screener(tok)
     threading.Thread(target=_worker, daemon=True).start()
 
 
-# ---------------------------------------------------------------------------
-# Scheduler
-# ---------------------------------------------------------------------------
+# ── scheduler ─────────────────────────────────────────────────────
 def scheduled_refresh():
-    if not CREDS["client_id"] or not CREDS["access_token"]:
-        return
-    if is_market_open():
-        fetch_screener()
-    else:
-        print(f"Market closed — skipping ({datetime.now(IST).strftime('%H:%M IST')})")
+    if not CREDS["client_id"] or not CREDS["access_token"]: return
+    if is_market_open(): fetch_screener()
+    else: print(f"Market closed — skipping ({datetime.now(IST).strftime('%H:%M IST')})")
 
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(scheduled_refresh, "interval", minutes=5,  id="screener")
-scheduler.add_job(keep_alive,        "interval", minutes=10, id="keepalive")  # ping every 10 min
+scheduler.add_job(keep_alive,        "interval", minutes=10, id="keepalive")
 scheduler.start()
 
 
-# ---------------------------------------------------------------------------
-# Startup — symbols load synchronously, screener in background
-# ---------------------------------------------------------------------------
+# ── startup ───────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
     fetch_fno_symbols()
     print(f"Symbols ready: {len(SYMBOLS)} ({cache['symbol_source']})")
-    # Delay screener by 3s so uvicorn fully starts and health check passes first
     def _delayed():
         time.sleep(3)
         fetch_screener()
     threading.Thread(target=_delayed, daemon=True).start()
 
 
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
-
+# ── routes ────────────────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {
-        "status":      "ok",
-        "service":     "DhanScreen API",
-        "docs":        "/docs",
-        "time_ist":    datetime.now(IST).strftime("%H:%M:%S"),
-        "market_open": is_market_open(),
-    }
+    return {"status": "ok", "service": "DhanScreen API", "docs": "/docs",
+            "time_ist": datetime.now(IST).strftime("%H:%M:%S"), "market_open": is_market_open()}
 
 
 @app.get("/api/ping-dhan")
-def ping_dhan(
-    x_client_id: str = Header(None),
-    x_access_token: str = Header(None),
-):
+def ping_dhan(x_client_id: str = Header(None), x_access_token: str = Header(None)):
     tok = x_access_token or CREDS["access_token"]
-    if not tok:
-        return {"connected": False, "error": "No access token"}
+    if not tok: return {"connected": False, "error": "No access token"}
     try:
-        resp = requests.get(
-            f"{DHAN_BASE}/v2/profile",
-            headers={"access-token": tok},
-            timeout=5,
-        )
-        if resp.status_code == 200:
-            return {"connected": True, "status": 200, "profile": resp.json()}
-        return {"connected": False, "status": resp.status_code, "detail": resp.text[:200]}
+        r = requests.get(f"{DHAN_BASE}/v2/profile", headers={"access-token": tok}, timeout=5)
+        if r.status_code == 200: return {"connected": True, "status": 200, "profile": r.json()}
+        return {"connected": False, "status": r.status_code, "detail": r.text[:200]}
     except Exception as e:
         return {"connected": False, "error": str(e)}
 
 
 @app.get("/api/screener")
-def get_screener(
-    x_client_id: str = Header(None),
-    x_access_token: str = Header(None),
-):
+def get_screener(x_client_id: str = Header(None), x_access_token: str = Header(None)):
     if x_client_id and x_access_token:
-        CREDS["client_id"]    = x_client_id
-        CREDS["access_token"] = x_access_token
+        CREDS["client_id"] = x_client_id; CREDS["access_token"] = x_access_token
         fetch_screener(x_client_id, x_access_token)
     return cache
 
@@ -621,12 +501,7 @@ def volume_spike(min_ratio: float = 2.0):
 
 @app.get("/api/screener/strong")
 def strong(min_mom: float = 5.0, min_vol: float = 2.5):
-    return {
-        "data": [
-            s for s in cache["data"]
-            if s["momentum5d"] >= min_mom and s["volumeRatio"] >= min_vol
-        ]
-    }
+    return {"data": [s for s in cache["data"] if s["momentum5d"] >= min_mom and s["volumeRatio"] >= min_vol]}
 
 
 @app.get("/api/screener/top")
@@ -636,89 +511,60 @@ def top(limit: int = 20):
 
 @app.get("/api/symbols")
 def list_symbols():
-    return {
-        "count":   len(SYMBOLS),
-        "source":  cache.get("symbol_source"),
-        "symbols": SYMBOLS,
-    }
+    return {"count": len(SYMBOLS), "source": cache.get("symbol_source"), "symbols": SYMBOLS}
 
 
 @app.get("/api/health")
 def health():
     return {
-        "status":         "ok",
-        "cache_status":   cache["status"],
-        "last_refresh":   cache["updated_at"],
-        "symbol_count":   len(SYMBOLS),
-        "symbol_source":  cache.get("symbol_source"),
-        "result_count":   cache["count"],
-        "error_count":    len(cache.get("errors", [])),
-        "skipped_count":  len(cache.get("skipped", [])),
+        "status": "ok", "cache_status": cache["status"],
+        "last_refresh": cache["updated_at"], "symbol_count": len(SYMBOLS),
+        "symbol_source": cache.get("symbol_source"), "result_count": cache["count"],
+        "error_count": len(cache.get("errors", [])),
+        "skipped_count": len(cache.get("skipped", [])),
         "skipped_sample": cache.get("skipped", [])[:5],
-        "progress_pct":   cache.get("progress", 0),
-        "market_open":    is_market_open(),
-        "time_ist":       datetime.now(IST).strftime("%H:%M:%S"),
-        "day":            datetime.now(IST).strftime("%A"),
-        "debug":          cache.get("debug", {}),
+        "progress_pct": cache.get("progress", 0),
+        "market_open": is_market_open(),
+        "time_ist": datetime.now(IST).strftime("%H:%M:%S"),
+        "day": datetime.now(IST).strftime("%A"),
+        "debug": cache.get("debug", {}),
     }
 
 
-# ---------------------------------------------------------------------------
-# /api/ltp — live prices for all FNO stocks in ONE Dhan API call
-# Uses POST /v2/marketfeed/ohlc — returns LTP + OHLC for up to 1000 symbols
-# ---------------------------------------------------------------------------
+# ── /api/ltp — live prices in ONE call using marketfeed/ohlc ─────
 @app.get("/api/ltp")
-def get_ltp(
-    x_client_id: str = Header(None),
-    x_access_token: str = Header(None),
-):
+def get_ltp(x_client_id: str = Header(None), x_access_token: str = Header(None)):
     cid = x_client_id or CREDS["client_id"]
     tok = x_access_token or CREDS["access_token"]
 
-    if not cid or not tok:
-        return {"status": "no_credentials", "quotes": {}}
-    if not SYMBOLS:
-        return {"status": "no_symbols", "quotes": {}}
+    if not cid or not tok: return {"status": "no_credentials", "quotes": {}}
+    if not SYMBOLS:        return {"status": "no_symbols",     "quotes": {}}
 
-    # Build payload: { "NSE_EQ": { "security_id": 0, ... } }
     payload = {"NSE_EQ": {sym["security_id"]: 0 for sym in SYMBOLS}}
 
     try:
         resp = requests.post(
             f"{DHAN_BASE}/v2/marketfeed/ohlc",
             json=payload,
-            headers={
-                "access-token": tok,
-                "client-id":    cid,
-                "Content-Type": "application/json",
-            },
+            headers={"access-token": tok, "client-id": cid, "Content-Type": "application/json"},
             timeout=10,
         )
-
-        if resp.status_code == 401:
-            return {"status": "token_expired", "quotes": {}}
-        if resp.status_code == 429:
-            return {"status": "rate_limited",  "quotes": {}}
-        if resp.status_code == 400:
-            return {"status": "bad_request",   "quotes": {}, "detail": resp.text[:200]}
-
+        if resp.status_code == 401: return {"status": "token_expired", "quotes": {}}
+        if resp.status_code == 429: return {"status": "rate_limited",  "quotes": {}}
+        if resp.status_code == 400: return {"status": "bad_request",   "quotes": {}, "detail": resp.text[:200]}
         resp.raise_for_status()
-        data = resp.json()
 
-        # Response: { "data": { "NSE_EQ": { "<sec_id>": { "last_price": x, "ohlc": {...} } } } }
-        raw       = data.get("data", {}).get("NSE_EQ", {})
+        raw       = resp.json().get("data", {}).get("NSE_EQ", {})
         id_to_sym = {sym["security_id"]: sym["symbol"] for sym in SYMBOLS}
+        quotes    = {}
 
-        quotes = {}
         for sec_id, q in raw.items():
             sym = id_to_sym.get(str(sec_id))
-            if not sym:
-                continue
+            if not sym: continue
             ltp        = float(q.get("last_price", 0))
             ohlc       = q.get("ohlc", {})
             prev_close = float(ohlc.get("close", 0))
             chg_pct    = round(((ltp - prev_close) / prev_close) * 100, 2) if prev_close else 0
-
             quotes[sym] = {
                 "ltp":        round(ltp, 2),
                 "open":       round(float(ohlc.get("open", 0)), 2),
@@ -728,14 +574,12 @@ def get_ltp(
                 "change_pct": chg_pct,
             }
 
-        now_ist = datetime.now(IST)
         return {
             "status":      "ok",
-            "updated_at":  now_ist.strftime("%H:%M:%S IST"),
+            "updated_at":  datetime.now(IST).strftime("%H:%M:%S IST"),
             "market_open": is_market_open(),
             "count":       len(quotes),
             "quotes":      quotes,
         }
-
     except Exception as e:
         return {"status": "error", "error": str(e), "quotes": {}}
