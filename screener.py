@@ -31,6 +31,7 @@ cache = {
     "total": 0,
     "symbol_source": "none",
     "market_open": False,
+    "debug": {},   # stores sample raw response for diagnosis
 }
 
 CREDS = {
@@ -46,18 +47,12 @@ _screener_lock = threading.Lock()
 # Market hours helpers (IST)
 # ---------------------------------------------------------------------------
 def is_market_open() -> bool:
-    """Returns True if current IST time is within NSE market hours on a weekday."""
     now = datetime.now(IST)
-    if now.weekday() >= 5:          # Saturday=5, Sunday=6
+    if now.weekday() >= 5:
         return False
     market_start = now.replace(hour=9,  minute=15, second=0, microsecond=0)
     market_end   = now.replace(hour=15, minute=30, second=0, microsecond=0)
     return market_start <= now <= market_end
-
-
-def is_market_day() -> bool:
-    """True on weekdays (ignores time)."""
-    return datetime.now(IST).weekday() < 5
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +265,7 @@ SEED_SYMBOLS = [
 # ---------------------------------------------------------------------------
 def fetch_fno_symbols():
     global SYMBOLS
-    SYMBOLS = list(SEED_SYMBOLS)          # always pre-load seed first
+    SYMBOLS = list(SEED_SYMBOLS)
     cache["symbol_source"] = "seed"
 
     try:
@@ -328,22 +323,11 @@ def fetch_fno_symbols():
 
 
 # ---------------------------------------------------------------------------
-# Historical data fetch
+# Historical data fetch — with debug capture on first call
 # ---------------------------------------------------------------------------
-def get_historical(security_id, access_token, retries=3):
+def get_historical(security_id, access_token, retries=3, capture_debug=False):
     today     = datetime.now(IST)
-    # Use last trading day if market is closed
-    if not is_market_open():
-        # go back to last weekday
-        days_back = 1
-        while True:
-            candidate = today - timedelta(days=days_back)
-            if candidate.weekday() < 5:
-                today = candidate
-                break
-            days_back += 1
-
-    from_date = (today - timedelta(days=25)).strftime("%Y-%m-%d")
+    from_date = (today - timedelta(days=30)).strftime("%Y-%m-%d")  # wider window
     to_date   = today.strftime("%Y-%m-%d")
 
     url     = f"{DHAN_BASE}/v2/charts/historical"
@@ -365,6 +349,16 @@ def get_historical(security_id, access_token, retries=3):
         try:
             resp = requests.post(url, json=payload, headers=headers, timeout=10)
 
+            if capture_debug:
+                cache["debug"] = {
+                    "security_id": security_id,
+                    "status_code": resp.status_code,
+                    "from_date":   from_date,
+                    "to_date":     to_date,
+                    "raw_keys":    list(resp.json().keys()) if resp.status_code == 200 else [],
+                    "raw_sample":  resp.text[:300],
+                }
+
             if resp.status_code == 429:
                 wait = 2 ** (attempt + 1)
                 print(f"  429 — sleeping {wait}s")
@@ -378,11 +372,12 @@ def get_historical(security_id, access_token, retries=3):
             resp.raise_for_status()
             data = resp.json()
 
-            if not data.get("timestamp"):
+            timestamps = data.get("timestamp", [])
+            if not timestamps:
                 return None
 
             df = pd.DataFrame({
-                "date":   data["timestamp"],
+                "date":   timestamps,
                 "open":   data.get("open",   []),
                 "high":   data.get("high",   []),
                 "low":    data.get("low",    []),
@@ -410,44 +405,70 @@ def _run_screener(tok):
     if not SYMBOLS:
         fetch_fno_symbols()
 
-    results = []
-    errors  = []
-    total   = len(SYMBOLS)
-    now_ist = datetime.now(IST)
+    results    = []
+    errors     = []
+    skipped    = []   # track symbols with too few candles
+    total      = len(SYMBOLS)
+    first_call = True
 
     cache["status"]      = "fetching"
     cache["progress"]    = 0
     cache["total"]       = total
     cache["market_open"] = is_market_open()
 
-    print(f"Screener started — {total} stocks | IST: {now_ist.strftime('%H:%M:%S')} | market_open={cache['market_open']}")
+    now_ist = datetime.now(IST)
+    print(f"Screener started — {total} stocks | {now_ist.strftime('%H:%M:%S IST')} | market={cache['market_open']}")
 
     for i, sym in enumerate(SYMBOLS):
         try:
-            df = get_historical(sym["security_id"], tok)
+            df = get_historical(
+                sym["security_id"], tok,
+                capture_debug=first_call   # capture raw response for first stock
+            )
+            first_call = False
 
-            if df is not None and len(df) >= 8:
-                today_vol  = df["volume"].iloc[-1]
-                avg_vol_7d = df["volume"].iloc[-8:-1].mean()
-                vol_ratio  = round(today_vol / avg_vol_7d, 2) if avg_vol_7d > 0 else 0
+            if df is None:
+                skipped.append(f"{sym['symbol']}:None")
+                cache["progress"] = round((i + 1) / total * 100)
+                time.sleep(0.3)
+                continue
 
-                close_now  = df["close"].iloc[-1]
-                close_5ago = df["close"].iloc[-6] if len(df) >= 6 else df["close"].iloc[0]
-                momentum5d = round(((close_now - close_5ago) / close_5ago) * 100, 2)
+            rows = len(df)
 
-                close_prev = df["close"].iloc[-2]
-                day_chg    = round(((close_now - close_prev) / close_prev) * 100, 2)
+            # FIX: lowered from 8 to 2 — need at least prev close + today
+            if rows < 2:
+                skipped.append(f"{sym['symbol']}:{rows}rows")
+                cache["progress"] = round((i + 1) / total * 100)
+                time.sleep(0.3)
+                continue
 
-                results.append({
-                    "symbol":      sym["symbol"],
-                    "exchange":    sym["exchange"],
-                    "ltp":         round(float(close_now), 2),
-                    "change":      day_chg,
-                    "momentum5d":  momentum5d,
-                    "volumeRatio": vol_ratio,
-                    "todayVol":    int(today_vol),
-                    "avgVol7d":    int(avg_vol_7d),
-                })
+            today_vol  = df["volume"].iloc[-1]
+
+            # avg vol: use whatever history we have, up to 7 days
+            hist_rows  = min(rows - 1, 7)
+            avg_vol_7d = df["volume"].iloc[-(hist_rows + 1):-1].mean()
+            vol_ratio  = round(today_vol / avg_vol_7d, 2) if avg_vol_7d > 0 else 0
+
+            close_now  = df["close"].iloc[-1]
+            close_prev = df["close"].iloc[-2]
+            day_chg    = round(((close_now - close_prev) / close_prev) * 100, 2) if close_prev else 0
+
+            # 5d momentum: use whatever history available
+            lookback   = min(rows - 1, 5)
+            close_ago  = df["close"].iloc[-(lookback + 1)]
+            momentum5d = round(((close_now - close_ago) / close_ago) * 100, 2) if close_ago else 0
+
+            results.append({
+                "symbol":      sym["symbol"],
+                "exchange":    sym["exchange"],
+                "ltp":         round(float(close_now), 2),
+                "change":      day_chg,
+                "momentum5d":  momentum5d,
+                "volumeRatio": vol_ratio,
+                "todayVol":    int(today_vol),
+                "avgVol7d":    int(avg_vol_7d),
+                "candles":     rows,
+            })
 
         except Exception as e:
             err = f"{sym['symbol']}: {e}"
@@ -458,7 +479,7 @@ def _run_screener(tok):
 
         time.sleep(0.3)
         if (i + 1) % 20 == 0:
-            print(f"  {i+1}/{total} done")
+            print(f"  {i+1}/{total} | results={len(results)} skipped={len(skipped)}")
             time.sleep(1.5)
 
     results.sort(key=lambda x: x["volumeRatio"], reverse=True)
@@ -469,10 +490,13 @@ def _run_screener(tok):
     cache["status"]      = "ok"
     cache["count"]       = len(results)
     cache["errors"]      = errors
+    cache["skipped"]     = skipped[:20]   # first 20 skipped for debug
     cache["progress"]    = 100
     cache["market_open"] = is_market_open()
 
-    print(f"Screener done — {len(results)} OK, {len(errors)} errors | {cache['updated_at']}")
+    print(f"Done — {len(results)} OK | {len(skipped)} skipped | {len(errors)} errors")
+    if skipped:
+        print(f"  Skipped sample: {skipped[:5]}")
 
 
 def fetch_screener(client_id=None, access_token=None):
@@ -481,7 +505,6 @@ def fetch_screener(client_id=None, access_token=None):
 
     if not cid or not tok:
         cache["status"] = "no_credentials"
-        print("Screener skipped: no credentials.")
         return
 
     CREDS["client_id"]    = cid
@@ -499,22 +522,18 @@ def fetch_screener(client_id=None, access_token=None):
 
 
 # ---------------------------------------------------------------------------
-# Scheduler — runs every 5 min during market hours, every 60 min otherwise
+# Scheduler — every 5 min during market hours
 # ---------------------------------------------------------------------------
 def scheduled_refresh():
-    """Called by scheduler — only triggers during market hours on weekdays."""
     if not CREDS["client_id"] or not CREDS["access_token"]:
         return
     if is_market_open():
-        print("Scheduled refresh — market is OPEN")
         fetch_screener()
     else:
-        now = datetime.now(IST)
-        print(f"Scheduled refresh skipped — market CLOSED ({now.strftime('%H:%M IST, %A')})")
+        print(f"Market closed — skipping refresh ({datetime.now(IST).strftime('%H:%M IST')})")
 
 
 scheduler = BackgroundScheduler()
-# Check every 5 minutes — scheduled_refresh() skips if market is closed
 scheduler.add_job(scheduled_refresh, "interval", minutes=5, id="screener")
 scheduler.start()
 
@@ -525,8 +544,7 @@ scheduler.start()
 @app.on_event("startup")
 async def startup():
     fetch_fno_symbols()
-    print(f"Symbols loaded: {len(SYMBOLS)} (source: {cache['symbol_source']})")
-    # Always run once on startup to populate cache with latest available data
+    print(f"Symbols ready: {len(SYMBOLS)} ({cache['symbol_source']})")
     fetch_screener()
 
 
@@ -536,12 +554,11 @@ async def startup():
 
 @app.get("/")
 def root():
-    now_ist = datetime.now(IST)
     return {
         "status":      "ok",
         "service":     "DhanScreen API",
         "docs":        "/docs",
-        "time_ist":    now_ist.strftime("%H:%M:%S"),
+        "time_ist":    datetime.now(IST).strftime("%H:%M:%S"),
         "market_open": is_market_open(),
     }
 
@@ -553,7 +570,7 @@ def ping_dhan(
 ):
     tok = x_access_token or CREDS["access_token"]
     if not tok:
-        return {"connected": False, "error": "No access token provided"}
+        return {"connected": False, "error": "No access token"}
     try:
         resp = requests.get(
             f"{DHAN_BASE}/v2/profile",
@@ -608,24 +625,26 @@ def top(limit: int = 20):
 def list_symbols():
     return {
         "count":   len(SYMBOLS),
-        "source":  cache.get("symbol_source", "unknown"),
+        "source":  cache.get("symbol_source"),
         "symbols": SYMBOLS,
     }
 
 
 @app.get("/api/health")
 def health():
-    now_ist = datetime.now(IST)
     return {
         "status":        "ok",
         "cache_status":  cache["status"],
         "last_refresh":  cache["updated_at"],
         "symbol_count":  len(SYMBOLS),
-        "symbol_source": cache.get("symbol_source", "unknown"),
+        "symbol_source": cache.get("symbol_source"),
         "result_count":  cache["count"],
         "error_count":   len(cache.get("errors", [])),
+        "skipped_count": len(cache.get("skipped", [])),
+        "skipped_sample":cache.get("skipped", [])[:5],
         "progress_pct":  cache.get("progress", 0),
         "market_open":   is_market_open(),
-        "time_ist":      now_ist.strftime("%H:%M:%S"),
-        "day":           now_ist.strftime("%A"),
+        "time_ist":      datetime.now(IST).strftime("%H:%M:%S"),
+        "day":           datetime.now(IST).strftime("%A"),
+        "debug":         cache.get("debug", {}),   # raw Dhan response sample
     }
