@@ -21,6 +21,9 @@ app.add_middleware(
 DHAN_BASE = "https://api.dhan.co"
 IST = ZoneInfo("Asia/Kolkata")
 
+# Self URL for keep-alive ping (set RENDER_EXTERNAL_URL env var on Render)
+SELF_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+
 cache = {
     "data": [],
     "updated_at": None,
@@ -53,6 +56,19 @@ def is_market_open() -> bool:
     market_start = now.replace(hour=9,  minute=15, second=0, microsecond=0)
     market_end   = now.replace(hour=15, minute=30, second=0, microsecond=0)
     return market_start <= now <= market_end
+
+
+# ---------------------------------------------------------------------------
+# Keep-alive ping — prevents Render free tier from spinning down
+# ---------------------------------------------------------------------------
+def keep_alive():
+    if not SELF_URL:
+        return
+    try:
+        requests.get(f"{SELF_URL}/api/health", timeout=10)
+        print(f"Keep-alive ping OK ({datetime.now(IST).strftime('%H:%M IST')})")
+    except Exception as e:
+        print(f"Keep-alive failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -286,7 +302,7 @@ def fetch_fno_symbols():
         inst_col = next((c for c in df.columns if "INSTRUMENT" in c), None)
 
         if not all([seg_col, sym_col, id_col]):
-            print(f"CSV column mismatch — using seed.")
+            print("CSV column mismatch — using seed.")
             return
 
         eq_df  = df[df[seg_col].str.upper().str.strip() == "NSE_EQ"].copy()
@@ -304,7 +320,7 @@ def fetch_fno_symbols():
         ].drop_duplicates(subset=[sym_col])
 
         if matched.empty:
-            print("No matches found — using seed.")
+            print("No matches — using seed.")
             return
 
         SYMBOLS = [
@@ -323,7 +339,7 @@ def fetch_fno_symbols():
 
 
 # ---------------------------------------------------------------------------
-# Historical data fetch — with debug capture on first call
+# Historical data fetch
 # ---------------------------------------------------------------------------
 def get_historical(security_id, access_token, retries=3, capture_debug=False):
     today     = datetime.now(IST)
@@ -351,8 +367,7 @@ def get_historical(security_id, access_token, retries=3, capture_debug=False):
 
             if capture_debug:
                 try:
-                    rj = resp.json()
-                    raw_keys = list(rj.keys())
+                    raw_keys = list(resp.json().keys())
                 except Exception:
                     raw_keys = []
                 cache["debug"] = {
@@ -426,10 +441,7 @@ def _run_screener(tok):
 
     for i, sym in enumerate(SYMBOLS):
         try:
-            df = get_historical(
-                sym["security_id"], tok,
-                capture_debug=first_call
-            )
+            df = get_historical(sym["security_id"], tok, capture_debug=first_call)
             first_call = False
 
             if df is None:
@@ -439,7 +451,6 @@ def _run_screener(tok):
                 continue
 
             rows = len(df)
-
             if rows < 2:
                 skipped.append(f"{sym['symbol']}:{rows}rows")
                 cache["progress"] = round((i + 1) / total * 100)
@@ -472,12 +483,10 @@ def _run_screener(tok):
             })
 
         except Exception as e:
-            err = f"{sym['symbol']}: {e}"
-            print(f"  Error {err}")
-            errors.append(err)
+            errors.append(f"{sym['symbol']}: {e}")
+            print(f"  Error {sym['symbol']}: {e}")
 
         cache["progress"] = round((i + 1) / total * 100)
-
         time.sleep(0.3)
         if (i + 1) % 20 == 0:
             print(f"  {i+1}/{total} | results={len(results)} skipped={len(skipped)}")
@@ -496,8 +505,6 @@ def _run_screener(tok):
     cache["market_open"] = is_market_open()
 
     print(f"Done — {len(results)} OK | {len(skipped)} skipped | {len(errors)} errors")
-    if skipped:
-        print(f"  Skipped sample: {skipped[:5]}")
 
 
 def fetch_screener(client_id=None, access_token=None):
@@ -523,7 +530,7 @@ def fetch_screener(client_id=None, access_token=None):
 
 
 # ---------------------------------------------------------------------------
-# Scheduler — every 5 min during market hours
+# Scheduler
 # ---------------------------------------------------------------------------
 def scheduled_refresh():
     if not CREDS["client_id"] or not CREDS["access_token"]:
@@ -531,22 +538,27 @@ def scheduled_refresh():
     if is_market_open():
         fetch_screener()
     else:
-        print(f"Market closed — skipping refresh ({datetime.now(IST).strftime('%H:%M IST')})")
+        print(f"Market closed — skipping ({datetime.now(IST).strftime('%H:%M IST')})")
 
 
 scheduler = BackgroundScheduler()
-scheduler.add_job(scheduled_refresh, "interval", minutes=5, id="screener")
+scheduler.add_job(scheduled_refresh, "interval", minutes=5,  id="screener")
+scheduler.add_job(keep_alive,        "interval", minutes=10, id="keepalive")  # ping every 10 min
 scheduler.start()
 
 
 # ---------------------------------------------------------------------------
-# Startup
+# Startup — symbols load synchronously, screener in background
 # ---------------------------------------------------------------------------
 @app.on_event("startup")
 async def startup():
     fetch_fno_symbols()
     print(f"Symbols ready: {len(SYMBOLS)} ({cache['symbol_source']})")
-    fetch_screener()
+    # Delay screener by 3s so uvicorn fully starts and health check passes first
+    def _delayed():
+        time.sleep(3)
+        fetch_screener()
+    threading.Thread(target=_delayed, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -652,9 +664,8 @@ def health():
 
 
 # ---------------------------------------------------------------------------
-# NEW: /api/ltp — live prices for all FNO stocks in ONE Dhan API call
-# Called by the frontend every 5 seconds to update LTP without re-running
-# the full screener. Uses POST /v2/marketfeed/ohlc (up to 1000 instruments).
+# /api/ltp — live prices for all FNO stocks in ONE Dhan API call
+# Uses POST /v2/marketfeed/ohlc — returns LTP + OHLC for up to 1000 symbols
 # ---------------------------------------------------------------------------
 @app.get("/api/ltp")
 def get_ltp(
@@ -666,13 +677,11 @@ def get_ltp(
 
     if not cid or not tok:
         return {"status": "no_credentials", "quotes": {}}
-
     if not SYMBOLS:
         return {"status": "no_symbols", "quotes": {}}
 
-    # Build request payload: { "NSE_EQ": { "security_id": 0, ... } }
-    nse_eq  = {sym["security_id"]: 0 for sym in SYMBOLS}
-    payload = {"NSE_EQ": nse_eq}
+    # Build payload: { "NSE_EQ": { "security_id": 0, ... } }
+    payload = {"NSE_EQ": {sym["security_id"]: 0 for sym in SYMBOLS}}
 
     try:
         resp = requests.post(
@@ -687,19 +696,17 @@ def get_ltp(
         )
 
         if resp.status_code == 401:
-            return {"status": "token_expired",  "quotes": {}}
+            return {"status": "token_expired", "quotes": {}}
         if resp.status_code == 429:
-            return {"status": "rate_limited",   "quotes": {}}
+            return {"status": "rate_limited",  "quotes": {}}
         if resp.status_code == 400:
-            return {"status": "bad_request",    "quotes": {}, "detail": resp.text[:200]}
+            return {"status": "bad_request",   "quotes": {}, "detail": resp.text[:200]}
 
         resp.raise_for_status()
         data = resp.json()
 
         # Response: { "data": { "NSE_EQ": { "<sec_id>": { "last_price": x, "ohlc": {...} } } } }
-        raw = data.get("data", {}).get("NSE_EQ", {})
-
-        # Build security_id → symbol lookup
+        raw       = data.get("data", {}).get("NSE_EQ", {})
         id_to_sym = {sym["security_id"]: sym["symbol"] for sym in SYMBOLS}
 
         quotes = {}
@@ -707,17 +714,17 @@ def get_ltp(
             sym = id_to_sym.get(str(sec_id))
             if not sym:
                 continue
-            ltp        = q.get("last_price", 0)
+            ltp        = float(q.get("last_price", 0))
             ohlc       = q.get("ohlc", {})
-            prev_close = ohlc.get("close", 0)   # Dhan returns prev day close as ohlc.close
+            prev_close = float(ohlc.get("close", 0))
             chg_pct    = round(((ltp - prev_close) / prev_close) * 100, 2) if prev_close else 0
 
             quotes[sym] = {
-                "ltp":        round(float(ltp),        2),
+                "ltp":        round(ltp, 2),
                 "open":       round(float(ohlc.get("open", 0)), 2),
                 "high":       round(float(ohlc.get("high", 0)), 2),
                 "low":        round(float(ohlc.get("low",  0)), 2),
-                "prev_close": round(float(prev_close), 2),
+                "prev_close": round(prev_close, 2),
                 "change_pct": chg_pct,
             }
 
