@@ -31,7 +31,7 @@ cache = {
     "total": 0,
     "symbol_source": "none",
     "market_open": False,
-    "debug": {},   # stores sample raw response for diagnosis
+    "debug": {},
 }
 
 CREDS = {
@@ -327,7 +327,7 @@ def fetch_fno_symbols():
 # ---------------------------------------------------------------------------
 def get_historical(security_id, access_token, retries=3, capture_debug=False):
     today     = datetime.now(IST)
-    from_date = (today - timedelta(days=30)).strftime("%Y-%m-%d")  # wider window
+    from_date = (today - timedelta(days=30)).strftime("%Y-%m-%d")
     to_date   = today.strftime("%Y-%m-%d")
 
     url     = f"{DHAN_BASE}/v2/charts/historical"
@@ -350,12 +350,17 @@ def get_historical(security_id, access_token, retries=3, capture_debug=False):
             resp = requests.post(url, json=payload, headers=headers, timeout=10)
 
             if capture_debug:
+                try:
+                    rj = resp.json()
+                    raw_keys = list(rj.keys())
+                except Exception:
+                    raw_keys = []
                 cache["debug"] = {
                     "security_id": security_id,
                     "status_code": resp.status_code,
                     "from_date":   from_date,
                     "to_date":     to_date,
-                    "raw_keys":    list(resp.json().keys()) if resp.status_code == 200 else [],
+                    "raw_keys":    raw_keys,
                     "raw_sample":  resp.text[:300],
                 }
 
@@ -407,7 +412,7 @@ def _run_screener(tok):
 
     results    = []
     errors     = []
-    skipped    = []   # track symbols with too few candles
+    skipped    = []
     total      = len(SYMBOLS)
     first_call = True
 
@@ -423,7 +428,7 @@ def _run_screener(tok):
         try:
             df = get_historical(
                 sym["security_id"], tok,
-                capture_debug=first_call   # capture raw response for first stock
+                capture_debug=first_call
             )
             first_call = False
 
@@ -435,7 +440,6 @@ def _run_screener(tok):
 
             rows = len(df)
 
-            # FIX: lowered from 8 to 2 — need at least prev close + today
             if rows < 2:
                 skipped.append(f"{sym['symbol']}:{rows}rows")
                 cache["progress"] = round((i + 1) / total * 100)
@@ -443,8 +447,6 @@ def _run_screener(tok):
                 continue
 
             today_vol  = df["volume"].iloc[-1]
-
-            # avg vol: use whatever history we have, up to 7 days
             hist_rows  = min(rows - 1, 7)
             avg_vol_7d = df["volume"].iloc[-(hist_rows + 1):-1].mean()
             vol_ratio  = round(today_vol / avg_vol_7d, 2) if avg_vol_7d > 0 else 0
@@ -453,7 +455,6 @@ def _run_screener(tok):
             close_prev = df["close"].iloc[-2]
             day_chg    = round(((close_now - close_prev) / close_prev) * 100, 2) if close_prev else 0
 
-            # 5d momentum: use whatever history available
             lookback   = min(rows - 1, 5)
             close_ago  = df["close"].iloc[-(lookback + 1)]
             momentum5d = round(((close_now - close_ago) / close_ago) * 100, 2) if close_ago else 0
@@ -490,7 +491,7 @@ def _run_screener(tok):
     cache["status"]      = "ok"
     cache["count"]       = len(results)
     cache["errors"]      = errors
-    cache["skipped"]     = skipped[:20]   # first 20 skipped for debug
+    cache["skipped"]     = skipped[:20]
     cache["progress"]    = 100
     cache["market_open"] = is_market_open()
 
@@ -633,18 +634,101 @@ def list_symbols():
 @app.get("/api/health")
 def health():
     return {
-        "status":        "ok",
-        "cache_status":  cache["status"],
-        "last_refresh":  cache["updated_at"],
-        "symbol_count":  len(SYMBOLS),
-        "symbol_source": cache.get("symbol_source"),
-        "result_count":  cache["count"],
-        "error_count":   len(cache.get("errors", [])),
-        "skipped_count": len(cache.get("skipped", [])),
-        "skipped_sample":cache.get("skipped", [])[:5],
-        "progress_pct":  cache.get("progress", 0),
-        "market_open":   is_market_open(),
-        "time_ist":      datetime.now(IST).strftime("%H:%M:%S"),
-        "day":           datetime.now(IST).strftime("%A"),
-        "debug":         cache.get("debug", {}),   # raw Dhan response sample
+        "status":         "ok",
+        "cache_status":   cache["status"],
+        "last_refresh":   cache["updated_at"],
+        "symbol_count":   len(SYMBOLS),
+        "symbol_source":  cache.get("symbol_source"),
+        "result_count":   cache["count"],
+        "error_count":    len(cache.get("errors", [])),
+        "skipped_count":  len(cache.get("skipped", [])),
+        "skipped_sample": cache.get("skipped", [])[:5],
+        "progress_pct":   cache.get("progress", 0),
+        "market_open":    is_market_open(),
+        "time_ist":       datetime.now(IST).strftime("%H:%M:%S"),
+        "day":            datetime.now(IST).strftime("%A"),
+        "debug":          cache.get("debug", {}),
     }
+
+
+# ---------------------------------------------------------------------------
+# NEW: /api/ltp — live prices for all FNO stocks in ONE Dhan API call
+# Called by the frontend every 5 seconds to update LTP without re-running
+# the full screener. Uses POST /v2/marketfeed/ohlc (up to 1000 instruments).
+# ---------------------------------------------------------------------------
+@app.get("/api/ltp")
+def get_ltp(
+    x_client_id: str = Header(None),
+    x_access_token: str = Header(None),
+):
+    cid = x_client_id or CREDS["client_id"]
+    tok = x_access_token or CREDS["access_token"]
+
+    if not cid or not tok:
+        return {"status": "no_credentials", "quotes": {}}
+
+    if not SYMBOLS:
+        return {"status": "no_symbols", "quotes": {}}
+
+    # Build request payload: { "NSE_EQ": { "security_id": 0, ... } }
+    nse_eq  = {sym["security_id"]: 0 for sym in SYMBOLS}
+    payload = {"NSE_EQ": nse_eq}
+
+    try:
+        resp = requests.post(
+            f"{DHAN_BASE}/v2/marketfeed/ohlc",
+            json=payload,
+            headers={
+                "access-token": tok,
+                "client-id":    cid,
+                "Content-Type": "application/json",
+            },
+            timeout=10,
+        )
+
+        if resp.status_code == 401:
+            return {"status": "token_expired",  "quotes": {}}
+        if resp.status_code == 429:
+            return {"status": "rate_limited",   "quotes": {}}
+        if resp.status_code == 400:
+            return {"status": "bad_request",    "quotes": {}, "detail": resp.text[:200]}
+
+        resp.raise_for_status()
+        data = resp.json()
+
+        # Response: { "data": { "NSE_EQ": { "<sec_id>": { "last_price": x, "ohlc": {...} } } } }
+        raw = data.get("data", {}).get("NSE_EQ", {})
+
+        # Build security_id → symbol lookup
+        id_to_sym = {sym["security_id"]: sym["symbol"] for sym in SYMBOLS}
+
+        quotes = {}
+        for sec_id, q in raw.items():
+            sym = id_to_sym.get(str(sec_id))
+            if not sym:
+                continue
+            ltp        = q.get("last_price", 0)
+            ohlc       = q.get("ohlc", {})
+            prev_close = ohlc.get("close", 0)   # Dhan returns prev day close as ohlc.close
+            chg_pct    = round(((ltp - prev_close) / prev_close) * 100, 2) if prev_close else 0
+
+            quotes[sym] = {
+                "ltp":        round(float(ltp),        2),
+                "open":       round(float(ohlc.get("open", 0)), 2),
+                "high":       round(float(ohlc.get("high", 0)), 2),
+                "low":        round(float(ohlc.get("low",  0)), 2),
+                "prev_close": round(float(prev_close), 2),
+                "change_pct": chg_pct,
+            }
+
+        now_ist = datetime.now(IST)
+        return {
+            "status":      "ok",
+            "updated_at":  now_ist.strftime("%H:%M:%S IST"),
+            "market_open": is_market_open(),
+            "count":       len(quotes),
+            "quotes":      quotes,
+        }
+
+    except Exception as e:
+        return {"status": "error", "error": str(e), "quotes": {}}
