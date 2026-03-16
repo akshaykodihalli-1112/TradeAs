@@ -10,13 +10,7 @@ from zoneinfo import ZoneInfo
 from io import StringIO
 
 app = FastAPI(title="DhanScreen API", version="1.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 DHAN_BASE = "https://api.dhan.co"
 IST       = ZoneInfo("Asia/Kolkata")
@@ -27,12 +21,7 @@ cache = {
     "count": 0, "errors": [], "progress": 0, "total": 0,
     "symbol_source": "none", "market_open": False, "debug": {},
 }
-
-CREDS = {
-    "client_id":    os.getenv("DHAN_CLIENT_ID", ""),
-    "access_token": os.getenv("DHAN_ACCESS_TOKEN", ""),
-}
-
+CREDS  = {"client_id": os.getenv("DHAN_CLIENT_ID", ""), "access_token": os.getenv("DHAN_ACCESS_TOKEN", "")}
 SYMBOLS = []
 _screener_lock = threading.Lock()
 
@@ -40,16 +29,14 @@ _screener_lock = threading.Lock()
 # ── market hours ──────────────────────────────────────────────────
 def is_market_open() -> bool:
     now = datetime.now(IST)
-    if now.weekday() >= 5:
-        return False
+    if now.weekday() >= 5: return False
     return now.replace(hour=9, minute=15, second=0, microsecond=0) <= now \
         <= now.replace(hour=15, minute=30, second=0, microsecond=0)
 
 
-# ── keep-alive (prevents Render free tier spin-down) ─────────────
+# ── keep-alive ────────────────────────────────────────────────────
 def keep_alive():
-    if not SELF_URL:
-        return
+    if not SELF_URL: return
     try:
         requests.get(f"{SELF_URL}/api/health", timeout=10)
         print(f"Keep-alive OK ({datetime.now(IST).strftime('%H:%M IST')})")
@@ -260,154 +247,180 @@ SEED_SYMBOLS = [
 ]
 
 
-# ── fetch FNO symbols from Dhan master CSV ────────────────────────
 def fetch_fno_symbols():
     global SYMBOLS
     SYMBOLS = list(SEED_SYMBOLS)
     cache["symbol_source"] = "seed"
     try:
-        print("Fetching Dhan master CSV...")
-        resp = requests.get(
-            "https://images.dhan.co/api-data/api-scrip-master.csv", timeout=15)
+        resp = requests.get("https://images.dhan.co/api-data/api-scrip-master.csv", timeout=15)
         resp.raise_for_status()
         df = pd.read_csv(StringIO(resp.text), low_memory=False)
         df.columns = [c.strip().upper() for c in df.columns]
-        print(f"CSV columns: {list(df.columns)}")
-
-        seg_col  = next((c for c in df.columns if "EXCH_SEG"  in c or "SEGMENT"        in c), None)
+        seg_col  = next((c for c in df.columns if "EXCH_SEG" in c or "SEGMENT" in c), None)
         sym_col  = next((c for c in df.columns if "TRADING_SYMBOL" in c or "SYMBOL_NAME" in c), None)
-        id_col   = next((c for c in df.columns if "SECURITY_ID"    in c or "SCRIP_ID"    in c or "SM_SYMBOL_ID" in c), None)
+        id_col   = next((c for c in df.columns if "SECURITY_ID" in c or "SCRIP_ID" in c or "SM_SYMBOL_ID" in c), None)
         inst_col = next((c for c in df.columns if "INSTRUMENT" in c), None)
-
-        if not all([seg_col, sym_col, id_col]):
-            print("CSV column mismatch — using seed.")
-            return
-
+        if not all([seg_col, sym_col, id_col]): return
         eq_df  = df[df[seg_col].str.upper().str.strip() == "NSE_EQ"].copy()
         fno_df = df[df[seg_col].str.upper().str.strip() == "NSE_FNO"].copy()
         if inst_col:
             fno_df = fno_df[fno_df[inst_col].str.upper().str.strip() == "FUTSTK"]
-
         fno_syms = set(fno_df[sym_col].str.strip().unique())
-        if not fno_syms:
-            print("No FUTSTK symbols — using seed.")
-            return
-
-        matched = eq_df[eq_df[sym_col].str.strip().isin(fno_syms)][
-            [id_col, sym_col]].drop_duplicates(subset=[sym_col])
-
-        if matched.empty:
-            print("No matches — using seed.")
-            return
-
-        SYMBOLS = [{"symbol": r[sym_col].strip(), "security_id": str(int(r[id_col])), "exchange": "NSE"}
-                   for _, r in matched.iterrows()]
+        if not fno_syms: return
+        matched = eq_df[eq_df[sym_col].str.strip().isin(fno_syms)][[id_col, sym_col]].drop_duplicates(subset=[sym_col])
+        if matched.empty: return
+        SYMBOLS = [{"symbol": r[sym_col].strip(), "security_id": str(int(r[id_col])), "exchange": "NSE"} for _, r in matched.iterrows()]
         cache["symbol_source"] = "csv"
         print(f"Loaded {len(SYMBOLS)} FNO stocks from CSV.")
     except Exception as e:
-        print(f"CSV fetch failed ({e}) — using seed ({len(SYMBOLS)} stocks).")
+        print(f"CSV fetch failed ({e}) — using seed.")
 
 
-# ── historical OHLCV fetch ────────────────────────────────────────
-def get_historical(security_id, access_token, retries=3, capture_debug=False):
+# ── Step 1: fetch ALL live quotes in one shot ─────────────────────
+def fetch_all_quotes(cid, tok):
+    """
+    Single POST to marketfeed/ohlc — returns live LTP + prev_close for all symbols.
+    This is the PRIMARY source for ltp, change%, and today's volume proxy.
+    """
+    payload = {"NSE_EQ": {sym["security_id"]: 0 for sym in SYMBOLS}}
+    try:
+        resp = requests.post(
+            f"{DHAN_BASE}/v2/marketfeed/ohlc",
+            json=payload,
+            headers={"access-token": tok, "client-id": cid, "Content-Type": "application/json"},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            print(f"marketfeed/ohlc failed: {resp.status_code} {resp.text[:100]}")
+            return {}
+        raw       = resp.json().get("data", {}).get("NSE_EQ", {})
+        id_to_sym = {sym["security_id"]: sym["symbol"] for sym in SYMBOLS}
+        quotes    = {}
+        for sec_id, q in raw.items():
+            sym = id_to_sym.get(str(sec_id))
+            if not sym: continue
+            ltp        = float(q.get("last_price", 0))
+            ohlc       = q.get("ohlc", {})
+            prev_close = float(ohlc.get("close", 0))
+            chg_pct    = round(((ltp - prev_close) / prev_close) * 100, 2) if prev_close else 0
+            quotes[sym] = {
+                "ltp":        round(ltp, 2),
+                "prev_close": round(prev_close, 2),
+                "change_pct": chg_pct,
+                "open":       round(float(ohlc.get("open", 0)), 2),
+                "high":       round(float(ohlc.get("high", 0)), 2),
+                "low":        round(float(ohlc.get("low",  0)), 2),
+            }
+        print(f"marketfeed/ohlc returned {len(quotes)} live quotes")
+        return quotes
+    except Exception as e:
+        print(f"fetch_all_quotes error: {e}")
+        return {}
+
+
+# ── Step 2: historical fetch for volume + momentum only ───────────
+def get_historical(security_id, access_token, retries=3):
     today     = datetime.now(IST)
     from_date = (today - timedelta(days=30)).strftime("%Y-%m-%d")
     to_date   = today.strftime("%Y-%m-%d")
-    url       = f"{DHAN_BASE}/v2/charts/historical"
     headers   = {"access-token": access_token, "Content-Type": "application/json"}
     payload   = {
-        "securityId": security_id, "exchangeSegment": "NSE_EQ",
-        "instrument": "EQUITY",    "expiryCode": 0,
-        "oi": False, "fromDate": from_date, "toDate": to_date,
+        "securityId":      security_id,
+        "exchangeSegment": "NSE_EQ",
+        "instrument":      "EQUITY",
+        "expiryCode":      0,
+        "fromDate":        from_date,
+        "toDate":          to_date,
     }
-
     for attempt in range(retries):
         try:
-            resp = requests.post(url, json=payload, headers=headers, timeout=10)
-
-            if capture_debug:
-                try:    raw_keys = list(resp.json().keys())
-                except: raw_keys = []
-                cache["debug"] = {
-                    "security_id": security_id, "status_code": resp.status_code,
-                    "from_date": from_date, "to_date": to_date,
-                    "raw_keys": raw_keys, "raw_sample": resp.text[:300],
-                }
-
+            resp = requests.post(f"{DHAN_BASE}/v2/charts/historical",
+                                 json=payload, headers=headers, timeout=10)
             if resp.status_code == 429:
-                wait = 2 ** (attempt + 1)
-                print(f"  429 — sleeping {wait}s"); time.sleep(wait); continue
+                time.sleep(2 ** (attempt + 1)); continue
             if resp.status_code in (400, 401, 403):
-                print(f"  HTTP {resp.status_code} id={security_id}: {resp.text[:80]}")
                 return None
-
             resp.raise_for_status()
             data = resp.json()
-            if not data.get("timestamp"):
-                return None
-
+            if not data.get("timestamp"): return None
             df = pd.DataFrame({
                 "date":   data["timestamp"],
-                "open":   data.get("open",   []),
-                "high":   data.get("high",   []),
-                "low":    data.get("low",    []),
                 "close":  data.get("close",  []),
                 "volume": data.get("volume", []),
             })
             return df.sort_values("date").reset_index(drop=True)
-
-        except requests.exceptions.Timeout:
-            print(f"  Timeout id={security_id} attempt {attempt+1}"); time.sleep(1)
-        except requests.exceptions.RequestException as e:
-            print(f"  ReqError id={security_id}: {e}"); time.sleep(1)
+        except Exception:
+            time.sleep(1)
     return None
 
 
-# ── screener worker ───────────────────────────────────────────────
+# ── Main screener: live LTP first, then historical for vol/mom ────
 def _run_screener(tok):
     global cache
-    if not SYMBOLS:
-        fetch_fno_symbols()
+    if not SYMBOLS: fetch_fno_symbols()
 
-    results, errors, skipped = [], [], []
-    total      = len(SYMBOLS)
-    first_call = True
-
-    cache.update({"status": "fetching", "progress": 0, "total": total,
-                  "market_open": is_market_open()})
+    cid    = CREDS["client_id"]
+    total  = len(SYMBOLS)
+    cache.update({"status": "fetching", "progress": 0, "total": total, "market_open": is_market_open()})
     print(f"Screener started — {total} stocks | {datetime.now(IST).strftime('%H:%M:%S IST')}")
 
+    # ── Step 1: get ALL live prices in one API call ───────────────
+    quotes = fetch_all_quotes(cid, tok)
+    cache["debug"] = {"quotes_fetched": len(quotes), "sample": dict(list(quotes.items())[:2])}
+
+    results, errors, skipped = [], [], []
+
+    # ── Step 2: get historical vol/momentum per stock ─────────────
     for i, sym in enumerate(SYMBOLS):
         try:
-            df = get_historical(sym["security_id"], tok, capture_debug=first_call)
-            first_call = False
+            q = quotes.get(sym["symbol"])
+            if not q:
+                skipped.append(f"{sym['symbol']}:no_quote")
+                cache["progress"] = round((i + 1) / total * 100)
+                time.sleep(0.3)
+                continue
 
-            if df is None:
-                skipped.append(f"{sym['symbol']}:None")
-            elif len(df) < 2:
-                skipped.append(f"{sym['symbol']}:{len(df)}rows")
+            ltp     = q["ltp"]
+            chg_pct = q["change_pct"]
+
+            # Get historical for volume ratio + 5d momentum
+            df = get_historical(sym["security_id"], tok)
+
+            if df is None or len(df) < 2:
+                # Still add the stock with live LTP, just no vol/mom
+                results.append({
+                    "symbol":      sym["symbol"],
+                    "exchange":    sym["exchange"],
+                    "ltp":         ltp,
+                    "change":      chg_pct,
+                    "momentum5d":  0,
+                    "volumeRatio": 0,
+                    "todayVol":    0,
+                    "avgVol7d":    0,
+                })
             else:
                 rows       = len(df)
                 today_vol  = df["volume"].iloc[-1]
                 hist_rows  = min(rows - 1, 7)
                 avg_vol_7d = df["volume"].iloc[-(hist_rows+1):-1].mean()
                 vol_ratio  = round(today_vol / avg_vol_7d, 2) if avg_vol_7d > 0 else 0
-                close_now  = df["close"].iloc[-1]
-                close_prev = df["close"].iloc[-2]
-                day_chg    = round(((close_now - close_prev) / close_prev) * 100, 2) if close_prev else 0
                 lookback   = min(rows - 1, 5)
                 close_ago  = df["close"].iloc[-(lookback+1)]
-                momentum5d = round(((close_now - close_ago) / close_ago) * 100, 2) if close_ago else 0
+                momentum5d = round(((ltp - close_ago) / close_ago) * 100, 2) if close_ago else 0
+
                 results.append({
-                    "symbol": sym["symbol"], "exchange": sym["exchange"],
-                    "ltp": round(float(close_now), 2), "change": day_chg,
-                    "momentum5d": momentum5d, "volumeRatio": vol_ratio,
-                    "todayVol": int(today_vol), "avgVol7d": int(avg_vol_7d),
-                    "candles": rows,
+                    "symbol":      sym["symbol"],
+                    "exchange":    sym["exchange"],
+                    "ltp":         ltp,            # ← LIVE from marketfeed
+                    "change":      chg_pct,        # ← LIVE vs prev close
+                    "momentum5d":  momentum5d,     # ← live LTP vs 5d ago close
+                    "volumeRatio": vol_ratio,
+                    "todayVol":    int(today_vol),
+                    "avgVol7d":    int(avg_vol_7d),
                 })
+
         except Exception as e:
             errors.append(f"{sym['symbol']}: {e}")
-            print(f"  Error {sym['symbol']}: {e}")
 
         cache["progress"] = round((i + 1) / total * 100)
         time.sleep(0.3)
@@ -416,9 +429,8 @@ def _run_screener(tok):
             time.sleep(1.5)
 
     results.sort(key=lambda x: x["volumeRatio"], reverse=True)
-    now_ist = datetime.now(IST)
     cache.update({
-        "data": results, "updated_at": now_ist.strftime("%H:%M:%S IST"),
+        "data": results, "updated_at": datetime.now(IST).strftime("%H:%M:%S IST"),
         "status": "ok", "count": len(results), "errors": errors,
         "skipped": skipped[:20], "progress": 100, "market_open": is_market_open(),
     })
@@ -428,11 +440,9 @@ def _run_screener(tok):
 def fetch_screener(client_id=None, access_token=None):
     cid = client_id or CREDS["client_id"]
     tok = access_token or CREDS["access_token"]
-    if not cid or not tok:
-        cache["status"] = "no_credentials"; return
+    if not cid or not tok: cache["status"] = "no_credentials"; return
     CREDS["client_id"] = cid; CREDS["access_token"] = tok
-    if _screener_lock.locked():
-        print("Screener already running — skipping."); return
+    if _screener_lock.locked(): print("Screener already running."); return
     def _worker():
         with _screener_lock: _run_screener(tok)
     threading.Thread(target=_worker, daemon=True).start()
@@ -442,7 +452,7 @@ def fetch_screener(client_id=None, access_token=None):
 def scheduled_refresh():
     if not CREDS["client_id"] or not CREDS["access_token"]: return
     if is_market_open(): fetch_screener()
-    else: print(f"Market closed — skipping ({datetime.now(IST).strftime('%H:%M IST')})")
+    else: print(f"Market closed ({datetime.now(IST).strftime('%H:%M IST')})")
 
 
 scheduler = BackgroundScheduler()
@@ -531,55 +541,18 @@ def health():
     }
 
 
-# ── /api/ltp — live prices in ONE call using marketfeed/ohlc ─────
+# ── /api/ltp — frontend polls this every 5s for live prices ───────
 @app.get("/api/ltp")
 def get_ltp(x_client_id: str = Header(None), x_access_token: str = Header(None)):
     cid = x_client_id or CREDS["client_id"]
     tok = x_access_token or CREDS["access_token"]
-
     if not cid or not tok: return {"status": "no_credentials", "quotes": {}}
     if not SYMBOLS:        return {"status": "no_symbols",     "quotes": {}}
-
-    payload = {"NSE_EQ": {sym["security_id"]: 0 for sym in SYMBOLS}}
-
-    try:
-        resp = requests.post(
-            f"{DHAN_BASE}/v2/marketfeed/ohlc",
-            json=payload,
-            headers={"access-token": tok, "client-id": cid, "Content-Type": "application/json"},
-            timeout=10,
-        )
-        if resp.status_code == 401: return {"status": "token_expired", "quotes": {}}
-        if resp.status_code == 429: return {"status": "rate_limited",  "quotes": {}}
-        if resp.status_code == 400: return {"status": "bad_request",   "quotes": {}, "detail": resp.text[:200]}
-        resp.raise_for_status()
-
-        raw       = resp.json().get("data", {}).get("NSE_EQ", {})
-        id_to_sym = {sym["security_id"]: sym["symbol"] for sym in SYMBOLS}
-        quotes    = {}
-
-        for sec_id, q in raw.items():
-            sym = id_to_sym.get(str(sec_id))
-            if not sym: continue
-            ltp        = float(q.get("last_price", 0))
-            ohlc       = q.get("ohlc", {})
-            prev_close = float(ohlc.get("close", 0))
-            chg_pct    = round(((ltp - prev_close) / prev_close) * 100, 2) if prev_close else 0
-            quotes[sym] = {
-                "ltp":        round(ltp, 2),
-                "open":       round(float(ohlc.get("open", 0)), 2),
-                "high":       round(float(ohlc.get("high", 0)), 2),
-                "low":        round(float(ohlc.get("low",  0)), 2),
-                "prev_close": round(prev_close, 2),
-                "change_pct": chg_pct,
-            }
-
-        return {
-            "status":      "ok",
-            "updated_at":  datetime.now(IST).strftime("%H:%M:%S IST"),
-            "market_open": is_market_open(),
-            "count":       len(quotes),
-            "quotes":      quotes,
-        }
-    except Exception as e:
-        return {"status": "error", "error": str(e), "quotes": {}}
+    quotes = fetch_all_quotes(cid, tok)
+    return {
+        "status":      "ok" if quotes else "error",
+        "updated_at":  datetime.now(IST).strftime("%H:%M:%S IST"),
+        "market_open": is_market_open(),
+        "count":       len(quotes),
+        "quotes":      quotes,
+    }
