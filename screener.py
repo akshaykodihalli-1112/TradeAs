@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Header
+from fastapi import FastAPI, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.background import BackgroundScheduler
 import requests
@@ -33,11 +33,15 @@ def is_market_open() -> bool:
         <= now.replace(hour=15, minute=30, second=0, microsecond=0)
 
 
+def get_ist_now():
+    return datetime.now(IST)
+
+
 def keep_alive():
     if not SELF_URL: return
     try:
         requests.get(f"{SELF_URL}/api/health", timeout=10)
-        print(f"Keep-alive OK ({datetime.now(IST).strftime('%H:%M IST')})")
+        print(f"Keep-alive OK ({get_ist_now().strftime('%H:%M IST')})")
     except Exception as e:
         print(f"Keep-alive failed: {e}")
 
@@ -273,126 +277,97 @@ def fetch_fno_symbols():
         print(f"CSV fetch failed ({e}) — using seed.")
 
 
-# ── Live quotes: correct payload format per Dhan docs ─────────────
-# Request:  POST /v2/marketfeed/quote
-# Payload:  {"NSE_EQ": [int_id1, int_id2, ...]}  ← list of integers
-# Response: {"data": {"NSE_EQ": {"11536": {"last_price": x, "volume": x, "net_change": x, "ohlc": {...}}}}}
+# ── Live quotes ───────────────────────────────────────────────────
 def fetch_all_quotes(cid, tok):
-    # Dhan allows max 1000 instruments per request
-    # Split into batches of 500 to be safe
     all_ids   = [int(sym["security_id"]) for sym in SYMBOLS]
     id_to_sym = {sym["security_id"]: sym["symbol"] for sym in SYMBOLS}
     headers   = {"access-token": tok, "client-id": cid, "Content-Type": "application/json"}
     quotes    = {}
+    last_error = None
 
-    batch_size = 500
-    for i in range(0, len(all_ids), batch_size):
-        batch   = all_ids[i:i + batch_size]
-        payload = {"NSE_EQ": batch}   # ← CORRECT: list of integers
-        try:
-            resp = requests.post(
-                f"{DHAN_BASE}/v2/marketfeed/quote",  # quote gives volume + net_change
-                json=payload, headers=headers, timeout=15,
-            )
-            if resp.status_code != 200:
-                print(f"marketfeed/quote batch {i} failed: {resp.status_code} {resp.text[:150]}")
-                # fallback to ohlc endpoint
-                resp = requests.post(
-                    f"{DHAN_BASE}/v2/marketfeed/ohlc",
-                    json=payload, headers=headers, timeout=15,
-                )
-                if resp.status_code != 200:
-                    print(f"marketfeed/ohlc fallback also failed: {resp.status_code}")
-                    continue
-
-            raw = resp.json().get("data", {}).get("NSE_EQ", {})
-            for sec_id, q in raw.items():
-                sym = id_to_sym.get(str(sec_id))
-                if not sym: continue
-                ltp        = float(q.get("last_price", 0))
-                ohlc       = q.get("ohlc", {})
-                prev_close = float(ohlc.get("close", 0))
-                net_change = float(q.get("net_change", 0))
-                volume     = int(q.get("volume", 0))
-                # use net_change if available, else calculate from prev_close
-                if net_change and prev_close:
-                    chg_pct = round((net_change / prev_close) * 100, 2)
-                elif prev_close:
-                    chg_pct = round(((ltp - prev_close) / prev_close) * 100, 2)
+    for i in range(0, len(all_ids), 500):
+        batch   = all_ids[i:i + 500]
+        payload = {"NSE_EQ": batch}
+        for endpoint in ["/v2/marketfeed/quote", "/v2/marketfeed/ohlc"]:
+            try:
+                resp = requests.post(f"{DHAN_BASE}{endpoint}", json=payload, headers=headers, timeout=15)
+                print(f"  {endpoint} batch={i} status={resp.status_code} body_start={resp.text[:120]}")
+                if resp.status_code == 200:
+                    raw = resp.json().get("data", {}).get("NSE_EQ", {})
+                    for sec_id, q in raw.items():
+                        sym = id_to_sym.get(str(sec_id))
+                        if not sym: continue
+                        ltp        = float(q.get("last_price", 0))
+                        ohlc       = q.get("ohlc", {})
+                        prev_close = float(ohlc.get("close", 0))
+                        net_change = float(q.get("net_change", 0))
+                        volume     = int(q.get("volume", 0))
+                        if net_change and prev_close:
+                            chg_pct = round((net_change / prev_close) * 100, 2)
+                        elif prev_close:
+                            chg_pct = round(((ltp - prev_close) / prev_close) * 100, 2)
+                        else:
+                            chg_pct = 0
+                        quotes[sym] = {
+                            "ltp": round(ltp, 2), "prev_close": round(prev_close, 2),
+                            "change_pct": chg_pct, "volume": volume,
+                            "open": round(float(ohlc.get("open", 0)), 2),
+                            "high": round(float(ohlc.get("high", 0)), 2),
+                            "low":  round(float(ohlc.get("low",  0)), 2),
+                        }
+                    break
                 else:
-                    chg_pct = 0
-                quotes[sym] = {
-                    "ltp":        round(ltp, 2),
-                    "prev_close": round(prev_close, 2),
-                    "change_pct": chg_pct,
-                    "volume":     volume,
-                    "open":       round(float(ohlc.get("open", 0)), 2),
-                    "high":       round(float(ohlc.get("high", 0)), 2),
-                    "low":        round(float(ohlc.get("low",  0)), 2),
-                }
-        except Exception as e:
-            print(f"fetch_all_quotes batch {i} error: {e}")
+                    last_error = f"{endpoint} {resp.status_code}: {resp.text[:150]}"
+            except Exception as e:
+                last_error = str(e)
+        if i + 500 < len(all_ids):
+            time.sleep(1.1)
 
-        if i + batch_size < len(all_ids):
-            time.sleep(1.1)  # rate limit: 1 req/sec per Dhan docs
-
-    print(f"marketfeed/quote returned {len(quotes)} live quotes")
+    cache["debug"] = {"quotes_fetched": len(quotes), "last_error": last_error,
+                      "sample": {k: v for k, v in list(quotes.items())[:2]}}
+    print(f"fetch_all_quotes → {len(quotes)} quotes")
     return quotes
 
 
-# ── Historical fetch for 5d momentum only ─────────────────────────
-def get_historical_close(security_id, access_token, retries=3):
+def get_historical(security_id, access_token, retries=3):
     today     = datetime.now(IST)
     from_date = (today - timedelta(days=30)).strftime("%Y-%m-%d")
     to_date   = today.strftime("%Y-%m-%d")
     headers   = {"access-token": access_token, "Content-Type": "application/json"}
-    payload   = {
-        "securityId": security_id, "exchangeSegment": "NSE_EQ",
-        "instrument": "EQUITY", "expiryCode": 0,
-        "fromDate": from_date, "toDate": to_date,
-    }
+    payload   = {"securityId": security_id, "exchangeSegment": "NSE_EQ",
+                  "instrument": "EQUITY", "expiryCode": 0,
+                  "fromDate": from_date, "toDate": to_date}
     for attempt in range(retries):
         try:
             resp = requests.post(f"{DHAN_BASE}/v2/charts/historical",
                                  json=payload, headers=headers, timeout=10)
             if resp.status_code == 429:
                 time.sleep(2 ** (attempt + 1)); continue
-            if resp.status_code in (400, 401, 403): return None
+            if resp.status_code in (400, 401, 403): return None, None
             resp.raise_for_status()
             data = resp.json()
-            if not data.get("timestamp"): return None
-            closes = data.get("close", [])
-            return closes  # just return the close list
+            if not data.get("timestamp"): return None, None
+            return data.get("close", []), data.get("volume", [])
         except Exception:
             time.sleep(1)
-    return None
+    return None, None
 
 
-# ── Main screener ─────────────────────────────────────────────────
 def _run_screener(tok):
     global cache
     if not SYMBOLS: fetch_fno_symbols()
-
     cid   = CREDS["client_id"]
     total = len(SYMBOLS)
     cache.update({"status": "fetching", "progress": 0, "total": total, "market_open": is_market_open()})
-    print(f"Screener — {total} stocks | {datetime.now(IST).strftime('%H:%M:%S IST')}")
+    print(f"Screener — {total} stocks | {get_ist_now().strftime('%H:%M:%S IST')}")
 
-    # Step 1: all live quotes in 1-2 API calls
     quotes = fetch_all_quotes(cid, tok)
-    cache["debug"] = {
-        "quotes_fetched": len(quotes),
-        "sample": {k: v for k, v in list(quotes.items())[:3]},
-    }
-
     if not quotes:
-        cache.update({"status": "error", "progress": 100})
-        print("No quotes returned — check token / marketfeed subscription")
+        cache.update({"status": "error", "progress": 100,
+                      "errors": [f"marketfeed returned 0 quotes. debug: {cache['debug']}"]})
         return
 
     results, skipped = [], []
-
-    # Step 2: historical closes for 5d momentum (sequential, paced)
     for i, sym in enumerate(SYMBOLS):
         try:
             q = quotes.get(sym["symbol"])
@@ -401,54 +376,38 @@ def _run_screener(tok):
                 cache["progress"] = round((i + 1) / total * 100)
                 time.sleep(0.3)
                 continue
-
-            ltp        = q["ltp"]
-            chg_pct    = q["change_pct"]
-            today_vol  = q["volume"]
-            prev_close = q["prev_close"]
-
-            # Get historical closes for momentum
-            closes = get_historical_close(sym["security_id"], tok)
-
+            ltp       = q["ltp"]
+            chg_pct   = q["change_pct"]
+            today_vol = q["volume"]
+            closes, volumes = get_historical(sym["security_id"], tok)
+            momentum5d = 0
             if closes and len(closes) >= 6:
                 close_5ago = closes[-6]
                 momentum5d = round(((ltp - close_5ago) / close_5ago) * 100, 2) if close_5ago else 0
-                # vol ratio: today_vol vs avg of prev 7 days from history
-                # note: today_vol from live quote is more accurate
-                avg_vol_7d = 0   # will be computed below
-            else:
-                momentum5d = 0
-
-            # Compute avg_vol_7d from historical if we have it
+            vol_ratio  = 0
             avg_vol_7d = 0
-            if closes and len(closes) >= 2:
-                # We only have close prices from historical, not volume
-                # Use today_vol from live quote as-is, skip ratio
-                avg_vol_7d = 0  # placeholder — need volume history
-
+            if volumes and len(volumes) >= 8:
+                avg_vol_7d = sum(volumes[-8:-1]) / 7
+                vol_ratio  = round(today_vol / avg_vol_7d, 2) if avg_vol_7d > 0 else 0
+            elif today_vol > 0:
+                vol_ratio = 1.0
             results.append({
-                "symbol":      sym["symbol"],
-                "exchange":    sym["exchange"],
-                "ltp":         ltp,
-                "change":      chg_pct,
-                "momentum5d":  momentum5d,
-                "volumeRatio": 0,    # needs historical volume — see note below
-                "todayVol":    today_vol,
-                "avgVol7d":    avg_vol_7d,
+                "symbol": sym["symbol"], "exchange": sym["exchange"],
+                "ltp": ltp, "change": chg_pct,
+                "momentum5d": momentum5d, "volumeRatio": vol_ratio,
+                "todayVol": today_vol, "avgVol7d": int(avg_vol_7d),
             })
-
         except Exception as e:
             skipped.append(f"{sym['symbol']}:{e}")
-
         cache["progress"] = round((i + 1) / total * 100)
         time.sleep(0.3)
         if (i + 1) % 20 == 0:
             print(f"  {i+1}/{total} | ok={len(results)}")
             time.sleep(1.5)
 
-    results.sort(key=lambda x: x["todayVol"], reverse=True)
+    results.sort(key=lambda x: x["volumeRatio"], reverse=True)
     cache.update({
-        "data": results, "updated_at": datetime.now(IST).strftime("%H:%M:%S IST"),
+        "data": results, "updated_at": get_ist_now().strftime("%H:%M:%S IST"),
         "status": "ok", "count": len(results), "errors": [],
         "skipped": skipped[:20], "progress": 100, "market_open": is_market_open(),
     })
@@ -469,7 +428,7 @@ def fetch_screener(client_id=None, access_token=None):
 def scheduled_refresh():
     if not CREDS["client_id"] or not CREDS["access_token"]: return
     if is_market_open(): fetch_screener()
-    else: print(f"Market closed ({datetime.now(IST).strftime('%H:%M IST')})")
+    else: print(f"Market closed ({get_ist_now().strftime('%H:%M IST')})")
 
 
 scheduler = BackgroundScheduler()
@@ -487,10 +446,11 @@ async def startup():
     threading.Thread(target=_delayed, daemon=True).start()
 
 
+# ── STANDARD ROUTES ───────────────────────────────────────────────
 @app.get("/")
 def root():
     return {"status": "ok", "service": "DhanScreen API", "docs": "/docs",
-            "time_ist": datetime.now(IST).strftime("%H:%M:%S"), "market_open": is_market_open()}
+            "time_ist": get_ist_now().strftime("%H:%M:%S"), "market_open": is_market_open()}
 
 
 @app.get("/api/ping-dhan")
@@ -549,8 +509,8 @@ def health():
         "skipped_sample": cache.get("skipped", [])[:5],
         "progress_pct": cache.get("progress", 0),
         "market_open": is_market_open(),
-        "time_ist": datetime.now(IST).strftime("%H:%M:%S"),
-        "day": datetime.now(IST).strftime("%A"),
+        "time_ist": get_ist_now().strftime("%H:%M:%S"),
+        "day": get_ist_now().strftime("%A"),
         "debug": cache.get("debug", {}),
     }
 
@@ -562,10 +522,265 @@ def get_ltp(x_client_id: str = Header(None), x_access_token: str = Header(None))
     if not cid or not tok: return {"status": "no_credentials", "quotes": {}}
     if not SYMBOLS:        return {"status": "no_symbols",     "quotes": {}}
     quotes = fetch_all_quotes(cid, tok)
+    return {"status": "ok" if quotes else "error",
+            "updated_at": get_ist_now().strftime("%H:%M:%S IST"),
+            "market_open": is_market_open(), "count": len(quotes),
+            "quotes": quotes, "debug": cache.get("debug", {})}
+
+
+# ── NEW: PROXY ENDPOINTS FOR BREAKOUT SCANNER ─────────────────────
+
+@app.get("/api/intraday")
+def proxy_intraday(
+    security_id: str = Query(...),
+    date:        str = Query(...),
+    interval:    str = Query("5"),
+    x_client_id: str = Header(None),
+    x_access_token: str = Header(None),
+):
+    """
+    Proxy for Dhan intraday 5-min candles.
+    Solves CORS — browser calls this endpoint, backend calls Dhan.
+    Returns: { timestamp, open, high, low, close, volume }
+    When market is closed, returns last available daily candle as fallback.
+    """
+    cid = x_client_id or CREDS["client_id"]
+    tok = x_access_token or CREDS["access_token"]
+    if not tok: return {"status": "no_credentials", "data": {}}
+
+    headers = {"access-token": tok, "client-id": cid, "Content-Type": "application/json"}
+
+    # Try intraday first
+    payload = {
+        "securityId":      security_id,
+        "exchangeSegment": "NSE_EQ",
+        "instrument":      "EQUITY",
+        "interval":        interval,
+        "fromDate":        date,
+        "toDate":          date,
+    }
+    try:
+        resp = requests.post(f"{DHAN_BASE}/v2/charts/intraday",
+                             json=payload, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("timestamp") and len(data["timestamp"]) > 0:
+                return {"status": "ok", "source": "intraday", "data": data}
+
+        # Fallback: return last daily candle when intraday not available
+        print(f"Intraday fallback for {security_id} on {date}: status={resp.status_code}")
+    except Exception as e:
+        print(f"Intraday error {security_id}: {e}")
+
+    # Fallback to daily data (last trading day)
+    try:
+        today     = datetime.now(IST)
+        from_date = (today - timedelta(days=10)).strftime("%Y-%m-%d")
+        to_date   = today.strftime("%Y-%m-%d")
+        daily_payload = {
+            "securityId": security_id, "exchangeSegment": "NSE_EQ",
+            "instrument": "EQUITY", "expiryCode": 0,
+            "fromDate": from_date, "toDate": to_date,
+        }
+        resp2 = requests.post(f"{DHAN_BASE}/v2/charts/historical",
+                              json=daily_payload, headers=headers, timeout=10)
+        if resp2.status_code == 200:
+            data2 = resp2.json()
+            if data2.get("timestamp"):
+                # Return last candle as single-candle "intraday"
+                idx = -1
+                last_ts = data2["timestamp"][idx]
+                return {
+                    "status": "ok",
+                    "source": "daily_fallback",
+                    "data": {
+                        "timestamp": [last_ts],
+                        "open":   [data2["open"][idx]],
+                        "high":   [data2["high"][idx]],
+                        "low":    [data2["low"][idx]],
+                        "close":  [data2["close"][idx]],
+                        "volume": [data2["volume"][idx]],
+                    }
+                }
+    except Exception as e:
+        print(f"Daily fallback error {security_id}: {e}")
+
+    return {"status": "no_data", "data": {}}
+
+
+@app.get("/api/historical")
+def proxy_historical(
+    security_id:    str = Query(...),
+    from_date:      str = Query(...),
+    to_date:        str = Query(...),
+    x_client_id:    str = Header(None),
+    x_access_token: str = Header(None),
+):
+    """
+    Proxy for Dhan daily historical candles.
+    Solves CORS — browser calls this, backend calls Dhan.
+    Returns last N daily candles for historical breakout analysis.
+    """
+    cid = x_client_id or CREDS["client_id"]
+    tok = x_access_token or CREDS["access_token"]
+    if not tok: return {"status": "no_credentials", "data": {}}
+
+    headers = {"access-token": tok, "client-id": cid, "Content-Type": "application/json"}
+    payload = {
+        "securityId":      security_id,
+        "exchangeSegment": "NSE_EQ",
+        "instrument":      "EQUITY",
+        "expiryCode":      0,
+        "fromDate":        from_date,
+        "toDate":          to_date,
+    }
+    try:
+        resp = requests.post(f"{DHAN_BASE}/v2/charts/historical",
+                             json=payload, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            return {"status": "ok", "data": resp.json()}
+        return {"status": "error", "code": resp.status_code, "detail": resp.text[:150]}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.get("/api/breakout/scan")
+def breakout_scan_all(
+    x_client_id:    str = Header(None),
+    x_access_token: str = Header(None),
+):
+    """
+    Runs full breakout scan for all FNO symbols server-side.
+    Returns pre-computed ORB analysis so the browser doesn't need
+    to make 198 individual API calls.
+    """
+    cid = x_client_id or CREDS["client_id"]
+    tok = x_access_token or CREDS["access_token"]
+    if not tok: return {"status": "no_credentials", "results": []}
+    if not SYMBOLS: return {"status": "no_symbols", "results": []}
+
+    today     = datetime.now(IST)
+    from_date = (today - timedelta(days=10)).strftime("%Y-%m-%d")
+    to_date   = today.strftime("%Y-%m-%d")
+
+    headers = {"access-token": tok, "client-id": cid, "Content-Type": "application/json"}
+    results = []
+
+    for sym in SYMBOLS:
+        try:
+            # Fetch daily candles (last 10 days covers 5+ trading days)
+            payload = {
+                "securityId": sym["security_id"], "exchangeSegment": "NSE_EQ",
+                "instrument": "EQUITY", "expiryCode": 0,
+                "fromDate": from_date, "toDate": to_date,
+            }
+            resp = requests.post(f"{DHAN_BASE}/v2/charts/historical",
+                                 json=payload, headers=headers, timeout=10)
+            if resp.status_code != 200:
+                time.sleep(0.3)
+                continue
+
+            data = resp.json()
+            ts     = data.get("timestamp", [])
+            opens  = data.get("open",   [])
+            highs  = data.get("high",   [])
+            lows   = data.get("low",    [])
+            closes = data.get("close",  [])
+
+            if len(ts) < 2:
+                time.sleep(0.3)
+                continue
+
+            # Last 5 daily candles for history
+            history = []
+            for i in range(max(0, len(ts) - 5), len(ts)):
+                o, h, l, c = opens[i], highs[i], lows[i], closes[i]
+                day_chg = round(((c - o) / o) * 100, 2) if o else 0
+                rng     = round(((h - l) / l) * 100, 2) if l else 0
+                sig = "bull" if day_chg > 0.5 and rng > 0.5 else \
+                      "bear" if day_chg < -0.5 and rng > 0.5 else "none"
+                d = datetime.utcfromtimestamp(ts[i])
+                history.append({
+                    "date":    d.strftime("%d %b"),
+                    "open":    round(o, 2),
+                    "high":    round(h, 2),
+                    "low":     round(l, 2),
+                    "close":   round(c, 2),
+                    "chg_pct": day_chg,
+                    "signal":  sig,
+                })
+
+            # Latest candle = today's data
+            last = len(ts) - 1
+            ltp     = round(closes[last], 2)
+            day_o   = opens[last]
+            day_h   = highs[last]
+            day_l   = lows[last]
+            day_chg = round(((ltp - day_o) / day_o) * 100, 2) if day_o else 0
+
+            # ORB from daily data: use open as ORB reference
+            # high of day approximates the breakout level
+            # (true 5-min ORB only available during market hours via intraday API)
+            orb_high = round(day_h * 0.998, 2)  # day high as resistance
+            orb_low  = round(day_l * 1.002, 2)  # day low as support
+            orb_w    = round(((orb_high - orb_low) / orb_low) * 100, 2)
+
+            # Signal based on close vs open (daily breakout)
+            if ltp > orb_high:      signal = "bull"
+            elif ltp < orb_low:     signal = "bear"
+            elif day_chg > 0.3:     signal = "watch"
+            else:                   signal = "none"
+
+            bull_days = sum(1 for h in history if h["signal"] == "bull")
+            bear_days = sum(1 for h in history if h["signal"] == "bear")
+
+            # Streak
+            streak = 0
+            if history:
+                dir_ = history[-1]["signal"]
+                if dir_ != "none":
+                    for h in reversed(history):
+                        if h["signal"] == dir_: streak += 1
+                        else: break
+                    if dir_ == "bear": streak = -streak
+
+            score = (bull_days - bear_days) + \
+                    (2 if signal == "bull" else -2 if signal == "bear" else 0) + \
+                    (streak if streak > 0 else streak)
+
+            results.append({
+                "symbol":    sym["symbol"],
+                "exchange":  sym["exchange"],
+                "ltp":       ltp,
+                "change":    day_chg,
+                "orbHigh":   orb_high,
+                "orbLow":    orb_low,
+                "orbWidthPct": orb_w,
+                "signal":    signal,
+                "strength":  3 if signal in ("bull","bear") and abs(day_chg) > 1.5 else
+                             2 if signal in ("bull","bear") else
+                             1 if signal == "watch" else 0,
+                "history":   history,
+                "bullDays":  bull_days,
+                "bearDays":  bear_days,
+                "streak":    streak,
+                "score":     score,
+            })
+
+            time.sleep(0.3)
+
+        except Exception as e:
+            print(f"Breakout scan error {sym['symbol']}: {e}")
+            time.sleep(0.3)
+
+    results.sort(key=lambda x: (
+        3 if x["signal"] == "bull" else 2 if x["signal"] == "bear" else 1 if x["signal"] == "watch" else 0
+    ), reverse=True)
+
     return {
-        "status":      "ok" if quotes else "error",
-        "updated_at":  datetime.now(IST).strftime("%H:%M:%S IST"),
+        "status":     "ok",
+        "count":      len(results),
+        "updated_at": get_ist_now().strftime("%H:%M:%S IST"),
         "market_open": is_market_open(),
-        "count":       len(quotes),
-        "quotes":      quotes,
+        "results":    results,
     }
