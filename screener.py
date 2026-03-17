@@ -86,92 +86,68 @@ _csv_lock     = threading.Lock()
 
 
 
-# ── Emergency symbol list — verified Dhan NSE_EQ IDs (2025-03-17) ──────
-# Used ONLY when CSV is unreachable. Call POST /api/symbols/refresh to upgrade.
-_EMERGENCY_SYMBOLS = [
-    ("ABBOTINDIA","13636"),("ABCAPITAL","20904"),("ABFRL","20179"),("ACC","22"),
-    ("ADANIENT","25"),("ADANIPORTS","15083"),("ALKEM","17963"),("AMBUJACEM","1270"),
-    ("ANGELONE","20554"),("APLAPOLLO","19229"),("APOLLOHOSP","157"),("APOLLOTYRE","163"),
-    ("ASHOKLEY","212"),("ASIANPAINT","467"),("ASTRAL","14418"),("ATGL","22169"),
-    ("ATUL","263"),("AUBANK","21238"),("AUROPHARMA","275"),("AXISBANK","5900"),
-    ("BAJAJ-AUTO","16669"),("BAJAJFINSV","16675"),("BAJFINANCE","317"),
-    ("BALKRISIND","1482"),("BANDHANBNK","21719"),("BANKBARODA","1452"),
-    ("BATAINDIA","371"),("BEL","383"),("BERGEPAINT","404"),("BHARATFORG","422"),
-    ("BHARTIARTL","10604"),("BHEL","438"),("BIOCON","11373"),("BOSCHLTD","2181"),
-    ("BPCL","526"),("BRITANNIA","547"),("BSOFT","6004"),("CANBK","10794"),
-    ("CANFINHOME","9262"),("CDSL","21822"),("CGPOWER","678"),("CHAMBLFERT","685"),
-    ("CHOLAFIN","4375"),("CIPLA","694"),("COALINDIA","20374"),("COFORGE","11543"),
-    ("COLPAL","742"),("CONCOR","4749"),("COROMANDEL","739"),("CROMPTON","20655"),
-    ("CUB","5784"),("CUMMINSIND","774"),("DABUR","10107"),("DALBHARAT","18253"),
-    ("DEEPAKNTR","10209"),("DELTACORP","14413"),("DIVISLAB","15174"),("DIXON","21690"),
-    ("DLF","14732"),("DMART","21561"),("DRREDDY","881"),("EICHERMOT","910"),
-    ("ESCORTS","958"),("EXIDEIND","10780"),("FEDERALBNK","1023"),("FORCEMOT","1039"),
-    ("FORTIS","14804"),("GAIL","1066"),("GLENMARK","1109"),("GMRINFRA","13528"),
-    ("GNFC","1113"),("GODREJCP","10099"),("GODREJPROP","17875"),("GRANULES","11809"),
-    ("GRASIM","315"),("GUJGASLTD","10599"),("HAL","2303"),("HAVELLS","8927"),
-    ("HCLTECH","7229"),("HDFCAMC","22080"),("HDFCBANK","1333"),("HDFCLIFE","20704"),
-    ("HEROMOTOCO","1348"),("HFCL","1350"),("HINDALCO","1306"),("HINDCOPPER","14978"),
-    ("HINDPETRO","1406"),("HINDUNILVR","1394"),("ICICIBANK","4963"),("ICICIGI","21770"),
-    ("ICICIPRULI","18652"),("IDEA","14366"),("IDFCFIRSTB","20286"),("IEX","22149"),
-    ("IGL","11262"),("INDHOTEL","1512"),("INDIACEM","1515"),("INDIAMART","22592"),
-    ("INDIGO","20251"),("INDUSINDBK","5258"),("INDUSTOWER","22271"),("INFY","1594"),
-    ("IOC","1624"),("IPCALAB","19483"),("IRCTC","22961"),("ITC","1660"),
-    ("JINDALSTEL","11600"),("JKCEMENT","13910"),("JSWENERGY","17594"),("JSWSTEEL","11723"),
-    ("JUBLFOOD","18096"),("KALYANKJIL","22945"),("KEI","1743"),("KOTAKBANK","1232"),
-    ("KPITTECH","4651"),("LALPATHLAB","23048"),("LAURUSLABS","22950"),("LICHSGFIN","1847"),
-    ("LICI","24095"),("LT","11483"),("LTIM","17818"),("LTTS","20299"),("LUPIN","10440"),
-    ("M&M","2031"),("M&MFIN","13285"),("MANAPPURAM","19061"),("MARICO","4067"),
-    ("MARUTI","10999"),("MAXHEALTH","23267"),("MCX","19238"),("METROPOLIS","22843"),
-    ("MFSL","4136"),("MOTHERSON","4204"),("MPHASIS","4261"),("MRF","4162"),
-    ("MUTHOOTFIN","18143"),("NATIONALUM","4244"),("NAUKRI","13751"),("NAVINFLUOR","14500"),
-    ("NESTLEIND","4306"),("NMDC","15332"),("NTPC","11630"),("OBEROIRLTY","20242"),
-    ("OFSS","10738"),("ONGC","2475"),("PAGEIND","14401"),("PEL","2481"),
-    ("PERSISTENT","18365"),("PETRONET","11351"),("PFC","14299"),("PIDILITIND","2664"),
-    ("PIIND","19015"),("PNB","2730"),("POLYCAB","22185"),("POWERGRID","14977"),
-    ("PVRINOX","17243"),("RAMCOCEM","14994"),("RBLBANK","20413"),("RECLTD","15355"),
-    ("RELIANCE","2885"),("SAIL","2963"),("SBICARD","22990"),("SBILIFE","21808"),
-    ("SBIN","3045"),("SHREECEM","3103"),("SHRIRAMFIN","20817"),("SIEMENS","3150"),
-    ("SRF","3273"),("SUNPHARMA","3351"),("SUNTV","3367"),("SUPREMEIND","3378"),
-    ("SUZLON","3391"),("SYNGENE","20562"),("TATACHEM","3405"),("TATACOMM","3408"),
-    ("TATACONSUM","3432"),("TATAELXSI","4910"),("TATAMOTORS","3456"),("TATAPOWER","3426"),
-    ("TATASTEEL","3499"),("TCS","11536"),("TECHM","13538"),("TIINDIA","19455"),
-    ("TITAN","3506"),("TORNTPHARM","3518"),("TORNTPOWER","3519"),("TRENT","3530"),
-    ("TVSMOTOR","3559"),("UBL","16713"),("ULTRACEMCO","11532"),("UNIONBANK","10754"),
-    ("UPL","11287"),("VEDL","3063"),("VOLTAS","3597"),("WIPRO","3787"),
-    ("ZEEL","3812"),("ZOMATO","23652"),("ZYDUSLIFE","23148"),
-]
+DISK_CACHE_PATH = "/tmp/dhan_nse_eq_ids.json"
 
-def _load_emergency_symbols():
+
+def _save_symbols_to_disk():
+    """Save current SYMBOLS to disk so they survive background thread restarts."""
+    try:
+        import json as _json
+        with open(DISK_CACHE_PATH, "w") as f:
+            _json.dump({"symbols": SYMBOLS, "source": cache.get("symbol_source"), 
+                        "saved_at": get_ist_now().strftime("%H:%M:%S IST")}, f)
+        print(f"[symbols] Saved {len(SYMBOLS)} symbols to disk cache.")
+    except Exception as e:
+        print(f"[symbols] Disk save failed: {e}")
+
+
+def _load_symbols_from_disk() -> bool:
+    """Load symbols from disk cache. Returns True if successful."""
     global SYMBOLS
-    SYMBOLS = [{"symbol": s, "security_id": sid, "exchange": "NSE"} for s, sid in _EMERGENCY_SYMBOLS]
-    cache["symbol_source"] = "emergency_fallback"
-    print(f"[symbols] Loaded {len(SYMBOLS)} emergency symbols. POST /api/symbols/refresh to upgrade from CSV.")
+    try:
+        import json as _json
+        with open(DISK_CACHE_PATH) as f:
+            data = _json.load(f)
+        syms = data.get("symbols", [])
+        if len(syms) >= 100:
+            SYMBOLS = syms
+            cache["symbol_source"] = "disk_cache"
+            print(f"[symbols] Loaded {len(SYMBOLS)} symbols from disk cache (saved {data.get('saved_at','?')})")
+            return True
+    except Exception:
+        pass
+    return False
+
 
 
 def _parse_eq_lookup_from_csv(text: str) -> dict:
-    """Parse Dhan compact CSV → {SYMBOL_NAME: security_id} for NSE_EQ rows only."""
+    """Parse Dhan compact CSV → {SYMBOL_NAME: security_id} for NSE_EQ rows only.
+    Uses csv module to correctly handle quoted fields with commas inside."""
+    import csv as _csv
+    from io import StringIO as _StringIO
     lookup = {}
-    lines = text.splitlines()
-    if not lines:
-        return lookup
-    header = [h.strip().upper() for h in lines[0].split(",")]
-    try:
-        seg_i = next(i for i, h in enumerate(header) if "EXCH_SEG" in h or "SEGMENT" in h)
-        sym_i = next(i for i, h in enumerate(header) if "TRADING_SYMBOL" in h or "SYMBOL_NAME" in h)
-        id_i  = next(i for i, h in enumerate(header) if "SECURITY_ID" in h or "SCRIP_ID" in h or "SM_SYMBOL_ID" in h)
-    except StopIteration:
-        raise ValueError(f"CSV header missing required columns: {header[:8]}")
-    for line in lines[1:]:
-        cols = line.split(",")
-        if len(cols) <= max(seg_i, sym_i, id_i):
+    reader = _csv.reader(_StringIO(text))
+    header = None
+    seg_i = sym_i = id_i = None
+    for row in reader:
+        if header is None:
+            header = [h.strip().upper() for h in row]
+            try:
+                seg_i = next(i for i, h in enumerate(header) if "EXCH_SEG" in h or "SEGMENT" in h)
+                sym_i = next(i for i, h in enumerate(header) if "TRADING_SYMBOL" in h or "SYMBOL_NAME" in h)
+                id_i  = next(i for i, h in enumerate(header) if "SECURITY_ID" in h or "SCRIP_ID" in h or "SM_SYMBOL_ID" in h)
+            except StopIteration:
+                raise ValueError(f"CSV missing required columns. Found: {header[:10]}")
             continue
-        if cols[seg_i].strip().upper() != "NSE_EQ":
+        if len(row) <= max(seg_i, sym_i, id_i):
             continue
-        sym = cols[sym_i].strip()
+        if row[seg_i].strip().upper() != "NSE_EQ":
+            continue
+        sym = row[sym_i].strip()
         if not sym or sym in lookup:
             continue
         try:
-            lookup[sym] = str(int(float(cols[id_i].strip())))
+            lookup[sym] = str(int(float(row[id_i].strip())))
         except (ValueError, TypeError):
             pass
     return lookup
@@ -190,71 +166,89 @@ def fetch_fno_symbols(tok: str = ""):
     global SYMBOLS, _csv_eq_cache
     tok = tok or CREDS.get("access_token", "")
 
-    # ── Strategy 1: /v2/instrument/NSE_EQ API ─────────────────────────
+    # ── Strategy 1: /v2/instrument/NSE_EQ  (returns CSV text, not JSON) ──
     if tok:
         try:
-            print("[symbols] Trying /v2/instrument/NSE_EQ API...")
-            headers = {"access-token": tok, "Content-Type": "application/json"}
+            print("[symbols] Trying /v2/instrument/NSE_EQ...")
+            headers = {"access-token": tok, "client-id": CREDS.get("client_id",""),
+                       "Content-Type": "application/json"}
             resp = requests.get(f"{DHAN_BASE}/v2/instrument/NSE_EQ",
                                 headers=headers, timeout=20)
-            if resp.status_code == 200:
-                instruments = resp.json()   # list of dicts
-                # Build lookup from JSON response
-                eq_lookup = {}
-                for inst in instruments:
-                    sym = (inst.get("tradingSymbol") or inst.get("SEM_TRADING_SYMBOL") or
-                           inst.get("symbolName")    or inst.get("SM_SYMBOL_NAME") or "").strip()
-                    sid_raw = (inst.get("securityId") or inst.get("SEM_SMST_SECURITY_ID") or
-                               inst.get("security_id") or "")
-                    if sym and sid_raw and sym not in eq_lookup:
-                        try:
-                            eq_lookup[sym] = str(int(float(str(sid_raw))))
-                        except (ValueError, TypeError):
-                            pass
+            print(f"[symbols] /v2/instrument/NSE_EQ → {resp.status_code} len={len(resp.text)}")
+            if resp.status_code == 200 and len(resp.text) > 1000:
+                # Dhan returns CSV text from this endpoint, not JSON
+                text = resp.text
+                if text.lstrip().startswith("[") or text.lstrip().startswith("{"):
+                    # It IS json on some accounts
+                    import json as _json
+                    instruments = _json.loads(text)
+                    eq_lookup = {}
+                    for inst in instruments:
+                        sym = (inst.get("tradingSymbol") or inst.get("SEM_TRADING_SYMBOL") or
+                               inst.get("symbolName")    or inst.get("SM_SYMBOL_NAME") or "").strip()
+                        sid_raw = (inst.get("securityId") or inst.get("SEM_SMST_SECURITY_ID") or
+                                   inst.get("security_id") or "")
+                        if sym and sid_raw and sym not in eq_lookup:
+                            try:
+                                eq_lookup[sym] = str(int(float(str(sid_raw))))
+                            except (ValueError, TypeError):
+                                pass
+                else:
+                    # Parse as CSV (same format as scrip-master.csv but NSE_EQ only)
+                    eq_lookup = _parse_eq_lookup_from_csv(text)
+
+                print(f"[symbols] /v2/instrument parsed: {len(eq_lookup)} symbols")
                 if len(eq_lookup) > 100:
                     _csv_eq_cache = eq_lookup
                     matched, unmatched = _match_fno_to_eq(eq_lookup)
                     if len(matched) >= 50:
                         SYMBOLS = matched
                         cache["symbol_source"] = "api_dynamic"
-                        print(f"[symbols] ✓ API: {len(SYMBOLS)} matched, {len(unmatched)} unmatched")
+                        print(f"[symbols] ✓ instrument API: {len(SYMBOLS)} matched, {len(unmatched)} unmatched")
                         return
-            print(f"[symbols] API returned {resp.status_code} — trying CSV...")
+            print(f"[symbols] instrument API unusable — trying public CSV...")
         except Exception as e:
-            print(f"[symbols] API failed: {e} — trying CSV...")
+            print(f"[symbols] instrument API failed: {e} — trying CSV...")
 
-    # ── Strategy 2: Public compact CSV (no token, parsed without pandas) ──
+
+    # ── Strategy 2: Public compact CSV (no token needed) ────────────────
     try:
-        print("[symbols] Trying compact CSV...")
+        print("[symbols] Trying public compact CSV...")
         resp = None
         for attempt in range(3):
             try:
-                resp = requests.get(CSV_URL, timeout=30)
-                if resp.status_code == 200 and len(resp.text) > 10000:
-                    break
+                resp = requests.get(CSV_URL, timeout=35)
                 print(f"  CSV attempt {attempt+1}: status={getattr(resp,'status_code','?')} len={len(getattr(resp,'text',''))}")
+                if resp.status_code == 200 and len(resp.text) > 50000:
+                    break
             except Exception as ce:
                 print(f"  CSV attempt {attempt+1} error: {ce}")
-            time.sleep(4)
+            time.sleep(5)
 
-        if not resp or resp.status_code != 200 or len(resp.text) < 10000:
-            raise ConnectionError(f"CSV unreachable (status={getattr(resp,'status_code','N/A')} len={len(getattr(resp,'text',''))})")
+        if not resp or resp.status_code != 200 or len(resp.text) < 50000:
+            raise ConnectionError(
+                f"CSV too small or unreachable — "
+                f"status={getattr(resp,'status_code','N/A')} "
+                f"len={len(getattr(resp,'text',''))}"
+            )
 
         eq_lookup = _parse_eq_lookup_from_csv(resp.text)
         print(f"[symbols] CSV parsed: {len(eq_lookup)} NSE_EQ symbols")
         _csv_eq_cache = eq_lookup
 
         matched, unmatched = _match_fno_to_eq(eq_lookup)
+        print(f"[symbols] CSV match: {len(matched)} matched, {len(unmatched)} unmatched: {unmatched[:10]}")
         if len(matched) < 50:
-            raise ValueError(f"Only {len(matched)} FNO symbols matched in CSV")
+            raise ValueError(f"Only {len(matched)} FNO symbols matched in CSV — CSV may be truncated")
 
         SYMBOLS = matched
         cache["symbol_source"] = "csv_dynamic"
-        print(f"[symbols] ✓ CSV: {len(SYMBOLS)} matched, {len(unmatched)} unmatched: {unmatched[:5]}")
+        print(f"[symbols] ✓ CSV loaded: {len(SYMBOLS)} symbols")
         return
 
     except Exception as e:
         print(f"[symbols] ✗ CSV failed: {e}")
+
 
     # ── Strategy 3: Emergency fallback ───────────────────────────────────
     if not SYMBOLS:
@@ -354,6 +348,16 @@ def fetch_all_quotes(cid, tok):
     missing = [s["symbol"] for s in SYMBOLS if s["symbol"] not in quotes]
     if missing:
         print(f"  Missing from marketfeed ({len(missing)}): {missing[:10]}")
+        # If we're on emergency_fallback, try to auto-fix IDs for missing symbols
+        # by querying them on BSE_EQ — if found there, their IDs are BSE codes
+        # and we should skip them (we only want NSE_EQ data)
+        # Schedule a background symbol refresh to get correct IDs
+        if cache.get("symbol_source") == "emergency_fallback" and len(missing) > 10:
+            print("  ⚠ Many symbols missing on emergency_fallback — scheduling symbol refresh")
+            def _bg_refresh():
+                time.sleep(2)
+                fetch_fno_symbols(tok)
+            threading.Thread(target=_bg_refresh, daemon=True).start()
 
     cache["debug"] = {
         "quotes_fetched": len(quotes),
@@ -367,6 +371,7 @@ def fetch_all_quotes(cid, tok):
 
 
 def get_historical(security_id, access_token, retries=3):
+    """Fetch last 30 days of daily OHLCV. Returns full data dict or None."""
     today     = datetime.now(IST)
     from_date = (today - timedelta(days=30)).strftime("%Y-%m-%d")
     to_date   = today.strftime("%Y-%m-%d")
@@ -380,14 +385,14 @@ def get_historical(security_id, access_token, retries=3):
                                  json=payload, headers=headers, timeout=10)
             if resp.status_code == 429:
                 time.sleep(2 ** (attempt + 1)); continue
-            if resp.status_code in (400, 401, 403): return None, None
+            if resp.status_code in (400, 401, 403): return None
             resp.raise_for_status()
             data = resp.json()
-            if not data.get("timestamp"): return None, None
-            return data.get("close", []), data.get("volume", [])
+            if not data.get("timestamp"): return None
+            return data   # full dict: timestamp, open, high, low, close, volume
         except Exception:
             time.sleep(1)
-    return None, None
+    return None
 
 
 def _run_screener(tok):
@@ -398,11 +403,21 @@ def _run_screener(tok):
     cache.update({"status": "fetching", "progress": 0, "total": total, "market_open": is_market_open()})
     print(f"Screener — {total} stocks | {get_ist_now().strftime('%H:%M:%S IST')}")
 
+    if not SYMBOLS:
+        cache.update({"status": "error", "progress": 100,
+                      "errors": ["No symbols loaded — call POST /api/symbols/refresh with your token."]})
+        return
+    if cache.get("symbol_source") not in ("api_dynamic", "csv_dynamic", "disk_cache"):
+        print(f"[screener] ⚠ Running with potentially wrong IDs (source={cache.get('symbol_source')})")
+
     quotes = fetch_all_quotes(cid, tok)
     if not quotes:
         cache.update({"status": "error", "progress": 100,
                       "errors": [f"marketfeed returned 0 quotes. debug: {cache['debug']}"]})
         return
+
+    market_open = is_market_open()
+    today_str   = get_ist_now().strftime("%Y-%m-%d")
 
     results, skipped = [], []
     for i, sym in enumerate(SYMBOLS):
@@ -413,26 +428,77 @@ def _run_screener(tok):
                 cache["progress"] = round((i + 1) / total * 100)
                 time.sleep(0.3)
                 continue
+
             ltp       = q["ltp"]
-            chg_pct   = q["change_pct"]   # now correctly calculated
             today_vol = q["volume"]
-            closes, volumes = get_historical(sym["security_id"], tok)
-            momentum5d = 0
+
+            hist = get_historical(sym["security_id"], tok)
+
+            closes  = hist.get("close",     []) if hist else []
+            volumes = hist.get("volume",    []) if hist else []
+            stamps  = hist.get("timestamp", []) if hist else []
+
+            # ── Change % logic ──────────────────────────────────────────
+            # Market OPEN  → live: (ltp - prev_close) / prev_close
+            #   prev_close = yesterday's closing price from historical
+            # Market CLOSED → daily: (today_close - prev_close) / prev_close
+            #   today_close  = last bar in historical (today's session close)
+            #   prev_close   = second-to-last bar in historical
+            chg_pct    = 0.0
+            prev_close = 0.0
+            today_close = 0.0
+
+            if closes and len(closes) >= 2:
+                # Check if latest historical bar is today's date
+                last_ts   = stamps[-1] if stamps else 0
+                last_date = datetime.utcfromtimestamp(last_ts).strftime("%Y-%m-%d") if last_ts else ""
+                has_today = (last_date == today_str)
+
+                if market_open:
+                    # Live: use yesterday close as prev_close
+                    prev_close = closes[-1] if has_today else closes[-1]
+                    # Actually for live, prev_close from quote API is most accurate
+                    prev_close = q.get("prev_close") or closes[-2] if has_today else closes[-1]
+                    if prev_close:
+                        chg_pct = round(((ltp - prev_close) / prev_close) * 100, 2)
+                else:
+                    # Closed: (last_close - second_last_close) / second_last_close
+                    if has_today:
+                        today_close = closes[-1]
+                        prev_close  = closes[-2]
+                    else:
+                        # No today bar yet (pre-market or holiday) — use last two bars
+                        today_close = closes[-1]
+                        prev_close  = closes[-2]
+                    if prev_close:
+                        chg_pct = round(((today_close - prev_close) / prev_close) * 100, 2)
+            else:
+                # Fallback to quote API's change%
+                chg_pct = q.get("change_pct", 0.0)
+
+            # ── Momentum 5D ─────────────────────────────────────────────
+            momentum5d = 0.0
             if closes and len(closes) >= 6:
                 close_5ago = closes[-6]
-                momentum5d = round(((ltp - close_5ago) / close_5ago) * 100, 2) if close_5ago else 0
-            vol_ratio  = 0
+                ref_price  = ltp if market_open else (closes[-1] if closes else ltp)
+                momentum5d = round(((ref_price - close_5ago) / close_5ago) * 100, 2) if close_5ago else 0
+
+            # ── Volume ratio ─────────────────────────────────────────────
+            vol_ratio  = 0.0
             avg_vol_7d = 0
             if volumes and len(volumes) >= 8:
                 avg_vol_7d = sum(volumes[-8:-1]) / 7
                 vol_ratio  = round(today_vol / avg_vol_7d, 2) if avg_vol_7d > 0 else 0
             elif today_vol > 0:
                 vol_ratio = 1.0
+
             results.append({
-                "symbol": sym["symbol"], "exchange": sym["exchange"],
-                "ltp": ltp, "change": chg_pct,
+                "symbol":     sym["symbol"], "exchange": sym["exchange"],
+                "ltp":        ltp,
+                "prev_close": round(prev_close, 2),
+                "change":     chg_pct,
                 "momentum5d": momentum5d, "volumeRatio": vol_ratio,
-                "todayVol": today_vol, "avgVol7d": int(avg_vol_7d),
+                "todayVol":   today_vol,  "avgVol7d": int(avg_vol_7d),
             })
         except Exception as e:
             skipped.append(f"{sym['symbol']}:{e}")
@@ -464,10 +530,12 @@ def fetch_screener(client_id=None, access_token=None):
 
 def scheduled_refresh():
     if not CREDS["client_id"] or not CREDS["access_token"]: return
-    # If still on emergency fallback, try to upgrade symbols first
-    if cache.get("symbol_source") == "emergency_fallback":
-        print("[scheduler] Still on emergency fallback — attempting symbol refresh...")
+    # Refresh symbols from network if not yet on live IDs
+    if cache.get("symbol_source") not in ("api_dynamic", "csv_dynamic"):
+        print(f"[scheduler] Symbol source is '{cache.get('symbol_source')}' — refreshing...")
         fetch_fno_symbols(CREDS["access_token"])
+        if cache.get("symbol_source") in ("api_dynamic", "csv_dynamic"):
+            _save_symbols_to_disk()
     fetch_screener()
 
 
@@ -481,29 +549,38 @@ scheduler.start()
 @app.on_event("startup")
 async def startup():
     def _boot():
-        # Step 1: Load emergency symbols IMMEDIATELY — app is never stuck at 0
-        _load_emergency_symbols()
-        print(f"[boot] Emergency symbols loaded: {len(SYMBOLS)} — app is live.")
-
-        # Step 2: Try to upgrade to live IDs (API first, then CSV)
-        time.sleep(6)   # let Render container finish network init
         tok = CREDS.get("access_token", "")
+
+        # Step 1: Load disk cache immediately (fast, no network)
+        if _load_symbols_from_disk():
+            print(f"[boot] Disk cache loaded: {len(SYMBOLS)} symbols — starting screener.")
+            # Run screener with cached IDs right away
+            fetch_screener()
+
+        # Step 2: Fetch fresh IDs from network (API or CSV)
+        time.sleep(6)  # let network settle on Render cold start
         for attempt in range(4):
             try:
-                print(f"[boot] Symbol fetch attempt {attempt+1}/4 (tok={'yes' if tok else 'no'})...")
+                print(f"[boot] Network symbol fetch {attempt+1}/4...")
                 fetch_fno_symbols(tok)
                 src = cache["symbol_source"]
                 if src in ("api_dynamic", "csv_dynamic"):
-                    print(f"[boot] ✓ Live IDs loaded — {len(SYMBOLS)} symbols via {src}.")
+                    print(f"[boot] ✓ Fresh IDs from {src}: {len(SYMBOLS)} symbols.")
+                    _save_symbols_to_disk()   # persist for next boot
                     break
-                print(f"[boot] Still on {src}, retrying...")
+                print(f"[boot] Source still '{src}', retrying in {8*(attempt+1)}s...")
             except Exception as e:
-                print(f"[boot] Attempt {attempt+1} failed: {e}")
-            time.sleep(8 * (attempt + 1))   # 8s, 16s, 24s, 32s
+                print(f"[boot] Attempt {attempt+1} error: {e}")
+            time.sleep(8 * (attempt + 1))
 
-        # Step 3: Run screener with whatever symbols we have
-        print(f"[boot] Starting screener — {len(SYMBOLS)} symbols ({cache['symbol_source']})")
-        fetch_screener()
+        # Step 3: If disk cache was empty and network also failed
+        if not SYMBOLS:
+            print("[boot] ✗ No symbols from disk or network. Service needs /api/symbols/refresh.")
+            cache["symbol_source"] = "no_symbols"
+        elif cache["symbol_source"] not in ("disk_cache",):
+            # Fresh network load succeeded — run screener with correct IDs
+            print(f"[boot] Running screener with fresh IDs ({cache['symbol_source']})...")
+            fetch_screener()
 
     threading.Thread(target=_boot, daemon=True).start()
 
@@ -567,6 +644,8 @@ def refresh_symbols(x_access_token: str = Header(None)):
     tok = x_access_token or CREDS.get("access_token", "")
     before = len(SYMBOLS)
     fetch_fno_symbols(tok)
+    if cache.get("symbol_source") in ("api_dynamic", "csv_dynamic"):
+        _save_symbols_to_disk()
     return {
         "status": "ok",
         "before": before,
