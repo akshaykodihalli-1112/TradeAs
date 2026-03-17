@@ -120,6 +120,68 @@ def _build_eq_lookup_from_csv() -> dict:
     return lookup
 
 
+# ── Emergency symbol list — verified Dhan NSE_EQ IDs (2025-03-17) ──────
+# Used ONLY when CSV is unreachable. Call POST /api/symbols/refresh to upgrade.
+_EMERGENCY_SYMBOLS = [
+    ("ABBOTINDIA","13636"),("ABCAPITAL","20904"),("ABFRL","20179"),("ACC","22"),
+    ("ADANIENT","25"),("ADANIPORTS","15083"),("ALKEM","17963"),("AMBUJACEM","1270"),
+    ("ANGELONE","20554"),("APLAPOLLO","19229"),("APOLLOHOSP","157"),("APOLLOTYRE","163"),
+    ("ASHOKLEY","212"),("ASIANPAINT","467"),("ASTRAL","14418"),("ATGL","22169"),
+    ("ATUL","263"),("AUBANK","21238"),("AUROPHARMA","275"),("AXISBANK","5900"),
+    ("BAJAJ-AUTO","16669"),("BAJAJFINSV","16675"),("BAJFINANCE","317"),
+    ("BALKRISIND","1482"),("BANDHANBNK","21719"),("BANKBARODA","1452"),
+    ("BATAINDIA","371"),("BEL","383"),("BERGEPAINT","404"),("BHARATFORG","422"),
+    ("BHARTIARTL","10604"),("BHEL","438"),("BIOCON","11373"),("BOSCHLTD","2181"),
+    ("BPCL","526"),("BRITANNIA","547"),("BSOFT","6004"),("CANBK","10794"),
+    ("CANFINHOME","9262"),("CDSL","21822"),("CGPOWER","678"),("CHAMBLFERT","685"),
+    ("CHOLAFIN","4375"),("CIPLA","694"),("COALINDIA","20374"),("COFORGE","11543"),
+    ("COLPAL","742"),("CONCOR","4749"),("COROMANDEL","739"),("CROMPTON","20655"),
+    ("CUB","5784"),("CUMMINSIND","774"),("DABUR","10107"),("DALBHARAT","18253"),
+    ("DEEPAKNTR","10209"),("DELTACORP","14413"),("DIVISLAB","15174"),("DIXON","21690"),
+    ("DLF","14732"),("DMART","21561"),("DRREDDY","881"),("EICHERMOT","910"),
+    ("ESCORTS","958"),("EXIDEIND","10780"),("FEDERALBNK","1023"),("FORCEMOT","1039"),
+    ("FORTIS","14804"),("GAIL","1066"),("GLENMARK","1109"),("GMRINFRA","13528"),
+    ("GNFC","1113"),("GODREJCP","10099"),("GODREJPROP","17875"),("GRANULES","11809"),
+    ("GRASIM","315"),("GUJGASLTD","10599"),("HAL","2303"),("HAVELLS","8927"),
+    ("HCLTECH","7229"),("HDFCAMC","22080"),("HDFCBANK","1333"),("HDFCLIFE","20704"),
+    ("HEROMOTOCO","1348"),("HFCL","1350"),("HINDALCO","1306"),("HINDCOPPER","14978"),
+    ("HINDPETRO","1406"),("HINDUNILVR","1394"),("ICICIBANK","4963"),("ICICIGI","21770"),
+    ("ICICIPRULI","18652"),("IDEA","14366"),("IDFCFIRSTB","20286"),("IEX","22149"),
+    ("IGL","11262"),("INDHOTEL","1512"),("INDIACEM","1515"),("INDIAMART","22592"),
+    ("INDIGO","20251"),("INDUSINDBK","5258"),("INDUSTOWER","22271"),("INFY","1594"),
+    ("IOC","1624"),("IPCALAB","19483"),("IRCTC","22961"),("ITC","1660"),
+    ("JINDALSTEL","11600"),("JKCEMENT","13910"),("JSWENERGY","17594"),("JSWSTEEL","11723"),
+    ("JUBLFOOD","18096"),("KALYANKJIL","22945"),("KEI","1743"),("KOTAKBANK","1232"),
+    ("KPITTECH","4651"),("LALPATHLAB","23048"),("LAURUSLABS","22950"),("LICHSGFIN","1847"),
+    ("LICI","24095"),("LT","11483"),("LTIM","17818"),("LTTS","20299"),("LUPIN","10440"),
+    ("M&M","2031"),("M&MFIN","13285"),("MANAPPURAM","19061"),("MARICO","4067"),
+    ("MARUTI","10999"),("MAXHEALTH","23267"),("MCX","19238"),("METROPOLIS","22843"),
+    ("MFSL","4136"),("MOTHERSON","4204"),("MPHASIS","4261"),("MRF","4162"),
+    ("MUTHOOTFIN","18143"),("NATIONALUM","4244"),("NAUKRI","13751"),("NAVINFLUOR","14500"),
+    ("NESTLEIND","4306"),("NMDC","15332"),("NTPC","11630"),("OBEROIRLTY","20242"),
+    ("OFSS","10738"),("ONGC","2475"),("PAGEIND","14401"),("PEL","2481"),
+    ("PERSISTENT","18365"),("PETRONET","11351"),("PFC","14299"),("PIDILITIND","2664"),
+    ("PIIND","19015"),("PNB","2730"),("POLYCAB","22185"),("POWERGRID","14977"),
+    ("PVRINOX","17243"),("RAMCOCEM","14994"),("RBLBANK","20413"),("RECLTD","15355"),
+    ("RELIANCE","2885"),("SAIL","2963"),("SBICARD","22990"),("SBILIFE","21808"),
+    ("SBIN","3045"),("SHREECEM","3103"),("SHRIRAMFIN","20817"),("SIEMENS","3150"),
+    ("SRF","3273"),("SUNPHARMA","3351"),("SUNTV","3367"),("SUPREMEIND","3378"),
+    ("SUZLON","3391"),("SYNGENE","20562"),("TATACHEM","3405"),("TATACOMM","3408"),
+    ("TATACONSUM","3432"),("TATAELXSI","4910"),("TATAMOTORS","3456"),("TATAPOWER","3426"),
+    ("TATASTEEL","3499"),("TCS","11536"),("TECHM","13538"),("TIINDIA","19455"),
+    ("TITAN","3506"),("TORNTPHARM","3518"),("TORNTPOWER","3519"),("TRENT","3530"),
+    ("TVSMOTOR","3559"),("UBL","16713"),("ULTRACEMCO","11532"),("UNIONBANK","10754"),
+    ("UPL","11287"),("VEDL","3063"),("VOLTAS","3597"),("WIPRO","3787"),
+    ("ZEEL","3812"),("ZOMATO","23652"),("ZYDUSLIFE","23148"),
+]
+
+def _load_emergency_symbols():
+    global SYMBOLS
+    SYMBOLS = [{"symbol": s, "security_id": sid, "exchange": "NSE"} for s, sid in _EMERGENCY_SYMBOLS]
+    cache["symbol_source"] = "emergency_fallback"
+    print(f"[symbols] Loaded {len(SYMBOLS)} emergency symbols. POST /api/symbols/refresh to upgrade from CSV.")
+
+
 def fetch_fno_symbols():
     """
     Builds SYMBOLS list with 100% dynamic security IDs from Dhan master CSV.
@@ -213,67 +275,10 @@ def fetch_fno_symbols():
 
     except Exception as e:
         print(f"✗ CSV fetch failed: {e}")
-        # Emergency fallback — these IDs were verified from Dhan CSV on 2025-03-17.
-        # Used ONLY when CSV is unreachable (Render cold start, network blip, etc.).
-        # Call POST /api/symbols/refresh once network is up to replace with fresh IDs.
-        EMERGENCY_SYMBOLS = [
-            ("ABBOTINDIA","13636"),("ABCAPITAL","20904"),("ABFRL","20179"),("ACC","22"),
-            ("ADANIENT","25"),("ADANIPORTS","15083"),("ALKEM","17963"),("AMBUJACEM","1270"),
-            ("ANGELONE","20554"),("APLAPOLLO","19229"),("APOLLOHOSP","157"),("APOLLOTYRE","163"),
-            ("ASHOKLEY","212"),("ASIANPAINT","467"),("ASTRAL","14418"),("ATGL","22169"),
-            ("ATUL","263"),("AUBANK","21238"),("AUROPHARMA","275"),("AXISBANK","5900"),
-            ("BAJAJ-AUTO","16669"),("BAJAJFINSV","16675"),("BAJFINANCE","317"),
-            ("BALKRISIND","1482"),("BANDHANBNK","21719"),("BANKBARODA","1452"),
-            ("BATAINDIA","371"),("BEL","383"),("BERGEPAINT","404"),("BHARATFORG","422"),
-            ("BHARTIARTL","10604"),("BHEL","438"),("BIOCON","11373"),("BOSCHLTD","2181"),
-            ("BPCL","526"),("BRITANNIA","547"),("BSOFT","6004"),("CANBK","10794"),
-            ("CANFINHOME","9262"),("CDSL","21822"),("CGPOWER","678"),("CHAMBLFERT","685"),
-            ("CHOLAFIN","4375"),("CIPLA","694"),("COALINDIA","20374"),("COFORGE","11543"),
-            ("COLPAL","742"),("CONCOR","4749"),("COROMANDEL","739"),("CROMPTON","20655"),
-            ("CUB","5784"),("CUMMINSIND","774"),("DABUR","10107"),("DALBHARAT","18253"),
-            ("DEEPAKNTR","10209"),("DELTACORP","14413"),("DIVISLAB","15174"),("DIXON","21690"),
-            ("DLF","14732"),("DMART","21561"),("DRREDDY","881"),("EICHERMOT","910"),
-            ("ESCORTS","958"),("EXIDEIND","10780"),("FEDERALBNK","1023"),("FORCEMOT","1039"),
-            ("FORTIS","14804"),("GAIL","1066"),("GLENMARK","1109"),("GMRINFRA","13528"),
-            ("GNFC","1113"),("GODREJCP","10099"),("GODREJPROP","17875"),("GRANULES","11809"),
-            ("GRASIM","315"),("GUJGASLTD","10599"),("HAL","2303"),("HAVELLS","8927"),
-            ("HCLTECH","7229"),("HDFCAMC","22080"),("HDFCBANK","1333"),("HDFCLIFE","20704"),
-            ("HEROMOTOCO","1348"),("HFCL","1350"),("HINDALCO","1306"),("HINDCOPPER","14978"),
-            ("HINDPETRO","1406"),("HINDUNILVR","1394"),("ICICIBANK","4963"),("ICICIGI","21770"),
-            ("ICICIPRULI","18652"),("IDEA","14366"),("IDFCFIRSTB","20286"),("IEX","22149"),
-            ("IGL","11262"),("INDHOTEL","1512"),("INDIACEM","1515"),("INDIAMART","22592"),
-            ("INDIGO","20251"),("INDUSINDBK","5258"),("INDUSTOWER","22271"),("INFY","1594"),
-            ("IOC","1624"),("IPCALAB","19483"),("IRCTC","22961"),("ITC","1660"),
-            ("JINDALSTEL","11600"),("JKCEMENT","13910"),("JSWENERGY","17594"),("JSWSTEEL","11723"),
-            ("JUBLFOOD","18096"),("KALYANKJIL","22945"),("KEI","1743"),("KOTAKBANK","1232"),
-            ("KPITTECH","4651"),("LALPATHLAB","23048"),("LAURUSLABS","22950"),("LICHSGFIN","1847"),
-            ("LICI","24095"),("LT","11483"),("LTIM","17818"),("LTTS","20299"),("LUPIN","10440"),
-            ("M&M","2031"),("M&MFIN","13285"),("MANAPPURAM","19061"),("MARICO","4067"),
-            ("MARUTI","10999"),("MAXHEALTH","23267"),("MCX","19238"),("METROPOLIS","22843"),
-            ("MFSL","4136"),("MOTHERSON","4204"),("MPHASIS","4261"),("MRF","4162"),
-            ("MUTHOOTFIN","18143"),("NATIONALUM","4244"),("NAUKRI","13751"),("NAVINFLUOR","14500"),
-            ("NESTLEIND","4306"),("NMDC","15332"),("NTPC","11630"),("OBEROIRLTY","20242"),
-            ("OFSS","10738"),("ONGC","2475"),("PAGEIND","14401"),("PEL","2481"),
-            ("PERSISTENT","18365"),("PETRONET","11351"),("PFC","14299"),("PIDILITIND","2664"),
-            ("PIIND","19015"),("PNB","2730"),("POLYCAB","22185"),("POWERGRID","14977"),
-            ("PVRINOX","17243"),("RAMCOCEM","14994"),("RBLBANK","20413"),("RECLTD","15355"),
-            ("RELIANCE","2885"),("SAIL","2963"),("SBICARD","22990"),("SBILIFE","21808"),
-            ("SBIN","3045"),("SHREECEM","3103"),("SHRIRAMFIN","20817"),("SIEMENS","3150"),
-            ("SRF","3273"),("SUNPHARMA","3351"),("SUNTV","3367"),("SUPREMEIND","3378"),
-            ("SUZLON","3391"),("SYNGENE","20562"),("TATACHEM","3405"),("TATACOMM","3408"),
-            ("TATACONSUM","3432"),("TATAELXSI","4910"),("TATAMOTORS","3456"),("TATAPOWER","3426"),
-            ("TATASTEEL","3499"),("TCS","11536"),("TECHM","13538"),("TIINDIA","19455"),
-            ("TITAN","3506"),("TORNTPHARM","3518"),("TORNTPOWER","3519"),("TRENT","3530"),
-            ("TVSMOTOR","3559"),("UBL","16713"),("ULTRACEMCO","11532"),("UNIONBANK","10754"),
-            ("UPL","11287"),("VEDL","3063"),("VOLTAS","3597"),("WIPRO","3787"),
-            ("ZEEL","3812"),("ZOMATO","23652"),("ZYDUSLIFE","23148"),
-        ]
         if not SYMBOLS:
-            SYMBOLS = [{"symbol": s, "security_id": i, "exchange": "NSE"} for s, i in EMERGENCY_SYMBOLS]
-            cache["symbol_source"] = "emergency_fallback"
-            print(f"  Using emergency fallback — {len(SYMBOLS)} symbols. Call POST /api/symbols/refresh to reload from CSV.")
+            _load_emergency_symbols()
         else:
-            print(f"  Keeping existing {len(SYMBOLS)} symbols.")
+            print(f"  Keeping existing {len(SYMBOLS)} symbols ({cache['symbol_source']}).")
 
 
 
@@ -479,18 +484,27 @@ scheduler.start()
 @app.on_event("startup")
 async def startup():
     def _boot():
-        # Retry fetch_fno_symbols up to 3 times on startup (Render DNS can be slow)
-        for attempt in range(3):
-            fetch_fno_symbols()
-            if SYMBOLS:
-                break
-            print(f"Startup attempt {attempt+1}: symbols empty, retrying in 5s...")
-            time.sleep(5)
-        print(f"Symbols ready: {len(SYMBOLS)} ({cache['symbol_source']})")
-        if SYMBOLS:
-            fetch_screener()
-        else:
-            print("ERROR: No symbols loaded after 3 attempts — check Render network/logs.")
+        # Step 1: Load emergency symbols IMMEDIATELY so app is never stuck at 0
+        _load_emergency_symbols()
+        print(f"[boot] Emergency symbols loaded: {len(SYMBOLS)} — app is ready.")
+
+        # Step 2: Try to upgrade to CSV in background (with delay to let network settle)
+        time.sleep(8)   # give Render container time to fully init networking
+        for attempt in range(4):
+            try:
+                print(f"[boot] CSV fetch attempt {attempt+1}/4...")
+                fetch_fno_symbols()
+                if cache["symbol_source"] == "csv_dynamic":
+                    print(f"[boot] ✓ CSV loaded — {len(SYMBOLS)} symbols with fresh IDs.")
+                    break
+            except Exception as e:
+                print(f"[boot] CSV attempt {attempt+1} failed: {e}")
+            time.sleep(10 * (attempt + 1))   # 10s, 20s, 30s between retries
+
+        # Step 3: Run screener with whatever symbols we have
+        print(f"[boot] Starting screener with {len(SYMBOLS)} symbols ({cache['symbol_source']})")
+        fetch_screener()
+
     threading.Thread(target=_boot, daemon=True).start()
 
 
