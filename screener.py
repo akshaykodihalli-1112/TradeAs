@@ -339,41 +339,40 @@ def fetch_all_quotes(cid, tok):
     quotes    = {}
     last_error = None
 
-    for i in range(0, len(all_ids), 100):   # ← reduced batch to 100 to avoid Dhan limits
-        batch   = all_ids[i:i + 100]
+    BATCH_SIZE = 50  # Dhan rate-limits at ~75/req; 50 is safe
+    for i in range(0, len(all_ids), BATCH_SIZE):
+        batch   = all_ids[i:i + BATCH_SIZE]
         payload = {"NSE_EQ": batch}
+        success = False
         for endpoint in ["/v2/marketfeed/quote", "/v2/marketfeed/ohlc"]:
-            try:
-                resp = requests.post(f"{DHAN_BASE}{endpoint}", json=payload, headers=headers, timeout=15)
-                print(f"  {endpoint} batch={i} status={resp.status_code} returned={len(resp.json().get('data',{}).get('NSE_EQ',{})) if resp.status_code==200 else 'err'}")
-                if resp.status_code == 200:
-                    raw = resp.json().get("data", {}).get("NSE_EQ", {})
-                    for sec_id, q in raw.items():
-                        sym, data = parse_quote(sec_id, q, id_to_sym)
-                        if sym:
-                            quotes[sym] = data
-                    break
-                elif resp.status_code == 429:
-                    print(f"  Rate limited on batch={i}, waiting 5s…")
-                    time.sleep(5)
-                    # retry same endpoint after backoff
-                    resp2 = requests.post(f"{DHAN_BASE}{endpoint}", json=payload, headers=headers, timeout=15)
-                    if resp2.status_code == 200:
-                        raw = resp2.json().get("data", {}).get("NSE_EQ", {})
+            for attempt in range(3):
+                try:
+                    resp = requests.post(f"{DHAN_BASE}{endpoint}", json=payload, headers=headers, timeout=15)
+                    returned = len(resp.json().get("data", {}).get("NSE_EQ", {})) if resp.status_code == 200 else "err"
+                    print(f"  {endpoint} batch={i} attempt={attempt+1} status={resp.status_code} returned={returned}")
+                    if resp.status_code == 200:
+                        raw = resp.json().get("data", {}).get("NSE_EQ", {})
                         for sec_id, q in raw.items():
                             sym, data = parse_quote(sec_id, q, id_to_sym)
                             if sym:
                                 quotes[sym] = data
+                        success = True
                         break
+                    elif resp.status_code == 429:
+                        wait = 4 * (attempt + 1)
+                        print(f"  Rate limited batch={i}, waiting {wait}s...")
+                        time.sleep(wait)
+                        continue
                     else:
-                        last_error = f"{endpoint} 429 retry {resp2.status_code}: {resp2.text[:150]}"
-                else:
-                    last_error = f"{endpoint} {resp.status_code}: {resp.text[:150]}"
-            except Exception as e:
-                last_error = str(e)
-                print(f"  {endpoint} error: {e}")
-        if i + 100 < len(all_ids):
-            time.sleep(0.5)   # shorter sleep since batches are smaller
+                        last_error = f"{endpoint} {resp.status_code}: {resp.text[:150]}"
+                        break
+                except Exception as e:
+                    last_error = str(e)
+                    print(f"  {endpoint} error: {e}")
+                    time.sleep(1)
+            if success:
+                break
+        time.sleep(1.2)  # 1.2s between batches keeps us under rate limit
 
     # Log which symbols are missing — helps identify wrong IDs
     missing = [s["symbol"] for s in SYMBOLS if s["symbol"] not in quotes]
@@ -489,8 +488,8 @@ def fetch_screener(client_id=None, access_token=None):
 
 def scheduled_refresh():
     if not CREDS["client_id"] or not CREDS["access_token"]: return
-    if is_market_open(): fetch_screener()
-    else: print(f"Market closed ({get_ist_now().strftime('%H:%M IST')})")
+    # Run always — market closed data still useful (prev_close, volumes, etc.)
+    fetch_screener()
 
 
 scheduler = BackgroundScheduler()
@@ -503,9 +502,8 @@ scheduler.start()
 async def startup():
     fetch_fno_symbols()   # tries CSV first — gets correct IDs
     print(f"Symbols ready: {len(SYMBOLS)} ({cache['symbol_source']})")
-    def _delayed():
-        time.sleep(3); fetch_screener()
-    threading.Thread(target=_delayed, daemon=True).start()
+    # Start screener immediately on startup (no delay needed)
+    threading.Thread(target=fetch_screener, daemon=True).start()
 
 
 # ── ROUTES ────────────────────────────────────────────────────────
