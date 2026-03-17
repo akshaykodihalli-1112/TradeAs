@@ -80,7 +80,8 @@ FNO_SYMBOL_NAMES = [
     "UPL","VEDL","VOLTAS","WIPRO","ZEEL","ZOMATO","ZYDUSLIFE",
 ]
 
-CSV_URL      = "https://images.dhan.co/api-data/api-scrip-master.csv"
+CSV_URL         = "https://images.dhan.co/api-data/api-scrip-master.csv"
+CSV_URL_DETAIL  = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
 _csv_eq_cache = {}   # symbol → security_id, populated from CSV
 _csv_lock     = threading.Lock()
 
@@ -215,21 +216,27 @@ def fetch_fno_symbols(tok: str = ""):
     try:
         print("[symbols] Trying public compact CSV...")
         resp = None
-        for attempt in range(3):
-            try:
-                resp = requests.get(CSV_URL, timeout=35)
-                print(f"  CSV attempt {attempt+1}: status={getattr(resp,'status_code','?')} len={len(getattr(resp,'text',''))}")
-                if resp.status_code == 200 and len(resp.text) > 50000:
-                    break
-            except Exception as ce:
-                print(f"  CSV attempt {attempt+1} error: {ce}")
-            time.sleep(5)
+        for url in [CSV_URL, CSV_URL_DETAIL]:
+            for attempt in range(2):
+                try:
+                    print(f"  CSV {url.split('/')[-1]} attempt {attempt+1}...")
+                    resp = requests.get(url, timeout=40)
+                    print(f"  → status={resp.status_code} len={len(resp.text)}")
+                    if resp.status_code == 200 and len(resp.text) > 50000:
+                        break
+                    resp = None
+                except Exception as ce:
+                    print(f"  → error: {ce}")
+                    resp = None
+                time.sleep(4)
+            if resp and resp.status_code == 200 and len(resp.text) > 50000:
+                break
 
         if not resp or resp.status_code != 200 or len(resp.text) < 50000:
             raise ConnectionError(
-                f"CSV too small or unreachable — "
+                f"Both CSV URLs failed — "
                 f"status={getattr(resp,'status_code','N/A')} "
-                f"len={len(getattr(resp,'text',''))}"
+                f"len={len(getattr(resp,'text','') if resp else '')}"
             )
 
         eq_lookup = _parse_eq_lookup_from_csv(resp.text)
@@ -616,6 +623,61 @@ async def startup():
 def root():
     return {"status": "ok", "service": "DhanScreen API", "docs": "/docs",
             "time_ist": get_ist_now().strftime("%H:%M:%S"), "market_open": is_market_open()}
+
+
+@app.get("/api/boot")
+@app.post("/api/boot")
+def manual_boot(x_client_id: str = Header(None), x_access_token: str = Header(None)):
+    """
+    Call this endpoint once after deploy to force symbol load + first screener run.
+    GET https://tradeas.onrender.com/api/boot
+    Headers: x-client-id, x-access-token
+    Returns immediately with status — screener runs in background.
+    """
+    cid = x_client_id or CREDS.get("client_id", "")
+    tok = x_access_token or CREDS.get("access_token", "")
+    if cid: CREDS["client_id"] = cid
+    if tok: CREDS["access_token"] = tok
+
+    steps = []
+
+    # Step 1: disk cache
+    if not SYMBOLS:
+        if _load_symbols_from_disk():
+            steps.append(f"disk_cache: loaded {len(SYMBOLS)} symbols")
+        else:
+            steps.append("disk_cache: empty")
+
+    # Step 2: CSV (no token needed)
+    if not SYMBOLS or cache.get("symbol_source") in ("none","no_symbols","disk_cache"):
+        steps.append("csv_fetch: starting...")
+        try:
+            fetch_fno_symbols(tok)
+            src = cache.get("symbol_source","?")
+            steps.append(f"csv_fetch: done → source={src} symbols={len(SYMBOLS)}")
+            if src in ("api_dynamic","csv_dynamic"):
+                _save_symbols_to_disk()
+                steps.append("disk_save: ok")
+        except Exception as e:
+            steps.append(f"csv_fetch: ERROR {e}")
+
+    # Step 3: trigger screener
+    if SYMBOLS and (cid or tok):
+        fetch_screener(cid, tok)
+        steps.append(f"screener: triggered ({len(SYMBOLS)} symbols)")
+    elif not SYMBOLS:
+        steps.append("screener: SKIPPED — no symbols loaded")
+    else:
+        steps.append("screener: SKIPPED — no credentials")
+
+    return {
+        "symbol_count":  len(SYMBOLS),
+        "symbol_source": cache.get("symbol_source"),
+        "steps":         steps,
+        "has_creds":     bool(cid and tok),
+        "next":          "Poll /api/health to track progress" if SYMBOLS else
+                         "Set DHAN_CLIENT_ID + DHAN_ACCESS_TOKEN env vars on Render, then redeploy"
+    }
 
 
 @app.get("/api/ping-dhan")
