@@ -302,36 +302,52 @@ def get_historical(security_id, tok):
 
 # ── Screener ───────────────────────────────────────────────────────────────────
 def compute_metrics(q, hist, market_open, today_str):
-    """Compute change%, momentum5d, vol_ratio from quote + historical data."""
+    """
+    Compute change%, momentum5d, vol_ratio.
+
+    Change% logic:
+      Market OPEN  → (live LTP   - prev_day_close) / prev_day_close
+      Market CLOSED → (today_close - prev_day_close) / prev_day_close
+                       e.g. 17-Mar close vs 16-Mar close
+
+    Historical bars are daily candles sorted oldest→newest:
+      closes[-1] = latest trading day close  (today if market closed after 3:30pm)
+      closes[-2] = previous trading day close
+    """
     ltp       = q["ltp"]
     today_vol = q["volume"]
     closes    = hist.get("close",     []) if hist else []
     volumes   = hist.get("volume",    []) if hist else []
-    stamps    = hist.get("timestamp", []) if hist else []
 
     # ── Change % ──────────────────────────────────────────────────────
-    # Market open:  (ltp - prev_day_close) / prev_day_close
-    # Market closed: (today_close - prev_day_close) / prev_day_close
-    # Fallback:     quote's own prev_close field
-    chg_pct = 0.0; prev_close = 0.0
+    chg_pct = 0.0
+    prev_close = 0.0
 
     if len(closes) >= 2:
-        last_date  = datetime.utcfromtimestamp(stamps[-1]).strftime("%Y-%m-%d") if stamps else ""
-        has_today  = (last_date == today_str)
         if market_open:
-            prev_close = closes[-2] if has_today else closes[-1]
-            if prev_close: chg_pct = round(((ltp - prev_close) / prev_close) * 100, 2)
+            # Live: compare LTP against yesterday's close
+            # closes[-1] is today's in-progress candle, closes[-2] is yesterday
+            prev_close = closes[-2]
+            if prev_close:
+                chg_pct = round(((ltp - prev_close) / prev_close) * 100, 2)
         else:
+            # Closed: compare today's settled close vs previous day's close
+            # closes[-1] = 17th March close, closes[-2] = 16th March close
             today_close = closes[-1]
-            prev_close  = closes[-2] if has_today else closes[-1]
-            ref_close   = closes[-2] if has_today else (closes[-2] if len(closes)>=2 else 0)
-            if ref_close: chg_pct = round(((today_close - ref_close) / ref_close) * 100, 2)
-            prev_close = ref_close
+            prev_close  = closes[-2]
+            if prev_close:
+                chg_pct = round(((today_close - prev_close) / prev_close) * 100, 2)
+
     else:
-        # No historical — use quote's prev_close (works for intraday change)
+        # No historical data — fall back to quote API's prev_close
+        # (quote's ohlc.close = today's close, prev_close from Dhan = yesterday's close)
         prev_close = q.get("prev_close", 0)
         if prev_close and ltp:
-            chg_pct = round(((ltp - prev_close) / prev_close) * 100, 2)
+            if market_open:
+                chg_pct = round(((ltp - prev_close) / prev_close) * 100, 2)
+            else:
+                # ltp == today's close when market closed
+                chg_pct = round(((ltp - prev_close) / prev_close) * 100, 2)
 
     # ── Momentum 5D ───────────────────────────────────────────────────
     momentum5d = 0.0
