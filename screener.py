@@ -46,258 +46,168 @@ def keep_alive():
         print(f"Keep-alive failed: {e}")
 
 
-# ── SEED LIST — verified security IDs from Dhan master CSV ────────
-# Previously 58 symbols had wrong IDs — now corrected
-SEED_SYMBOLS = [
-    {"symbol": "ABBOTINDIA",  "security_id": "788",   "exchange": "NSE"},
-    {"symbol": "ABCAPITAL",   "security_id": "20904", "exchange": "NSE"},
-    {"symbol": "ABFRL",       "security_id": "20179", "exchange": "NSE"},
-    {"symbol": "ACC",         "security_id": "22",    "exchange": "NSE"},
-    {"symbol": "ADANIENT",    "security_id": "25",    "exchange": "NSE"},
-    {"symbol": "ADANIPORTS",  "security_id": "15083", "exchange": "NSE"},
-    {"symbol": "ALKEM",       "security_id": "17963", "exchange": "NSE"},
-    {"symbol": "AMBUJACEM",   "security_id": "1270",  "exchange": "NSE"},
-    {"symbol": "ANGELONE",    "security_id": "20554", "exchange": "NSE"},
-    {"symbol": "APLAPOLLO",   "security_id": "19229", "exchange": "NSE"},
-    {"symbol": "APOLLOHOSP",  "security_id": "157",   "exchange": "NSE"},
-    {"symbol": "APOLLOTYRE",  "security_id": "163",   "exchange": "NSE"},
-    {"symbol": "ASHOKLEY",    "security_id": "212",   "exchange": "NSE"},
-    {"symbol": "ASIANPAINT",  "security_id": "467",   "exchange": "NSE"},
-    {"symbol": "ASTRAL",      "security_id": "14418", "exchange": "NSE"},
-    {"symbol": "ATGL",        "security_id": "22169", "exchange": "NSE"},
-    {"symbol": "ATUL",        "security_id": "263",   "exchange": "NSE"},
-    {"symbol": "AUBANK",      "security_id": "21238", "exchange": "NSE"},
-    {"symbol": "AUROPHARMA",  "security_id": "275",   "exchange": "NSE"},
-    {"symbol": "AXISBANK",    "security_id": "5900",  "exchange": "NSE"},
-    {"symbol": "BAJAJ-AUTO",  "security_id": "16669", "exchange": "NSE"},
-    {"symbol": "BAJAJFINSV",  "security_id": "16675", "exchange": "NSE"},
-    {"symbol": "BAJFINANCE",  "security_id": "317",   "exchange": "NSE"},
-    {"symbol": "BALKRISIND",  "security_id": "1482",  "exchange": "NSE"},
-    {"symbol": "BANDHANBNK",  "security_id": "21719", "exchange": "NSE"},
-    {"symbol": "BANKBARODA",  "security_id": "1452",  "exchange": "NSE"},
-    {"symbol": "BATAINDIA",   "security_id": "371",   "exchange": "NSE"},
-    {"symbol": "BEL",         "security_id": "383",   "exchange": "NSE"},
-    {"symbol": "BERGEPAINT",  "security_id": "404",   "exchange": "NSE"},
-    {"symbol": "BHARATFORG",  "security_id": "422",   "exchange": "NSE"},
-    {"symbol": "BHARTIARTL",  "security_id": "10604", "exchange": "NSE"},
-    {"symbol": "BHEL",        "security_id": "438",   "exchange": "NSE"},
-    {"symbol": "BIOCON",      "security_id": "11373", "exchange": "NSE"},
-    {"symbol": "BOSCHLTD",    "security_id": "2181",  "exchange": "NSE"},
-    {"symbol": "BPCL",        "security_id": "526",   "exchange": "NSE"},
-    {"symbol": "BRITANNIA",   "security_id": "547",   "exchange": "NSE"},
-    {"symbol": "BSOFT",       "security_id": "6004",  "exchange": "NSE"},
-    {"symbol": "CANBK",       "security_id": "10794", "exchange": "NSE"},
-    {"symbol": "CANFINHOME",  "security_id": "9262",  "exchange": "NSE"},
-    {"symbol": "CDSL",        "security_id": "21822", "exchange": "NSE"},
-    {"symbol": "CGPOWER",     "security_id": "678",   "exchange": "NSE"},
-    {"symbol": "CHAMBLFERT",  "security_id": "685",   "exchange": "NSE"},
-    {"symbol": "CHOLAFIN",    "security_id": "4375",  "exchange": "NSE"},
-    {"symbol": "CIPLA",       "security_id": "694",   "exchange": "NSE"},
-    {"symbol": "COALINDIA",   "security_id": "20374", "exchange": "NSE"},
-    {"symbol": "COFORGE",     "security_id": "11543", "exchange": "NSE"},
-    {"symbol": "COLPAL",      "security_id": "742",   "exchange": "NSE"},
-    {"symbol": "CONCOR",      "security_id": "4749",  "exchange": "NSE"},
-    {"symbol": "COROMANDEL",  "security_id": "739",   "exchange": "NSE"},
-    {"symbol": "CROMPTON",    "security_id": "20655", "exchange": "NSE"},
-    {"symbol": "CUB",         "security_id": "5784",  "exchange": "NSE"},
-    {"symbol": "CUMMINSIND",  "security_id": "774",   "exchange": "NSE"},
-    {"symbol": "DABUR",       "security_id": "804",   "exchange": "NSE"},
-    {"symbol": "DALBHARAT",   "security_id": "18253", "exchange": "NSE"},
-    {"symbol": "DEEPAKNTR",   "security_id": "10209", "exchange": "NSE"},
-    {"symbol": "DELTACORP",   "security_id": "14413", "exchange": "NSE"},
-    {"symbol": "DIVISLAB",    "security_id": "15174", "exchange": "NSE"},
-    {"symbol": "DIXON",       "security_id": "21690", "exchange": "NSE"},
-    {"symbol": "DLF",         "security_id": "14732", "exchange": "NSE"},
-    {"symbol": "DMART",       "security_id": "21561", "exchange": "NSE"},
-    {"symbol": "DRREDDY",     "security_id": "881",   "exchange": "NSE"},
-    {"symbol": "EICHERMOT",   "security_id": "910",   "exchange": "NSE"},
-    {"symbol": "ESCORTS",     "security_id": "958",   "exchange": "NSE"},
-    {"symbol": "EXIDEIND",    "security_id": "993",   "exchange": "NSE"},
-    {"symbol": "FEDERALBNK",  "security_id": "1023",  "exchange": "NSE"},
-    {"symbol": "FORCEMOT",    "security_id": "1039",  "exchange": "NSE"},
-    {"symbol": "FORTIS",      "security_id": "14804", "exchange": "NSE"},
-    {"symbol": "GAIL",        "security_id": "1066",  "exchange": "NSE"},
-    {"symbol": "GLENMARK",    "security_id": "1109",  "exchange": "NSE"},
-    {"symbol": "GMRINFRA",    "security_id": "13528", "exchange": "NSE"},
-    {"symbol": "GNFC",        "security_id": "1113",  "exchange": "NSE"},
-    {"symbol": "GODREJCP",    "security_id": "10099", "exchange": "NSE"},
-    {"symbol": "GODREJPROP",  "security_id": "17875", "exchange": "NSE"},
-    {"symbol": "GRANULES",    "security_id": "11809", "exchange": "NSE"},
-    {"symbol": "GRASIM",      "security_id": "315",   "exchange": "NSE"},
-    {"symbol": "GUJGASLTD",   "security_id": "10599", "exchange": "NSE"},
-    {"symbol": "HAL",         "security_id": "2303",  "exchange": "NSE"},
-    {"symbol": "HAVELLS",     "security_id": "8927",  "exchange": "NSE"},
-    {"symbol": "HCLTECH",     "security_id": "7229",  "exchange": "NSE"},
-    {"symbol": "HDFCAMC",     "security_id": "22080", "exchange": "NSE"},
-    {"symbol": "HDFCBANK",    "security_id": "1333",  "exchange": "NSE"},
-    {"symbol": "HDFCLIFE",    "security_id": "20704", "exchange": "NSE"},
-    {"symbol": "HEROMOTOCO",  "security_id": "1348",  "exchange": "NSE"},
-    {"symbol": "HFCL",        "security_id": "1350",  "exchange": "NSE"},
-    {"symbol": "HINDALCO",    "security_id": "1306",  "exchange": "NSE"},
-    {"symbol": "HINDCOPPER",  "security_id": "14978", "exchange": "NSE"},
-    {"symbol": "HINDPETRO",   "security_id": "1406",  "exchange": "NSE"},
-    {"symbol": "HINDUNILVR",  "security_id": "1394",  "exchange": "NSE"},
-    {"symbol": "ICICIBANK",   "security_id": "4963",  "exchange": "NSE"},
-    {"symbol": "ICICIGI",     "security_id": "21770", "exchange": "NSE"},
-    {"symbol": "ICICIPRULI",  "security_id": "18652", "exchange": "NSE"},
-    {"symbol": "IDEA",        "security_id": "14366", "exchange": "NSE"},
-    {"symbol": "IDFCFIRSTB",  "security_id": "20286", "exchange": "NSE"},
-    {"symbol": "IEX",         "security_id": "22149", "exchange": "NSE"},
-    {"symbol": "IGL",         "security_id": "11262", "exchange": "NSE"},
-    {"symbol": "INDHOTEL",    "security_id": "1512",  "exchange": "NSE"},
-    {"symbol": "INDIACEM",    "security_id": "1515",  "exchange": "NSE"},
-    {"symbol": "INDIAMART",   "security_id": "22592", "exchange": "NSE"},
-    {"symbol": "INDIGO",      "security_id": "20251", "exchange": "NSE"},
-    {"symbol": "INDUSINDBK",  "security_id": "5258",  "exchange": "NSE"},
-    {"symbol": "INDUSTOWER",  "security_id": "22271", "exchange": "NSE"},
-    {"symbol": "INFY",        "security_id": "1594",  "exchange": "NSE"},
-    {"symbol": "IOC",         "security_id": "1624",  "exchange": "NSE"},
-    {"symbol": "IPCALAB",     "security_id": "1633",  "exchange": "NSE"},
-    {"symbol": "IRCTC",       "security_id": "22961", "exchange": "NSE"},
-    {"symbol": "ITC",         "security_id": "1660",  "exchange": "NSE"},
-    {"symbol": "JINDALSTEL",  "security_id": "11600", "exchange": "NSE"},
-    {"symbol": "JKCEMENT",    "security_id": "13910", "exchange": "NSE"},
-    {"symbol": "JSWENERGY",   "security_id": "17594", "exchange": "NSE"},
-    {"symbol": "JSWSTEEL",    "security_id": "11723", "exchange": "NSE"},
-    {"symbol": "JUBLFOOD",    "security_id": "18096", "exchange": "NSE"},
-    {"symbol": "KALYANKJIL",  "security_id": "22945", "exchange": "NSE"},
-    {"symbol": "KEI",         "security_id": "1743",  "exchange": "NSE"},
-    {"symbol": "KOTAKBANK",   "security_id": "1232",  "exchange": "NSE"},
-    {"symbol": "KPITTECH",    "security_id": "4651",  "exchange": "NSE"},
-    {"symbol": "LALPATHLAB",  "security_id": "23048", "exchange": "NSE"},
-    {"symbol": "LAURUSLABS",  "security_id": "22950", "exchange": "NSE"},
-    {"symbol": "LICHSGFIN",   "security_id": "1847",  "exchange": "NSE"},
-    {"symbol": "LICI",        "security_id": "24095", "exchange": "NSE"},
-    {"symbol": "LT",          "security_id": "11483", "exchange": "NSE"},
-    {"symbol": "LTIM",        "security_id": "17818", "exchange": "NSE"},
-    {"symbol": "LTTS",        "security_id": "20299", "exchange": "NSE"},
-    {"symbol": "LUPIN",       "security_id": "10440", "exchange": "NSE"},
-    {"symbol": "M&M",         "security_id": "2031",  "exchange": "NSE"},
-    {"symbol": "M&MFIN",      "security_id": "13285", "exchange": "NSE"},
-    {"symbol": "MANAPPURAM",  "security_id": "19061", "exchange": "NSE"},
-    {"symbol": "MARICO",      "security_id": "4067",  "exchange": "NSE"},
-    {"symbol": "MARUTI",      "security_id": "10999", "exchange": "NSE"},
-    {"symbol": "MAXHEALTH",   "security_id": "23267", "exchange": "NSE"},
-    {"symbol": "MCX",         "security_id": "19238", "exchange": "NSE"},
-    {"symbol": "METROPOLIS",  "security_id": "22843", "exchange": "NSE"},
-    {"symbol": "MFSL",        "security_id": "4136",  "exchange": "NSE"},
-    {"symbol": "MOTHERSON",   "security_id": "4204",  "exchange": "NSE"},
-    {"symbol": "MPHASIS",     "security_id": "4261",  "exchange": "NSE"},
-    {"symbol": "MRF",         "security_id": "4162",  "exchange": "NSE"},
-    {"symbol": "MUTHOOTFIN",  "security_id": "18143", "exchange": "NSE"},
-    {"symbol": "NATIONALUM",  "security_id": "4244",  "exchange": "NSE"},
-    {"symbol": "NAUKRI",      "security_id": "13751", "exchange": "NSE"},
-    {"symbol": "NAVINFLUOR",  "security_id": "14500", "exchange": "NSE"},
-    {"symbol": "NESTLEIND",   "security_id": "4306",  "exchange": "NSE"},
-    {"symbol": "NMDC",        "security_id": "15332", "exchange": "NSE"},
-    {"symbol": "NTPC",        "security_id": "11630", "exchange": "NSE"},
-    {"symbol": "OBEROIRLTY",  "security_id": "20242", "exchange": "NSE"},
-    {"symbol": "OFSS",        "security_id": "10738", "exchange": "NSE"},
-    {"symbol": "ONGC",        "security_id": "2475",  "exchange": "NSE"},
-    {"symbol": "PAGEIND",     "security_id": "14401", "exchange": "NSE"},
-    {"symbol": "PEL",         "security_id": "2481",  "exchange": "NSE"},
-    {"symbol": "PERSISTENT",  "security_id": "18365", "exchange": "NSE"},
-    {"symbol": "PETRONET",    "security_id": "11351", "exchange": "NSE"},
-    {"symbol": "PFC",         "security_id": "14299", "exchange": "NSE"},
-    {"symbol": "PIDILITIND",  "security_id": "2664",  "exchange": "NSE"},
-    {"symbol": "PIIND",       "security_id": "19015", "exchange": "NSE"},
-    {"symbol": "PNB",         "security_id": "2730",  "exchange": "NSE"},
-    {"symbol": "POLYCAB",     "security_id": "22185", "exchange": "NSE"},
-    {"symbol": "POWERGRID",   "security_id": "14977", "exchange": "NSE"},
-    {"symbol": "PVRINOX",     "security_id": "17243", "exchange": "NSE"},
-    {"symbol": "RAMCOCEM",    "security_id": "14994", "exchange": "NSE"},
-    {"symbol": "RBLBANK",     "security_id": "20413", "exchange": "NSE"},
-    {"symbol": "RECLTD",      "security_id": "15355", "exchange": "NSE"},
-    {"symbol": "RELIANCE",    "security_id": "2885",  "exchange": "NSE"},
-    {"symbol": "SAIL",        "security_id": "2963",  "exchange": "NSE"},
-    {"symbol": "SBICARD",     "security_id": "22990", "exchange": "NSE"},
-    {"symbol": "SBILIFE",     "security_id": "21808", "exchange": "NSE"},
-    {"symbol": "SBIN",        "security_id": "3045",  "exchange": "NSE"},
-    {"symbol": "SHREECEM",    "security_id": "3103",  "exchange": "NSE"},
-    {"symbol": "SHRIRAMFIN",  "security_id": "20817", "exchange": "NSE"},
-    {"symbol": "SIEMENS",     "security_id": "3150",  "exchange": "NSE"},
-    {"symbol": "SRF",         "security_id": "3273",  "exchange": "NSE"},
-    {"symbol": "SUNPHARMA",   "security_id": "3351",  "exchange": "NSE"},
-    {"symbol": "SUNTV",       "security_id": "3367",  "exchange": "NSE"},
-    {"symbol": "SUPREMEIND",  "security_id": "3378",  "exchange": "NSE"},
-    {"symbol": "SUZLON",      "security_id": "3391",  "exchange": "NSE"},
-    {"symbol": "SYNGENE",     "security_id": "20562", "exchange": "NSE"},
-    {"symbol": "TATACHEM",    "security_id": "3405",  "exchange": "NSE"},
-    {"symbol": "TATACOMM",    "security_id": "3408",  "exchange": "NSE"},
-    {"symbol": "TATACONSUM",  "security_id": "3432",  "exchange": "NSE"},
-    {"symbol": "TATAELXSI",   "security_id": "4910",  "exchange": "NSE"},
-    {"symbol": "TATAMOTORS",  "security_id": "3456",  "exchange": "NSE"},
-    {"symbol": "TATAPOWER",   "security_id": "3426",  "exchange": "NSE"},
-    {"symbol": "TATASTEEL",   "security_id": "3499",  "exchange": "NSE"},
-    {"symbol": "TCS",         "security_id": "11536", "exchange": "NSE"},
-    {"symbol": "TECHM",       "security_id": "13538", "exchange": "NSE"},
-    {"symbol": "TIINDIA",     "security_id": "19455", "exchange": "NSE"},
-    {"symbol": "TITAN",       "security_id": "3506",  "exchange": "NSE"},
-    {"symbol": "TORNTPHARM",  "security_id": "3518",  "exchange": "NSE"},
-    {"symbol": "TORNTPOWER",  "security_id": "3519",  "exchange": "NSE"},
-    {"symbol": "TRENT",       "security_id": "3530",  "exchange": "NSE"},
-    {"symbol": "TVSMOTOR",    "security_id": "3559",  "exchange": "NSE"},
-    {"symbol": "UBL",         "security_id": "16713", "exchange": "NSE"},
-    {"symbol": "ULTRACEMCO",  "security_id": "11532", "exchange": "NSE"},
-    {"symbol": "UNIONBANK",   "security_id": "10754", "exchange": "NSE"},
-    {"symbol": "UPL",         "security_id": "11287", "exchange": "NSE"},
-    {"symbol": "VEDL",        "security_id": "3063",  "exchange": "NSE"},
-    {"symbol": "VOLTAS",      "security_id": "3597",  "exchange": "NSE"},
-    {"symbol": "WIPRO",       "security_id": "3787",  "exchange": "NSE"},
-    {"symbol": "ZEEL",        "security_id": "3812",  "exchange": "NSE"},
-    {"symbol": "ZOMATO",      "security_id": "23652", "exchange": "NSE"},
-    {"symbol": "ZYDUSLIFE",   "security_id": "23148", "exchange": "NSE"},
+# ── FNO symbol names — IDs are fetched dynamically from Dhan CSV ──
+# This is ONLY a list of symbol names used when CSV is unavailable.
+# Security IDs are NEVER hardcoded here — always loaded from Dhan master CSV.
+FNO_SYMBOL_NAMES = [
+    "ABBOTINDIA","ABCAPITAL","ABFRL","ACC","ADANIENT","ADANIPORTS","ALKEM",
+    "AMBUJACEM","ANGELONE","APLAPOLLO","APOLLOHOSP","APOLLOTYRE","ASHOKLEY",
+    "ASIANPAINT","ASTRAL","ATGL","ATUL","AUBANK","AUROPHARMA","AXISBANK",
+    "BAJAJ-AUTO","BAJAJFINSV","BAJFINANCE","BALKRISIND","BANDHANBNK","BANKBARODA",
+    "BATAINDIA","BEL","BERGEPAINT","BHARATFORG","BHARTIARTL","BHEL","BIOCON",
+    "BOSCHLTD","BPCL","BRITANNIA","BSOFT","CANBK","CANFINHOME","CDSL","CGPOWER",
+    "CHAMBLFERT","CHOLAFIN","CIPLA","COALINDIA","COFORGE","COLPAL","CONCOR",
+    "COROMANDEL","CROMPTON","CUB","CUMMINSIND","DABUR","DALBHARAT","DEEPAKNTR",
+    "DELTACORP","DIVISLAB","DIXON","DLF","DMART","DRREDDY","EICHERMOT","ESCORTS",
+    "EXIDEIND","FEDERALBNK","FORCEMOT","FORTIS","GAIL","GLENMARK","GMRINFRA",
+    "GNFC","GODREJCP","GODREJPROP","GRANULES","GRASIM","GUJGASLTD","HAL",
+    "HAVELLS","HCLTECH","HDFCAMC","HDFCBANK","HDFCLIFE","HEROMOTOCO","HFCL",
+    "HINDALCO","HINDCOPPER","HINDPETRO","HINDUNILVR","ICICIBANK","ICICIGI",
+    "ICICIPRULI","IDEA","IDFCFIRSTB","IEX","IGL","INDHOTEL","INDIACEM",
+    "INDIAMART","INDIGO","INDUSINDBK","INDUSTOWER","INFY","IOC","IPCALAB",
+    "IRCTC","ITC","JINDALSTEL","JKCEMENT","JSWENERGY","JSWSTEEL","JUBLFOOD",
+    "KALYANKJIL","KEI","KOTAKBANK","KPITTECH","LALPATHLAB","LAURUSLABS",
+    "LICHSGFIN","LICI","LT","LTIM","LTTS","LUPIN","M&M","M&MFIN","MANAPPURAM",
+    "MARICO","MARUTI","MAXHEALTH","MCX","METROPOLIS","MFSL","MOTHERSON",
+    "MPHASIS","MRF","MUTHOOTFIN","NATIONALUM","NAUKRI","NAVINFLUOR","NESTLEIND",
+    "NMDC","NTPC","OBEROIRLTY","OFSS","ONGC","PAGEIND","PEL","PERSISTENT",
+    "PETRONET","PFC","PIDILITIND","PIIND","PNB","POLYCAB","POWERGRID","PVRINOX",
+    "RAMCOCEM","RBLBANK","RECLTD","RELIANCE","SAIL","SBICARD","SBILIFE","SBIN",
+    "SHREECEM","SHRIRAMFIN","SIEMENS","SRF","SUNPHARMA","SUNTV","SUPREMEIND",
+    "SUZLON","SYNGENE","TATACHEM","TATACOMM","TATACONSUM","TATAELXSI",
+    "TATAMOTORS","TATAPOWER","TATASTEEL","TCS","TECHM","TIINDIA","TITAN",
+    "TORNTPHARM","TORNTPOWER","TRENT","TVSMOTOR","UBL","ULTRACEMCO","UNIONBANK",
+    "UPL","VEDL","VOLTAS","WIPRO","ZEEL","ZOMATO","ZYDUSLIFE",
 ]
+
+CSV_URL      = "https://images.dhan.co/api-data/api-scrip-master.csv"
+_csv_eq_cache = {}   # symbol → security_id, populated from CSV
+_csv_lock     = threading.Lock()
+
+
+def _build_eq_lookup_from_csv() -> dict:
+    """
+    Downloads Dhan master CSV and returns {symbol: security_id}
+    for all NSE_EQ equities. Result is cached in _csv_eq_cache.
+    Raises on failure so caller can decide what to do.
+    """
+    resp = requests.get(CSV_URL, timeout=25)
+    resp.raise_for_status()
+    df = pd.read_csv(StringIO(resp.text), low_memory=False)
+    df.columns = [c.strip().upper() for c in df.columns]
+
+    seg_col = next((c for c in df.columns if "EXCH_SEG" in c or "SEGMENT" in c), None)
+    sym_col = next((c for c in df.columns if "TRADING_SYMBOL" in c or "SYMBOL_NAME" in c), None)
+    id_col  = next((c for c in df.columns if "SECURITY_ID" in c or "SCRIP_ID" in c or "SM_SYMBOL_ID" in c), None)
+
+    if not all([seg_col, sym_col, id_col]):
+        raise ValueError(f"Unexpected CSV columns: {list(df.columns)[:10]}")
+
+    df[sym_col] = df[sym_col].astype(str).str.strip()
+    df[seg_col] = df[seg_col].astype(str).str.upper().str.strip()
+    eq_df = df[df[seg_col] == "NSE_EQ"].copy()
+
+    lookup = {}
+    for _, r in eq_df[[id_col, sym_col]].iterrows():
+        sym = r[sym_col].strip()
+        if sym and sym not in lookup:
+            try:
+                lookup[sym] = str(int(float(str(r[id_col]))))
+            except (ValueError, TypeError):
+                pass
+
+    print(f"CSV: built NSE_EQ lookup — {len(lookup)} symbols")
+    return lookup
 
 
 def fetch_fno_symbols():
     """
-    Always tries master CSV first (correct IDs).
-    Falls back to seed only if CSV fails.
-    Logs which symbols are missing from marketfeed for debugging.
+    Builds SYMBOLS list with 100% dynamic security IDs from Dhan master CSV.
+
+    Flow:
+      1. Download CSV → build NSE_EQ symbol→ID lookup
+      2. Extract FNO symbols (FUTSTK + OPTSTK from NSE_FNO segment)
+      3. Cross-match FNO names against NSE_EQ to get correct equity IDs
+      4. Supplement with FNO_SYMBOL_NAMES for any known symbols missing from CSV
+      5. Only fallback to no-ID placeholder if CSV completely fails
+
+    No IDs are ever hardcoded. Wrong IDs are impossible if CSV is reachable.
     """
-    global SYMBOLS
-    SYMBOLS = list(SEED_SYMBOLS)
-    cache["symbol_source"] = "seed"
+    global SYMBOLS, _csv_eq_cache
+    cache["symbol_source"] = "loading"
+
     try:
-        resp = requests.get("https://images.dhan.co/api-data/api-scrip-master.csv", timeout=15)
+        resp = requests.get(CSV_URL, timeout=25)
         resp.raise_for_status()
         df = pd.read_csv(StringIO(resp.text), low_memory=False)
         df.columns = [c.strip().upper() for c in df.columns]
-        seg_col  = next((c for c in df.columns if "EXCH_SEG" in c or "SEGMENT" in c), None)
+
+        seg_col  = next((c for c in df.columns if "EXCH_SEG"       in c or "SEGMENT"     in c), None)
         sym_col  = next((c for c in df.columns if "TRADING_SYMBOL" in c or "SYMBOL_NAME" in c), None)
-        id_col   = next((c for c in df.columns if "SECURITY_ID" in c or "SCRIP_ID" in c or "SM_SYMBOL_ID" in c), None)
-        inst_col = next((c for c in df.columns if "INSTRUMENT" in c), None)
+        id_col   = next((c for c in df.columns if "SECURITY_ID"    in c or "SCRIP_ID"    in c or "SM_SYMBOL_ID" in c), None)
+        inst_col = next((c for c in df.columns if "INSTRUMENT"     in c), None)
+
         if not all([seg_col, sym_col, id_col]):
-            print("CSV column mismatch — using seed.")
-            return
-        eq_df  = df[df[seg_col].str.upper().str.strip() == "NSE_EQ"].copy()
-        fno_df = df[df[seg_col].str.upper().str.strip() == "NSE_FNO"].copy()
+            raise ValueError(f"CSV column mismatch: {list(df.columns)[:10]}")
+
+        df[sym_col] = df[sym_col].astype(str).str.strip()
+        df[seg_col] = df[seg_col].astype(str).str.upper().str.strip()
+
+        # ── Build NSE_EQ lookup: symbol → security_id ─────────────────
+        eq_df = df[df[seg_col] == "NSE_EQ"].copy()
+        eq_lookup = {}
+        for _, r in eq_df[[id_col, sym_col]].iterrows():
+            sym = r[sym_col].strip()
+            if sym and sym not in eq_lookup:
+                try:
+                    eq_lookup[sym] = str(int(float(str(r[id_col]))))
+                except (ValueError, TypeError):
+                    pass
+        _csv_eq_cache = eq_lookup   # cache for later use by /api/symbols/refresh
+        print(f"CSV NSE_EQ lookup: {len(eq_lookup)} symbols")
+
+        # ── Extract FNO symbol names from NSE_FNO segment ─────────────
+        fno_df = df[df[seg_col] == "NSE_FNO"].copy()
         if inst_col:
-            fno_df = fno_df[fno_df[inst_col].str.upper().str.strip() == "FUTSTK"]
-        fno_syms = set(fno_df[sym_col].str.strip().unique())
-        if not fno_syms:
-            print("No FUTSTK in CSV — using seed.")
-            return
-        matched = eq_df[eq_df[sym_col].str.strip().isin(fno_syms)][[id_col, sym_col]].drop_duplicates(subset=[sym_col])
-        if matched.empty:
-            print("No matches in CSV — using seed.")
-            return
-        new_symbols = []
-        for _, r in matched.iterrows():
-            try:
-                sid = str(int(float(str(r[id_col]))))   # handles int, float, or string IDs
-                new_symbols.append({"symbol": r[sym_col].strip(), "security_id": sid, "exchange": "NSE"})
-            except (ValueError, TypeError) as e:
-                print(f"  Skipping {r[sym_col]} — bad security_id '{r[id_col]}': {e}")
-        if not new_symbols:
-            print("No valid symbols parsed from CSV — using seed.")
-            return
-        SYMBOLS = new_symbols
-        cache["symbol_source"] = "csv"
-        print(f"Loaded {len(SYMBOLS)} FNO stocks from CSV.")
+            fno_df[inst_col] = fno_df[inst_col].astype(str).str.upper().str.strip()
+            futstk_syms = set(fno_df[fno_df[inst_col] == "FUTSTK"][sym_col].str.strip().unique())
+            optstk_syms = set(fno_df[fno_df[inst_col] == "OPTSTK"][sym_col].str.strip().unique())
+            fno_syms = futstk_syms | optstk_syms
+        else:
+            fno_syms = set(fno_df[sym_col].str.strip().unique())
+
+        # Merge with our known FNO names (union — CSV may miss newly listed stocks)
+        all_fno_names = fno_syms | set(FNO_SYMBOL_NAMES)
+        print(f"FNO names: {len(fno_syms)} from CSV + {len(FNO_SYMBOL_NAMES)} known = {len(all_fno_names)} total")
+
+        # ── Cross-match FNO names → NSE_EQ IDs ────────────────────────
+        matched, unmatched = [], []
+        for sym in sorted(all_fno_names):
+            sid = eq_lookup.get(sym)
+            if sid:
+                matched.append({"symbol": sym, "security_id": sid, "exchange": "NSE"})
+            else:
+                unmatched.append(sym)
+
+        if unmatched:
+            print(f"  Unmatched (no NSE_EQ entry): {unmatched[:10]}")
+
+        if len(matched) < 50:
+            raise ValueError(f"Only {len(matched)} symbols matched — CSV may be malformed")
+
+        SYMBOLS = matched
+        cache["symbol_source"] = "csv_dynamic"
+        print(f"✓ Loaded {len(SYMBOLS)} FNO stocks from CSV (dynamic IDs). Unmatched: {len(unmatched)}")
+
     except Exception as e:
-        print(f"CSV fetch failed ({e}) — using seed ({len(SYMBOLS)} stocks).")
+        print(f"✗ CSV fetch failed: {e}")
+        # Last-resort fallback: SYMBOLS list with no IDs — will cause 0 quotes
+        # but at least the app won't crash. Log clearly so user knows.
+        if not SYMBOLS:
+            print("  SYMBOLS is empty — app will return no data until CSV is reachable.")
+            SYMBOLS = []
+        cache["symbol_source"] = f"csv_failed:{str(e)[:60]}"
+
 
 
 # ── FIX 1: Always calculate change% from prev_close (net_change=0 after market close) ──
@@ -493,8 +403,9 @@ def scheduled_refresh():
 
 
 scheduler = BackgroundScheduler()
-scheduler.add_job(scheduled_refresh, "interval", minutes=5,  id="screener")
-scheduler.add_job(keep_alive,        "interval", minutes=10, id="keepalive")
+scheduler.add_job(scheduled_refresh,  "interval", minutes=5,   id="screener")
+scheduler.add_job(keep_alive,         "interval", minutes=10,  id="keepalive")
+scheduler.add_job(fetch_fno_symbols,  "cron",     hour=8, minute=30, id="csv_refresh")  # re-fetch CSV daily at 8:30 AM IST before market opens
 scheduler.start()
 
 
@@ -556,6 +467,21 @@ def top(limit: int = 20):
 @app.get("/api/symbols")
 def list_symbols():
     return {"count": len(SYMBOLS), "source": cache.get("symbol_source"), "symbols": SYMBOLS}
+
+
+@app.post("/api/symbols/refresh")
+def refresh_symbols():
+    """Force re-download of Dhan master CSV and rebuild symbol→ID map.
+    Call this anytime a symbol shows wrong price or a new FNO stock is listed."""
+    before = len(SYMBOLS)
+    fetch_fno_symbols()
+    return {
+        "status": "ok",
+        "before": before,
+        "after": len(SYMBOLS),
+        "source": cache.get("symbol_source"),
+        "sample": SYMBOLS[:5],
+    }
 
 
 @app.get("/api/health")
