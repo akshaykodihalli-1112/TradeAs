@@ -404,18 +404,26 @@ def get_historical(security_id, access_token, retries=3):
 
 def _run_screener(tok):
     global cache
-    if not SYMBOLS: fetch_fno_symbols()
-    cid   = CREDS["client_id"]
-    total = len(SYMBOLS)
-    cache.update({"status": "fetching", "progress": 0, "total": total, "market_open": is_market_open()})
-    print(f"Screener — {total} stocks | {get_ist_now().strftime('%H:%M:%S IST')}")
+
+    # Load symbols if not yet loaded — synchronous, happens before any screener work
+    if not SYMBOLS or cache.get("symbol_source") in ("none", "no_symbols"):
+        print(f"[screener] Loading symbols (source={cache.get('symbol_source')})...")
+        fetch_fno_symbols(tok)
+        if cache.get("symbol_source") in ("api_dynamic", "csv_dynamic"):
+            _save_symbols_to_disk()
 
     if not SYMBOLS:
         cache.update({"status": "error", "progress": 100,
-                      "errors": ["No symbols loaded — call POST /api/symbols/refresh with your token."]})
+                      "errors": ["No symbols loaded. Check Render logs and ensure CSV is reachable."]})
         return
+
+    cid   = CREDS["client_id"]
+    total = len(SYMBOLS)
+    cache.update({"status": "fetching", "progress": 0, "total": total, "market_open": is_market_open()})
+    print(f"Screener — {total} stocks ({cache.get('symbol_source')}) | {get_ist_now().strftime('%H:%M:%S IST')}")
+
     if cache.get("symbol_source") not in ("api_dynamic", "csv_dynamic", "disk_cache"):
-        print(f"[screener] ⚠ Running with potentially wrong IDs (source={cache.get('symbol_source')})")
+        print(f"[screener] ⚠ Source={cache.get('symbol_source')} — IDs may be incorrect")
 
     quotes = fetch_all_quotes(cid, tok)
     if not quotes:
@@ -539,12 +547,6 @@ def fetch_screener(client_id=None, access_token=None):
         return
     def _worker():
         with _screener_lock:
-            # If symbols still not loaded, try fetching them now with valid creds
-            if not SYMBOLS or cache.get("symbol_source") in ("none", "no_symbols"):
-                print("[screener] Symbols empty — fetching before screener run...")
-                fetch_fno_symbols(tok)
-                if cache.get("symbol_source") in ("api_dynamic", "csv_dynamic"):
-                    _save_symbols_to_disk()
             _run_screener(tok)
     threading.Thread(target=_worker, daemon=True).start()
 
@@ -563,57 +565,32 @@ def scheduled_refresh():
 scheduler = BackgroundScheduler()
 scheduler.add_job(scheduled_refresh,  "interval", minutes=5,   id="screener")
 scheduler.add_job(keep_alive,         "interval", minutes=10,  id="keepalive")
-scheduler.add_job(fetch_fno_symbols,  "cron",     hour=8, minute=30, id="csv_refresh")  # re-fetch CSV daily at 8:30 AM IST before market opens
+# csv_refresh runs via scheduled_refresh which has token from CREDS
 scheduler.start()
 
 
 @app.on_event("startup")
 async def startup():
-    """
-    Boot sequence (runs in background thread):
-    1. Try disk cache  → instant symbols, no network needed
-    2. Try CSV from Dhan (no token needed) → fresh IDs
-    3. If credentials available, try /v2/instrument API too
-    4. Save to disk on success so next boot is instant
-    Screener auto-starts once symbols are ready.
-    """
+    """Boot: load disk cache → try CSV → log result. Screener starts on first API call."""
     def _boot():
-        print("[boot] Starting...")
-
-        # Step 1: disk cache (instant, works offline)
-        if _load_symbols_from_disk():
-            print(f"[boot] ✓ Disk cache: {len(SYMBOLS)} symbols")
-            fetch_screener()   # start screener immediately with cached IDs
-
-        # Step 2: network refresh (CSV needs no token — works even without creds)
-        time.sleep(5)
         tok = CREDS.get("access_token", "")
         cid = CREDS.get("client_id", "")
-        print(f"[boot] Creds: client_id={'yes' if cid else 'NO'} token={'yes' if tok else 'NO'}")
+        print(f"[boot] start | cid={'yes' if cid else 'NO'} tok={'yes' if tok else 'NO'}")
 
-        for attempt in range(5):
-            try:
-                print(f"[boot] Symbol fetch attempt {attempt+1}/5...")
-                fetch_fno_symbols(tok)
-                src = cache["symbol_source"]
-                print(f"[boot] After fetch: source={src} symbols={len(SYMBOLS)}")
-                if src in ("api_dynamic", "csv_dynamic"):
-                    _save_symbols_to_disk()
-                    print(f"[boot] ✓ Live IDs saved ({len(SYMBOLS)} symbols) — starting screener")
-                    fetch_screener()
-                    return
-            except Exception as e:
-                print(f"[boot] Attempt {attempt+1} failed: {e}")
-            wait = 10 * (attempt + 1)
-            print(f"[boot] Waiting {wait}s before retry...")
-            time.sleep(wait)
+        # Load disk cache first (instant)
+        _load_symbols_from_disk()
 
-        # All attempts exhausted
-        if SYMBOLS:
-            print(f"[boot] Using {cache['symbol_source']} ({len(SYMBOLS)} symbols) — starting screener")
-            fetch_screener()
-        else:
-            print("[boot] ✗ No symbols loaded. Visit /api/symbols/refresh with your token.")
+        # Try CSV (no token needed)
+        fetch_fno_symbols(tok)
+        src = cache.get("symbol_source", "none")
+        print(f"[boot] done  | source={src} symbols={len(SYMBOLS)}")
+
+        if src in ("api_dynamic", "csv_dynamic"):
+            _save_symbols_to_disk()
+
+        # Auto-start screener if credentials available
+        if SYMBOLS and cid and tok:
+            fetch_screener(cid, tok)
 
     threading.Thread(target=_boot, daemon=True).start()
 
