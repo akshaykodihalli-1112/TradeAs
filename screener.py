@@ -174,8 +174,76 @@ def ensure_symbols(tok=""):
     load_symbols_verified()   # always works — never returns False
     # Try CSV in background to upgrade IDs
     if tok:
-        threading.Thread(target=load_symbols_csv, args=(tok,), daemon=True).start()
+        threading.Thread(target=_upgrade_ids_background, args=(tok,), daemon=True).start()
     return True
+
+
+def _upgrade_ids_background(tok):
+    """Try CSV first. If that fails, fix wrong IDs via marketfeed scan."""
+    if load_symbols_csv(tok):
+        return  # CSV worked — all IDs now correct
+    # CSV failed — scan for correct IDs of missing symbols
+    fix_missing_ids(tok)
+
+
+def fix_missing_ids(tok):
+    """
+    Scan all Dhan NSE_EQ IDs in focused ranges, collect tradingSymbol from each response.
+    Builds a complete symbol→ID map and fixes any wrong IDs in SYMBOLS.
+    Runs once in background after first screener run.
+    Takes ~2-3 minutes but only runs when IDs are wrong.
+    """
+    global SYMBOLS, VERIFIED_IDS
+    if not tok: return
+    print("[fix] starting full ID scan...")
+    headers = {"access-token": tok, "client-id": CREDS.get("client_id",""),
+               "Content-Type": "application/json"}
+
+    # Scan these ID ranges — covers all known Dhan NSE_EQ stock IDs
+    # Total: ~25000 IDs in batches of 100 = 250 batches
+    all_ids = list(range(1, 25001))
+    target  = {s["symbol"] for s in SYMBOLS}
+    found   = {}  # symbol → correct_id
+
+    for i in range(0, len(all_ids), 100):
+        if len(found) >= len(target): break
+        batch = all_ids[i:i+100]
+        for attempt in range(3):
+            try:
+                r = requests.post(f"{DHAN_BASE}/v2/marketfeed/ltp",
+                                  json={"NSE_EQ": batch}, headers=headers, timeout=15)
+                if r.status_code == 429:
+                    time.sleep(6*(attempt+1)); continue
+                if r.status_code == 200:
+                    for sec_id, q in r.json().get("data",{}).get("NSE_EQ",{}).items():
+                        sym = (q.get("tradingSymbol") or q.get("trading_symbol") or "").strip()
+                        if sym in target:
+                            found[sym] = str(int(float(sec_id)))
+                    break
+            except: time.sleep(1)
+        time.sleep(0.8)
+        if i % 2000 == 0:
+            print(f"[fix] scanned {i+100}/25000 IDs, found {len(found)}/{len(target)}")
+
+    print(f"[fix] scan complete: {len(found)}/{len(target)} symbols found")
+
+    # Apply corrections for any symbols where ID changed
+    corrections = {}
+    current_map = {s["symbol"]: s["security_id"] for s in SYMBOLS}
+    for sym, new_id in found.items():
+        if current_map.get(sym) != new_id:
+            corrections[sym] = new_id
+
+    if corrections:
+        VERIFIED_IDS.update(corrections)
+        for s in SYMBOLS:
+            if s["symbol"] in corrections:
+                s["security_id"] = corrections[s["symbol"]]
+        cache["symbol_source"] = "scanned"
+        save_symbols()
+        print(f"[fix] corrected {len(corrections)} IDs: {list(corrections.items())[:5]}")
+    else:
+        print("[fix] no corrections needed")
 
 # ── Quotes ─────────────────────────────────────────────────────────────────────
 def get_all_quotes(tok):
@@ -311,6 +379,12 @@ def run_screener(tok):
         "status":"ok","count":len(results),"errors":[],"skipped":skipped[:20],
         "progress":100,"market_open":is_market_open()})
     print(f"[screener] done — {len(results)} ok | {len(skipped)} skipped")
+
+    # If many symbols missing quotes, trigger ID fix in background
+    missing_count = cache.get("debug", {}).get("missing_count", 0)
+    if missing_count > 10 and cache["symbol_source"] in ("verified", "disk"):
+        print(f"[screener] {missing_count} missing — scheduling ID fix...")
+        threading.Thread(target=fix_missing_ids, args=(tok,), daemon=True).start()
 
 def trigger_screener(cid="",tok=""):
     cid=cid or CREDS["client_id"]; tok=tok or CREDS["access_token"]
