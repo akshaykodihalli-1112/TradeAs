@@ -520,11 +520,25 @@ def _run_screener(tok):
 def fetch_screener(client_id=None, access_token=None):
     cid = client_id or CREDS["client_id"]
     tok = access_token or CREDS["access_token"]
-    if not cid or not tok: cache["status"] = "no_credentials"; return
-    CREDS["client_id"] = cid; CREDS["access_token"] = tok
-    if _screener_lock.locked(): return
+    if not cid or not tok:
+        cache["status"] = "no_credentials"
+        print("[screener] No credentials — pass x-client-id and x-access-token headers")
+        return
+    # Always update CREDS so boot thread + scheduler can use them
+    CREDS["client_id"]    = cid
+    CREDS["access_token"] = tok
+    if _screener_lock.locked():
+        print("[screener] Already running, skipping duplicate")
+        return
     def _worker():
-        with _screener_lock: _run_screener(tok)
+        with _screener_lock:
+            # If symbols still not loaded, try fetching them now with valid creds
+            if not SYMBOLS or cache.get("symbol_source") in ("none", "no_symbols"):
+                print("[screener] Symbols empty — fetching before screener run...")
+                fetch_fno_symbols(tok)
+                if cache.get("symbol_source") in ("api_dynamic", "csv_dynamic"):
+                    _save_symbols_to_disk()
+            _run_screener(tok)
     threading.Thread(target=_worker, daemon=True).start()
 
 
@@ -548,39 +562,51 @@ scheduler.start()
 
 @app.on_event("startup")
 async def startup():
+    """
+    Boot sequence (runs in background thread):
+    1. Try disk cache  → instant symbols, no network needed
+    2. Try CSV from Dhan (no token needed) → fresh IDs
+    3. If credentials available, try /v2/instrument API too
+    4. Save to disk on success so next boot is instant
+    Screener auto-starts once symbols are ready.
+    """
     def _boot():
-        tok = CREDS.get("access_token", "")
+        print("[boot] Starting...")
 
-        # Step 1: Load disk cache immediately (fast, no network)
+        # Step 1: disk cache (instant, works offline)
         if _load_symbols_from_disk():
-            print(f"[boot] Disk cache loaded: {len(SYMBOLS)} symbols — starting screener.")
-            # Run screener with cached IDs right away
-            fetch_screener()
+            print(f"[boot] ✓ Disk cache: {len(SYMBOLS)} symbols")
+            fetch_screener()   # start screener immediately with cached IDs
 
-        # Step 2: Fetch fresh IDs from network (API or CSV)
-        time.sleep(6)  # let network settle on Render cold start
-        for attempt in range(4):
+        # Step 2: network refresh (CSV needs no token — works even without creds)
+        time.sleep(5)
+        tok = CREDS.get("access_token", "")
+        cid = CREDS.get("client_id", "")
+        print(f"[boot] Creds: client_id={'yes' if cid else 'NO'} token={'yes' if tok else 'NO'}")
+
+        for attempt in range(5):
             try:
-                print(f"[boot] Network symbol fetch {attempt+1}/4...")
+                print(f"[boot] Symbol fetch attempt {attempt+1}/5...")
                 fetch_fno_symbols(tok)
                 src = cache["symbol_source"]
+                print(f"[boot] After fetch: source={src} symbols={len(SYMBOLS)}")
                 if src in ("api_dynamic", "csv_dynamic"):
-                    print(f"[boot] ✓ Fresh IDs from {src}: {len(SYMBOLS)} symbols.")
-                    _save_symbols_to_disk()   # persist for next boot
-                    break
-                print(f"[boot] Source still '{src}', retrying in {8*(attempt+1)}s...")
+                    _save_symbols_to_disk()
+                    print(f"[boot] ✓ Live IDs saved ({len(SYMBOLS)} symbols) — starting screener")
+                    fetch_screener()
+                    return
             except Exception as e:
-                print(f"[boot] Attempt {attempt+1} error: {e}")
-            time.sleep(8 * (attempt + 1))
+                print(f"[boot] Attempt {attempt+1} failed: {e}")
+            wait = 10 * (attempt + 1)
+            print(f"[boot] Waiting {wait}s before retry...")
+            time.sleep(wait)
 
-        # Step 3: If disk cache was empty and network also failed
-        if not SYMBOLS:
-            print("[boot] ✗ No symbols from disk or network. Service needs /api/symbols/refresh.")
-            cache["symbol_source"] = "no_symbols"
-        elif cache["symbol_source"] not in ("disk_cache",):
-            # Fresh network load succeeded — run screener with correct IDs
-            print(f"[boot] Running screener with fresh IDs ({cache['symbol_source']})...")
+        # All attempts exhausted
+        if SYMBOLS:
+            print(f"[boot] Using {cache['symbol_source']} ({len(SYMBOLS)} symbols) — starting screener")
             fetch_screener()
+        else:
+            print("[boot] ✗ No symbols loaded. Visit /api/symbols/refresh with your token.")
 
     threading.Thread(target=_boot, daemon=True).start()
 
@@ -606,9 +632,14 @@ def ping_dhan(x_client_id: str = Header(None), x_access_token: str = Header(None
 
 @app.get("/api/screener")
 def get_screener(x_client_id: str = Header(None), x_access_token: str = Header(None)):
-    if x_client_id and x_access_token:
-        CREDS["client_id"] = x_client_id; CREDS["access_token"] = x_access_token
-        fetch_screener(x_client_id, x_access_token)
+    cid = x_client_id or CREDS.get("client_id","")
+    tok = x_access_token or CREDS.get("access_token","")
+    if cid: CREDS["client_id"] = cid
+    if tok: CREDS["access_token"] = tok
+    # Trigger screener if cache is stale/idle and credentials available
+    if cid and tok:
+        if cache.get("status") in ("idle", "no_credentials", "error") or not cache.get("data"):
+            fetch_screener(cid, tok)
     return cache
 
 
