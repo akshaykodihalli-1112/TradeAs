@@ -85,40 +85,6 @@ _csv_eq_cache = {}   # symbol → security_id, populated from CSV
 _csv_lock     = threading.Lock()
 
 
-def _build_eq_lookup_from_csv() -> dict:
-    """
-    Downloads Dhan master CSV and returns {symbol: security_id}
-    for all NSE_EQ equities. Result is cached in _csv_eq_cache.
-    Raises on failure so caller can decide what to do.
-    """
-    resp = requests.get(CSV_URL, timeout=25)
-    resp.raise_for_status()
-    df = pd.read_csv(StringIO(resp.text), low_memory=False)
-    df.columns = [c.strip().upper() for c in df.columns]
-
-    seg_col = next((c for c in df.columns if "EXCH_SEG" in c or "SEGMENT" in c), None)
-    sym_col = next((c for c in df.columns if "TRADING_SYMBOL" in c or "SYMBOL_NAME" in c), None)
-    id_col  = next((c for c in df.columns if "SECURITY_ID" in c or "SCRIP_ID" in c or "SM_SYMBOL_ID" in c), None)
-
-    if not all([seg_col, sym_col, id_col]):
-        raise ValueError(f"Unexpected CSV columns: {list(df.columns)[:10]}")
-
-    df[sym_col] = df[sym_col].astype(str).str.strip()
-    df[seg_col] = df[seg_col].astype(str).str.upper().str.strip()
-    eq_df = df[df[seg_col] == "NSE_EQ"].copy()
-
-    lookup = {}
-    for _, r in eq_df[[id_col, sym_col]].iterrows():
-        sym = r[sym_col].strip()
-        if sym and sym not in lookup:
-            try:
-                lookup[sym] = str(int(float(str(r[id_col]))))
-            except (ValueError, TypeError):
-                pass
-
-    print(f"CSV: built NSE_EQ lookup — {len(lookup)} symbols")
-    return lookup
-
 
 # ── Emergency symbol list — verified Dhan NSE_EQ IDs (2025-03-17) ──────
 # Used ONLY when CSV is unreachable. Call POST /api/symbols/refresh to upgrade.
@@ -182,103 +148,131 @@ def _load_emergency_symbols():
     print(f"[symbols] Loaded {len(SYMBOLS)} emergency symbols. POST /api/symbols/refresh to upgrade from CSV.")
 
 
-def fetch_fno_symbols():
+def _parse_eq_lookup_from_csv(text: str) -> dict:
+    """Parse Dhan compact CSV → {SYMBOL_NAME: security_id} for NSE_EQ rows only."""
+    lookup = {}
+    lines = text.splitlines()
+    if not lines:
+        return lookup
+    header = [h.strip().upper() for h in lines[0].split(",")]
+    try:
+        seg_i = next(i for i, h in enumerate(header) if "EXCH_SEG" in h or "SEGMENT" in h)
+        sym_i = next(i for i, h in enumerate(header) if "TRADING_SYMBOL" in h or "SYMBOL_NAME" in h)
+        id_i  = next(i for i, h in enumerate(header) if "SECURITY_ID" in h or "SCRIP_ID" in h or "SM_SYMBOL_ID" in h)
+    except StopIteration:
+        raise ValueError(f"CSV header missing required columns: {header[:8]}")
+    for line in lines[1:]:
+        cols = line.split(",")
+        if len(cols) <= max(seg_i, sym_i, id_i):
+            continue
+        if cols[seg_i].strip().upper() != "NSE_EQ":
+            continue
+        sym = cols[sym_i].strip()
+        if not sym or sym in lookup:
+            continue
+        try:
+            lookup[sym] = str(int(float(cols[id_i].strip())))
+        except (ValueError, TypeError):
+            pass
+    return lookup
+
+
+def fetch_fno_symbols(tok: str = ""):
     """
-    Builds SYMBOLS list with 100% dynamic security IDs from Dhan master CSV.
+    Builds SYMBOLS with correct NSE_EQ security IDs. Three strategies in order:
 
-    Flow:
-      1. Download CSV → build NSE_EQ symbol→ID lookup
-      2. Extract FNO symbols (FUTSTK + OPTSTK from NSE_FNO segment)
-      3. Cross-match FNO names against NSE_EQ to get correct equity IDs
-      4. Supplement with FNO_SYMBOL_NAMES for any known symbols missing from CSV
-      5. Only fallback to no-ID placeholder if CSV completely fails
+    1. Dhan /v2/instrument/NSE_EQ  — fastest, uses token, returns JSON directly
+    2. Dhan compact CSV            — no token needed, parse without pandas
+    3. Emergency fallback          — hardcoded IDs, always works
 
-    No IDs are ever hardcoded. Wrong IDs are impossible if CSV is reachable.
+    Both live sources are tried with retries before falling back.
     """
     global SYMBOLS, _csv_eq_cache
-    cache["symbol_source"] = "loading"
+    tok = tok or CREDS.get("access_token", "")
 
+    # ── Strategy 1: /v2/instrument/NSE_EQ API ─────────────────────────
+    if tok:
+        try:
+            print("[symbols] Trying /v2/instrument/NSE_EQ API...")
+            headers = {"access-token": tok, "Content-Type": "application/json"}
+            resp = requests.get(f"{DHAN_BASE}/v2/instrument/NSE_EQ",
+                                headers=headers, timeout=20)
+            if resp.status_code == 200:
+                instruments = resp.json()   # list of dicts
+                # Build lookup from JSON response
+                eq_lookup = {}
+                for inst in instruments:
+                    sym = (inst.get("tradingSymbol") or inst.get("SEM_TRADING_SYMBOL") or
+                           inst.get("symbolName")    or inst.get("SM_SYMBOL_NAME") or "").strip()
+                    sid_raw = (inst.get("securityId") or inst.get("SEM_SMST_SECURITY_ID") or
+                               inst.get("security_id") or "")
+                    if sym and sid_raw and sym not in eq_lookup:
+                        try:
+                            eq_lookup[sym] = str(int(float(str(sid_raw))))
+                        except (ValueError, TypeError):
+                            pass
+                if len(eq_lookup) > 100:
+                    _csv_eq_cache = eq_lookup
+                    matched, unmatched = _match_fno_to_eq(eq_lookup)
+                    if len(matched) >= 50:
+                        SYMBOLS = matched
+                        cache["symbol_source"] = "api_dynamic"
+                        print(f"[symbols] ✓ API: {len(SYMBOLS)} matched, {len(unmatched)} unmatched")
+                        return
+            print(f"[symbols] API returned {resp.status_code} — trying CSV...")
+        except Exception as e:
+            print(f"[symbols] API failed: {e} — trying CSV...")
+
+    # ── Strategy 2: Public compact CSV (no token, parsed without pandas) ──
     try:
-        # Retry CSV download up to 3 times (Render cold-start network blips)
+        print("[symbols] Trying compact CSV...")
         resp = None
-        for _attempt in range(3):
+        for attempt in range(3):
             try:
                 resp = requests.get(CSV_URL, timeout=30)
-                if resp.status_code == 200:
+                if resp.status_code == 200 and len(resp.text) > 10000:
                     break
-                print(f"  CSV attempt {_attempt+1} status {resp.status_code}, retrying...")
-                time.sleep(2)
-            except Exception as _e:
-                print(f"  CSV attempt {_attempt+1} failed: {_e}, retrying...")
-                time.sleep(3)
-        if not resp or resp.status_code != 200:
-            raise ConnectionError(f"CSV unreachable after 3 attempts (last status: {getattr(resp,'status_code','N/A')})")
-        df = pd.read_csv(StringIO(resp.text), low_memory=False)
-        df.columns = [c.strip().upper() for c in df.columns]
+                print(f"  CSV attempt {attempt+1}: status={getattr(resp,'status_code','?')} len={len(getattr(resp,'text',''))}")
+            except Exception as ce:
+                print(f"  CSV attempt {attempt+1} error: {ce}")
+            time.sleep(4)
 
-        seg_col  = next((c for c in df.columns if "EXCH_SEG"       in c or "SEGMENT"     in c), None)
-        sym_col  = next((c for c in df.columns if "TRADING_SYMBOL" in c or "SYMBOL_NAME" in c), None)
-        id_col   = next((c for c in df.columns if "SECURITY_ID"    in c or "SCRIP_ID"    in c or "SM_SYMBOL_ID" in c), None)
-        inst_col = next((c for c in df.columns if "INSTRUMENT"     in c), None)
+        if not resp or resp.status_code != 200 or len(resp.text) < 10000:
+            raise ConnectionError(f"CSV unreachable (status={getattr(resp,'status_code','N/A')} len={len(getattr(resp,'text',''))})")
 
-        if not all([seg_col, sym_col, id_col]):
-            raise ValueError(f"CSV column mismatch: {list(df.columns)[:10]}")
+        eq_lookup = _parse_eq_lookup_from_csv(resp.text)
+        print(f"[symbols] CSV parsed: {len(eq_lookup)} NSE_EQ symbols")
+        _csv_eq_cache = eq_lookup
 
-        df[sym_col] = df[sym_col].astype(str).str.strip()
-        df[seg_col] = df[seg_col].astype(str).str.upper().str.strip()
-
-        # ── Build NSE_EQ lookup: symbol → security_id ─────────────────
-        eq_df = df[df[seg_col] == "NSE_EQ"].copy()
-        eq_lookup = {}
-        for _, r in eq_df[[id_col, sym_col]].iterrows():
-            sym = r[sym_col].strip()
-            if sym and sym not in eq_lookup:
-                try:
-                    eq_lookup[sym] = str(int(float(str(r[id_col]))))
-                except (ValueError, TypeError):
-                    pass
-        _csv_eq_cache = eq_lookup   # cache for later use by /api/symbols/refresh
-        print(f"CSV NSE_EQ lookup: {len(eq_lookup)} symbols")
-
-        # ── Extract FNO symbol names from NSE_FNO segment ─────────────
-        fno_df = df[df[seg_col] == "NSE_FNO"].copy()
-        if inst_col:
-            fno_df[inst_col] = fno_df[inst_col].astype(str).str.upper().str.strip()
-            futstk_syms = set(fno_df[fno_df[inst_col] == "FUTSTK"][sym_col].str.strip().unique())
-            optstk_syms = set(fno_df[fno_df[inst_col] == "OPTSTK"][sym_col].str.strip().unique())
-            fno_syms = futstk_syms | optstk_syms
-        else:
-            fno_syms = set(fno_df[sym_col].str.strip().unique())
-
-        # Merge with our known FNO names (union — CSV may miss newly listed stocks)
-        all_fno_names = fno_syms | set(FNO_SYMBOL_NAMES)
-        print(f"FNO names: {len(fno_syms)} from CSV + {len(FNO_SYMBOL_NAMES)} known = {len(all_fno_names)} total")
-
-        # ── Cross-match FNO names → NSE_EQ IDs ────────────────────────
-        matched, unmatched = [], []
-        for sym in sorted(all_fno_names):
-            sid = eq_lookup.get(sym)
-            if sid:
-                matched.append({"symbol": sym, "security_id": sid, "exchange": "NSE"})
-            else:
-                unmatched.append(sym)
-
-        if unmatched:
-            print(f"  Unmatched (no NSE_EQ entry): {unmatched[:10]}")
-
+        matched, unmatched = _match_fno_to_eq(eq_lookup)
         if len(matched) < 50:
-            raise ValueError(f"Only {len(matched)} symbols matched — CSV may be malformed")
+            raise ValueError(f"Only {len(matched)} FNO symbols matched in CSV")
 
         SYMBOLS = matched
         cache["symbol_source"] = "csv_dynamic"
-        print(f"✓ Loaded {len(SYMBOLS)} FNO stocks from CSV (dynamic IDs). Unmatched: {len(unmatched)}")
+        print(f"[symbols] ✓ CSV: {len(SYMBOLS)} matched, {len(unmatched)} unmatched: {unmatched[:5]}")
+        return
 
     except Exception as e:
-        print(f"✗ CSV fetch failed: {e}")
-        if not SYMBOLS:
-            _load_emergency_symbols()
+        print(f"[symbols] ✗ CSV failed: {e}")
+
+    # ── Strategy 3: Emergency fallback ───────────────────────────────────
+    if not SYMBOLS:
+        _load_emergency_symbols()
+    else:
+        print(f"[symbols] Keeping existing {len(SYMBOLS)} ({cache['symbol_source']})")
+
+
+def _match_fno_to_eq(eq_lookup: dict):
+    """Cross-match FNO_SYMBOL_NAMES against NSE_EQ lookup → (matched, unmatched)."""
+    matched, unmatched = [], []
+    for sym in sorted(set(FNO_SYMBOL_NAMES)):
+        sid = eq_lookup.get(sym)
+        if sid:
+            matched.append({"symbol": sym, "security_id": sid, "exchange": "NSE"})
         else:
-            print(f"  Keeping existing {len(SYMBOLS)} symbols ({cache['symbol_source']}).")
+            unmatched.append(sym)
+    return matched, unmatched
 
 
 
@@ -470,7 +464,10 @@ def fetch_screener(client_id=None, access_token=None):
 
 def scheduled_refresh():
     if not CREDS["client_id"] or not CREDS["access_token"]: return
-    # Run always — market closed data still useful (prev_close, volumes, etc.)
+    # If still on emergency fallback, try to upgrade symbols first
+    if cache.get("symbol_source") == "emergency_fallback":
+        print("[scheduler] Still on emergency fallback — attempting symbol refresh...")
+        fetch_fno_symbols(CREDS["access_token"])
     fetch_screener()
 
 
@@ -484,25 +481,28 @@ scheduler.start()
 @app.on_event("startup")
 async def startup():
     def _boot():
-        # Step 1: Load emergency symbols IMMEDIATELY so app is never stuck at 0
+        # Step 1: Load emergency symbols IMMEDIATELY — app is never stuck at 0
         _load_emergency_symbols()
-        print(f"[boot] Emergency symbols loaded: {len(SYMBOLS)} — app is ready.")
+        print(f"[boot] Emergency symbols loaded: {len(SYMBOLS)} — app is live.")
 
-        # Step 2: Try to upgrade to CSV in background (with delay to let network settle)
-        time.sleep(8)   # give Render container time to fully init networking
+        # Step 2: Try to upgrade to live IDs (API first, then CSV)
+        time.sleep(6)   # let Render container finish network init
+        tok = CREDS.get("access_token", "")
         for attempt in range(4):
             try:
-                print(f"[boot] CSV fetch attempt {attempt+1}/4...")
-                fetch_fno_symbols()
-                if cache["symbol_source"] == "csv_dynamic":
-                    print(f"[boot] ✓ CSV loaded — {len(SYMBOLS)} symbols with fresh IDs.")
+                print(f"[boot] Symbol fetch attempt {attempt+1}/4 (tok={'yes' if tok else 'no'})...")
+                fetch_fno_symbols(tok)
+                src = cache["symbol_source"]
+                if src in ("api_dynamic", "csv_dynamic"):
+                    print(f"[boot] ✓ Live IDs loaded — {len(SYMBOLS)} symbols via {src}.")
                     break
+                print(f"[boot] Still on {src}, retrying...")
             except Exception as e:
-                print(f"[boot] CSV attempt {attempt+1} failed: {e}")
-            time.sleep(10 * (attempt + 1))   # 10s, 20s, 30s between retries
+                print(f"[boot] Attempt {attempt+1} failed: {e}")
+            time.sleep(8 * (attempt + 1))   # 8s, 16s, 24s, 32s
 
         # Step 3: Run screener with whatever symbols we have
-        print(f"[boot] Starting screener with {len(SYMBOLS)} symbols ({cache['symbol_source']})")
+        print(f"[boot] Starting screener — {len(SYMBOLS)} symbols ({cache['symbol_source']})")
         fetch_screener()
 
     threading.Thread(target=_boot, daemon=True).start()
@@ -561,16 +561,18 @@ def list_symbols():
 
 
 @app.post("/api/symbols/refresh")
-def refresh_symbols():
-    """Force re-download of Dhan master CSV and rebuild symbol→ID map.
+def refresh_symbols(x_access_token: str = Header(None)):
+    """Force re-fetch of symbol→ID map from Dhan API or CSV.
     Call this anytime a symbol shows wrong price or a new FNO stock is listed."""
+    tok = x_access_token or CREDS.get("access_token", "")
     before = len(SYMBOLS)
-    fetch_fno_symbols()
+    fetch_fno_symbols(tok)
     return {
         "status": "ok",
         "before": before,
         "after": len(SYMBOLS),
         "source": cache.get("symbol_source"),
+        "unmatched_sample": [s for s in FNO_SYMBOL_NAMES if s not in {x["symbol"] for x in SYMBOLS}][:10],
         "sample": SYMBOLS[:5],
     }
 
