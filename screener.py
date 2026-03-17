@@ -301,86 +301,120 @@ def get_historical(security_id, tok):
     return None
 
 # ── Screener ───────────────────────────────────────────────────────────────────
+def compute_metrics(q, hist, market_open, today_str):
+    """Compute change%, momentum5d, vol_ratio from quote + historical data."""
+    ltp       = q["ltp"]
+    today_vol = q["volume"]
+    closes    = hist.get("close",     []) if hist else []
+    volumes   = hist.get("volume",    []) if hist else []
+    stamps    = hist.get("timestamp", []) if hist else []
+
+    # ── Change % ──────────────────────────────────────────────────────
+    # Market open:  (ltp - prev_day_close) / prev_day_close
+    # Market closed: (today_close - prev_day_close) / prev_day_close
+    # Fallback:     quote's own prev_close field
+    chg_pct = 0.0; prev_close = 0.0
+
+    if len(closes) >= 2:
+        last_date  = datetime.utcfromtimestamp(stamps[-1]).strftime("%Y-%m-%d") if stamps else ""
+        has_today  = (last_date == today_str)
+        if market_open:
+            prev_close = closes[-2] if has_today else closes[-1]
+            if prev_close: chg_pct = round(((ltp - prev_close) / prev_close) * 100, 2)
+        else:
+            today_close = closes[-1]
+            prev_close  = closes[-2] if has_today else closes[-1]
+            ref_close   = closes[-2] if has_today else (closes[-2] if len(closes)>=2 else 0)
+            if ref_close: chg_pct = round(((today_close - ref_close) / ref_close) * 100, 2)
+            prev_close = ref_close
+    else:
+        # No historical — use quote's prev_close (works for intraday change)
+        prev_close = q.get("prev_close", 0)
+        if prev_close and ltp:
+            chg_pct = round(((ltp - prev_close) / prev_close) * 100, 2)
+
+    # ── Momentum 5D ───────────────────────────────────────────────────
+    momentum5d = 0.0
+    if len(closes) >= 6:
+        ref = ltp if market_open else closes[-1]
+        c5  = closes[-6]
+        if c5: momentum5d = round(((ref - c5) / c5) * 100, 2)
+
+    # ── Volume ratio ──────────────────────────────────────────────────
+    vol_ratio = 0.0; avg_vol7d = 0
+    if len(volumes) >= 8:
+        avg_vol7d = sum(volumes[-8:-1]) / 7
+        vol_ratio = round(today_vol / avg_vol7d, 2) if avg_vol7d else 0
+    elif today_vol > 0:
+        vol_ratio = 1.0
+
+    return chg_pct, round(prev_close, 2), momentum5d, vol_ratio, int(avg_vol7d)
+
+
 def run_screener(tok):
     global cache
     ensure_symbols(tok)
     if not SYMBOLS:
-        cache.update({"status":"error","errors":["No symbols"]}); return
+        cache.update({"status": "error", "errors": ["No symbols"]}); return
 
-    cid=CREDS["client_id"]; total=len(SYMBOLS)
-    cache.update({"status":"fetching","progress":0,"total":total,"market_open":is_market_open()})
+    total = len(SYMBOLS)
+    cache.update({"status": "fetching", "progress": 5, "total": total,
+                  "market_open": is_market_open()})
     print(f"[screener] {total} symbols ({cache['symbol_source']}) | {ist_now().strftime('%H:%M:%S IST')}")
 
-    quotes=get_all_quotes(tok)
+    # Step 1: Get all quotes (fast — 4 batches)
+    quotes = get_all_quotes(tok)
     if not quotes:
-        cache.update({"status":"error","errors":["0 quotes returned"]}); return
+        cache.update({"status": "error", "errors": ["0 quotes returned"]}); return
+    cache["progress"] = 20
 
-    market_open=is_market_open()
-    today_str=ist_now().strftime("%Y-%m-%d")
-    results,skipped=[],[]
+    # Step 2: Fetch historical for symbols that have quotes
+    # Only fetch for symbols we actually got quotes for — skip the missing ones
+    syms_with_quotes = [s for s in SYMBOLS if s["symbol"] in quotes]
+    print(f"[screener] fetching historical for {len(syms_with_quotes)} symbols...")
 
-    for i,sym in enumerate(SYMBOLS):
+    hist_data = {}  # symbol → hist dict
+    market_open = is_market_open()
+    today_str   = ist_now().strftime("%Y-%m-%d")
+
+    for i, sym in enumerate(syms_with_quotes):
+        hist = get_historical(sym["security_id"], tok)
+        if hist:
+            hist_data[sym["symbol"]] = hist
+        cache["progress"] = 20 + round((i + 1) / len(syms_with_quotes) * 70)
+        # Rate limit: 0.4s between historical calls
+        time.sleep(0.4)
+        if (i + 1) % 30 == 0:
+            print(f"  hist {i+1}/{len(syms_with_quotes)}")
+            time.sleep(2)  # extra pause every 30 calls
+
+    # Step 3: Build results
+    results, skipped = [], []
+    for sym in SYMBOLS:
         try:
-            q=quotes.get(sym["symbol"])
+            q = quotes.get(sym["symbol"])
             if not q:
                 skipped.append(f"{sym['symbol']}:no_quote")
-                cache["progress"]=round((i+1)/total*100)
                 continue
-
-            ltp=q["ltp"]; today_vol=q["volume"]
-            hist=get_historical(sym["security_id"],tok)
-            closes=hist.get("close",[]) if hist else []
-            volumes=hist.get("volume",[]) if hist else []
-            stamps=hist.get("timestamp",[]) if hist else []
-
-            # Change %
-            chg_pct=0.0; prev_close=0.0
-            if len(closes)>=2:
-                last_date=datetime.utcfromtimestamp(stamps[-1]).strftime("%Y-%m-%d") if stamps else ""
-                has_today=(last_date==today_str)
-                if market_open:
-                    prev_close=closes[-2] if has_today else closes[-1]
-                    if prev_close: chg_pct=round(((ltp-prev_close)/prev_close)*100,2)
-                else:
-                    today_close=closes[-1]
-                    prev_close=closes[-2] if len(closes)>=2 else 0
-                    if prev_close: chg_pct=round(((today_close-prev_close)/prev_close)*100,2)
-            elif q["prev_close"]:
-                prev_close=q["prev_close"]
-                if prev_close: chg_pct=round(((ltp-prev_close)/prev_close)*100,2)
-
-            # Momentum 5D
-            momentum5d=0.0
-            if len(closes)>=6:
-                ref=ltp if market_open else closes[-1]
-                c5=closes[-6]
-                if c5: momentum5d=round(((ref-c5)/c5)*100,2)
-
-            # Vol ratio
-            vol_ratio=0.0; avg_vol7d=0
-            if len(volumes)>=8:
-                avg_vol7d=sum(volumes[-8:-1])/7
-                vol_ratio=round(today_vol/avg_vol7d,2) if avg_vol7d else 0
-            elif today_vol>0: vol_ratio=1.0
-
-            results.append({"symbol":sym["symbol"],"exchange":"NSE","ltp":ltp,
-                "prev_close":round(prev_close,2),"change":chg_pct,
-                "momentum5d":momentum5d,"volumeRatio":vol_ratio,
-                "todayVol":today_vol,"avgVol7d":int(avg_vol7d)})
+            hist = hist_data.get(sym["symbol"])
+            chg_pct, prev_close, momentum5d, vol_ratio, avg_vol7d =                 compute_metrics(q, hist, market_open, today_str)
+            results.append({
+                "symbol":      sym["symbol"], "exchange": "NSE",
+                "ltp":         q["ltp"],      "prev_close": prev_close,
+                "change":      chg_pct,       "momentum5d": momentum5d,
+                "volumeRatio": vol_ratio,     "todayVol":   q["volume"],
+                "avgVol7d":    avg_vol7d,
+            })
         except Exception as e:
             skipped.append(f"{sym['symbol']}:{e}")
-        cache["progress"]=round((i+1)/total*100)
-        time.sleep(0.3)
-        if (i+1)%20==0:
-            print(f"  {i+1}/{total} ok={len(results)}"); time.sleep(1.5)
 
-    results.sort(key=lambda x:x["volumeRatio"],reverse=True)
-    cache.update({"data":results,"updated_at":ist_now().strftime("%H:%M:%S IST"),
-        "status":"ok","count":len(results),"errors":[],"skipped":skipped[:20],
-        "progress":100,"market_open":is_market_open()})
+    results.sort(key=lambda x: x["volumeRatio"], reverse=True)
+    cache.update({"data": results, "updated_at": ist_now().strftime("%H:%M:%S IST"),
+        "status": "ok", "count": len(results), "errors": [], "skipped": skipped[:20],
+        "progress": 100, "market_open": is_market_open()})
     print(f"[screener] done — {len(results)} ok | {len(skipped)} skipped")
 
-    # If many symbols missing quotes, trigger ID fix in background
+    # Trigger ID fix in background if too many missing
     missing_count = cache.get("debug", {}).get("missing_count", 0)
     if missing_count > 10 and cache["symbol_source"] in ("verified", "disk"):
         print(f"[screener] {missing_count} missing — scheduling ID fix...")
