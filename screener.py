@@ -577,6 +577,38 @@ def refresh_symbols(x_access_token: str = Header(None)):
     }
 
 
+@app.get("/api/debug/ids")
+def debug_ids(x_access_token: str = Header(None)):
+    """
+    Diagnostic endpoint — shows which symbols have no quote from Dhan marketfeed.
+    Use this to identify wrong security IDs.
+    Call after market hours to see which 60 symbols return no data.
+    Also triggers a fresh symbol refresh using your token.
+    """
+    tok = x_access_token or CREDS.get("access_token", "")
+    
+    # Try to refresh symbols first if token provided
+    if tok and cache.get("symbol_source") in ("emergency_fallback", "loading", None):
+        fetch_fno_symbols(tok)
+    
+    last_debug = cache.get("debug", {})
+    missing    = last_debug.get("missing_sample", [])
+    
+    return {
+        "symbol_count":   len(SYMBOLS),
+        "symbol_source":  cache.get("symbol_source"),
+        "quotes_fetched": last_debug.get("quotes_fetched", 0),
+        "missing_count":  last_debug.get("missing_count", 0),
+        "missing_sample": missing,
+        "all_symbols": [
+            {"symbol": s["symbol"], "security_id": s["security_id"]}
+            for s in SYMBOLS
+            if s["symbol"] in set(last_debug.get("missing_sample", []))
+        ],
+        "note": "If symbol_source is emergency_fallback, IDs may be wrong. Deploy new code and call POST /api/symbols/refresh with your token."
+    }
+
+
 @app.get("/api/health")
 def health():
     return {
