@@ -177,20 +177,21 @@ def _parse_csv(text):
     for row in reader:
         if header is None:
             header = [h.strip().upper() for h in row]
-            seg_i  = _find_col(header, "EXCH_SEG", "SEGMENT")
-            sym_i  = _find_col(header, "TRADING_SYMBOL", "SYMBOL_NAME", "SM_SYMBOL_NAME")
-            id_i   = _find_col(header, "SECURITY_ID", "SCRIP_ID", "SM_SYMBOL_ID", "SMST_SECURITY_ID")
-            inst_i = _find_col(header, "INSTRUMENT", "SEM_INSTRUMENT")
+            seg_i  = _find_col(header, "SEM_SEGMENT", "EXCH_SEG", "SEGMENT")
+            sym_i  = _find_col(header, "SEM_TRADING_SYMBOL", "TRADING_SYMBOL", "SYMBOL_NAME", "SM_SYMBOL_NAME")
+            id_i   = _find_col(header, "SEM_SMST_SECURITY_ID", "SECURITY_ID", "SCRIP_ID", "SM_SYMBOL_ID", "SMST_SECURITY_ID")
+            inst_i = _find_col(header, "SEM_INSTRUMENT_NAME", "INSTRUMENT", "SEM_INSTRUMENT")
             if None in (seg_i, sym_i, id_i): break
             continue
         if len(row) <= max(seg_i, sym_i, id_i): continue
         seg = row[seg_i].strip().upper()
         sym = row[sym_i].strip()
         if not sym: continue
-        if seg == "NSE_EQ" and sym not in eq:
+        is_nse_eq = seg in ("NSE_EQ", "NSE EQ", "NSEEQ") or (seg.startswith("NSE") and "EQ" in seg)
+        if is_nse_eq and sym not in eq:
             try: eq[sym] = str(int(float(row[id_i].strip())))
             except: pass
-        elif seg == "NSE_FNO" and inst_i is not None and len(row) > inst_i:
+        elif ("FNO" in seg or "NSE_FO" in seg) and inst_i is not None and len(row) > inst_i:
             if row[inst_i].strip().upper() in ("FUTSTK", "OPTSTK"):
                 fno.add(sym)
     return eq, fno
