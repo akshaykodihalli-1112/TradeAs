@@ -354,16 +354,10 @@ def get_historical(security_id, tok):
 # ── Screener ───────────────────────────────────────────────────────────────────
 def compute_metrics(q, hist, market_open, today_str):
     """
-    Formula (always):
-        change% = (today_price - prev_day_close) / prev_day_close * 100
-
-    today_price  = ltp  (live during market hours, last traded price after close)
-    prev_day_close:
-        - Market OPEN : closes[-1]  (yesterday's settled close, today bar not in hist yet)
-        - Market CLOSED: closes[-2] (day-before-today close, e.g. 16-Mar when today=17-Mar)
-          because closes[-1] IS today's close and closes[-2] is previous day
-
-    Fallback when no historical: use quote's own prev_close field from Dhan API.
+    change% formula:
+      Market OPEN:   (ltp - closes[-1]) / closes[-1]      closes[-1] = yesterday settled
+      Market CLOSED: (closes[-1] - closes[-2]) / closes[-2]  closes[-1] = today settled
+    Fallback (no hist): use quote prev_close from Dhan API
     """
     ltp       = q["ltp"]
     today_vol = q["volume"]
@@ -375,14 +369,21 @@ def compute_metrics(q, hist, market_open, today_str):
     prev_close = 0.0
 
     if len(closes) >= 2:
-        # When market is open, historical has bars up to yesterday (today's bar not settled)
-        # When market is closed, historical includes today's settled bar as closes[-1]
-        prev_close = closes[-2] if not market_open else closes[-1]
+        if market_open:
+            # Today's bar not yet settled — closes[-1] is yesterday's close
+            prev_close = closes[-1]
+            today_price = ltp
+        else:
+            # Market closed — closes[-1] is today's settled close
+            # closes[-2] is yesterday's close
+            today_price = closes[-1]
+            prev_close  = closes[-2]
+            ltp = today_price  # show today's close as LTP after hours
         if prev_close:
-            chg_pct = round(((ltp - prev_close) / prev_close) * 100, 2)
+            chg_pct = round(((today_price - prev_close) / prev_close) * 100, 2)
 
     elif q.get("prev_close"):
-        # Fallback: Dhan quote API stores yesterday's close in ohlc.close
+        # Fallback: use Dhan's prev_close field
         prev_close = q["prev_close"]
         if prev_close:
             chg_pct = round(((ltp - prev_close) / prev_close) * 100, 2)
@@ -390,14 +391,20 @@ def compute_metrics(q, hist, market_open, today_str):
     # ── Momentum 5D ───────────────────────────────────────────────────
     momentum5d = 0.0
     if len(closes) >= 6:
-        c5 = closes[-6]
-        if c5: momentum5d = round(((ltp - c5) / c5) * 100, 2)
+        ref = closes[-1] if not market_open else ltp
+        c5  = closes[-7] if not market_open else closes[-6]
+        if c5: momentum5d = round(((ref - c5) / c5) * 100, 2)
 
     # ── Volume ratio ──────────────────────────────────────────────────
     vol_ratio = 0.0; avg_vol7d = 0
     if len(volumes) >= 8:
-        avg_vol7d = sum(volumes[-8:-1]) / 7
-        vol_ratio = round(today_vol / avg_vol7d, 2) if avg_vol7d else 0
+        if market_open:
+            avg_vol7d = int(sum(volumes[-8:-1]) / 7)
+            vol_ratio = round(today_vol / avg_vol7d, 2) if avg_vol7d else 0
+        else:
+            # Market closed — volumes[-1] is today's final volume
+            avg_vol7d = int(sum(volumes[-8:-1]) / 7)
+            vol_ratio = round(volumes[-1] / avg_vol7d, 2) if avg_vol7d else 0
     elif today_vol > 0:
         vol_ratio = 1.0
 
@@ -443,33 +450,37 @@ def run_screener(tok):
             if not q:
                 skipped.append(f"{sym['symbol']}:no_quote")
                 continue
-            # Use existing historical if available from previous run
-            hist = None
+            # Reuse previous run's hist metrics if available — background will refresh
             for r in cache.get("data", []):
                 if r["symbol"] == sym["symbol"] and r.get("avgVol7d", 0) > 0:
-                    # Reuse previous hist metrics — will be refreshed by background fetch
+                    pc = r["prev_close"]
+                    if market_open:
+                        # Live: use fresh ltp vs stored prev_close
+                        chg = round(((q["ltp"] - pc) / pc * 100), 2) if pc else 0
+                        ltp = q["ltp"]
+                    else:
+                        # Closed: keep the settled change from last enriched run
+                        chg = r["change"]
+                        ltp = r["ltp"]  # use settled close, not stale quote
                     results.append({
-                        "symbol":      sym["symbol"], "exchange": "NSE",
-                        "ltp":         q["ltp"],      "prev_close": r["prev_close"],
-                        "change":      round(((q["ltp"]-r["prev_close"])/r["prev_close"]*100),2) if r["prev_close"] else 0,
-                        "momentum5d":  r["momentum5d"],
+                        "symbol": sym["symbol"], "exchange": "NSE",
+                        "ltp": ltp, "prev_close": pc, "change": chg,
+                        "momentum5d": r["momentum5d"],
                         "volumeRatio": r["volumeRatio"], "todayVol": q["volume"],
-                        "avgVol7d":    r["avgVol7d"],
+                        "avgVol7d": r["avgVol7d"],
                     })
-                    hist = True
                     break
-            if hist:
-                continue
-            # No prior data — use quote's prev_close, no volume ratio yet
-            pc = q.get("prev_close", 0)
-            chg = round(((q["ltp"]-pc)/pc*100),2) if pc else 0.0
-            results.append({
-                "symbol":      sym["symbol"], "exchange": "NSE",
-                "ltp":         q["ltp"],      "prev_close": pc,
-                "change":      chg,           "momentum5d": 0.0,
-                "volumeRatio": 0.0,           "todayVol":   q["volume"],
-                "avgVol7d":    0,
-            })
+            else:
+                # No prior data — use quote's prev_close as best available estimate
+                pc  = q.get("prev_close", 0)
+                ltp = q["ltp"]
+                chg = round(((ltp - pc) / pc * 100), 2) if pc else 0.0
+                results.append({
+                    "symbol": sym["symbol"], "exchange": "NSE",
+                    "ltp": ltp, "prev_close": pc, "change": chg,
+                    "momentum5d": 0.0, "volumeRatio": 0.0,
+                    "todayVol": q["volume"], "avgVol7d": 0,
+                })
         except Exception as e:
             skipped.append(f"{sym['symbol']}:{e}")
 
