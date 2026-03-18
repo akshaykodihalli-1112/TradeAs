@@ -1,12 +1,13 @@
 from fastapi import FastAPI, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.background import BackgroundScheduler
+from contextlib import asynccontextmanager
 import requests, threading, time, os, json, csv
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from io import StringIO
 
-app = FastAPI(title="DhanScreen API", version="3.0")
+app = FastAPI(title="DhanScreen API", version="3.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 DHAN_BASE = "https://api.dhan.co"
@@ -160,26 +161,38 @@ def load_symbols_csv(tok=""):
             print(f"[sym]   error: {e}")
     return False
 
+def _find_col(header, *keywords):
+    """Return first column index whose header contains any keyword."""
+    for i, h in enumerate(header):
+        for kw in keywords:
+            if kw in h:
+                return i
+    return None
+
 def _parse_csv(text):
     eq, fno = {}, set()
     reader = csv.reader(StringIO(text))
-    header = seg_i = sym_i = id_i = inst_i = None
+    header = None
+    seg_i = sym_i = id_i = inst_i = None
     for row in reader:
         if header is None:
             header = [h.strip().upper() for h in row]
-            fi = lambda *kws: next((i for i,h in enumerate(header) if any(k in h for k in kws)), None)
-            seg_i=fi("EXCH_SEG","SEGMENT"); sym_i=fi("TRADING_SYMBOL","SYMBOL_NAME","SM_SYMBOL_NAME")
-            id_i=fi("SECURITY_ID","SCRIP_ID","SM_SYMBOL_ID"); inst_i=fi("INSTRUMENT","SEM_INSTRUMENT")
-            if None in (seg_i,sym_i,id_i): break
+            seg_i  = _find_col(header, "EXCH_SEG", "SEGMENT")
+            sym_i  = _find_col(header, "TRADING_SYMBOL", "SYMBOL_NAME", "SM_SYMBOL_NAME")
+            id_i   = _find_col(header, "SECURITY_ID", "SCRIP_ID", "SM_SYMBOL_ID", "SMST_SECURITY_ID")
+            inst_i = _find_col(header, "INSTRUMENT", "SEM_INSTRUMENT")
+            if None in (seg_i, sym_i, id_i): break
             continue
-        if len(row) <= max(seg_i,sym_i,id_i): continue
-        seg=row[seg_i].strip().upper(); sym=row[sym_i].strip()
+        if len(row) <= max(seg_i, sym_i, id_i): continue
+        seg = row[seg_i].strip().upper()
+        sym = row[sym_i].strip()
         if not sym: continue
-        if seg=="NSE_EQ" and sym not in eq:
-            try: eq[sym]=str(int(float(row[id_i].strip())))
+        if seg == "NSE_EQ" and sym not in eq:
+            try: eq[sym] = str(int(float(row[id_i].strip())))
             except: pass
-        elif seg=="NSE_FNO" and inst_i and row[inst_i].strip().upper() in ("FUTSTK","OPTSTK"):
-            fno.add(sym)
+        elif seg == "NSE_FNO" and inst_i is not None and len(row) > inst_i:
+            if row[inst_i].strip().upper() in ("FUTSTK", "OPTSTK"):
+                fno.add(sym)
     return eq, fno
 
 def ensure_symbols(tok=""):
@@ -291,7 +304,6 @@ def get_all_quotes(tok):
                     else: break
                 except Exception as e:
                     print(f"  quote err: {e}"); time.sleep(2)
-            if any(id_map.get(str(batch[0]))==s for s in quotes): break
         time.sleep(1.2)
     missing=[s["symbol"] for s in SYMBOLS if s["symbol"] not in quotes]
     print(f"[quotes] got={len(quotes)} missing={len(missing)} sample={missing[:5]}")
@@ -466,16 +478,17 @@ scheduler.add_job(keep_alive,"interval",minutes=10,id="keepalive")
 scheduler.start()
 
 # ── Startup ────────────────────────────────────────────────────────────────────
-@app.on_event("startup")
-async def startup():
+@asynccontextmanager
+async def lifespan(app):
     def _boot():
         tok=CREDS.get("access_token",""); cid=CREDS.get("client_id","")
         print(f"[boot] cid={'SET' if cid else 'MISSING'} tok={'SET' if tok else 'MISSING'}")
-        ensure_symbols(tok)   # loads verified IDs instantly, tries CSV in background
+        ensure_symbols(tok)
         print(f"[boot] symbols={len(SYMBOLS)} source={cache['symbol_source']}")
         if cid and tok: trigger_screener(cid,tok)
         else: print("[boot] no creds — set DHAN_CLIENT_ID + DHAN_ACCESS_TOKEN on Render")
     threading.Thread(target=_boot,daemon=True).start()
+    yield
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
 @app.get("/")
