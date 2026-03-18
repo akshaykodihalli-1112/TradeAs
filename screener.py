@@ -279,6 +279,14 @@ def fix_missing_ids(tok):
                 s["security_id"] = corrections[s["symbol"]]
         cache["symbol_source"] = "scanned"
         save_symbols()
+        # Also update correct_ids.json so fixes persist across restarts
+        try:
+            cij = {s["symbol"]: s["security_id"] for s in SYMBOLS}
+            with open("correct_ids.json", "w") as f:
+                json.dump(cij, f, indent=2)
+            print(f"[fix] saved corrections to correct_ids.json")
+        except Exception as e:
+            print(f"[fix] could not save correct_ids.json: {e}")
         print(f"[fix] corrected {len(corrections)} IDs: {list(corrections.items())[:5]}")
     else:
         print("[fix] no corrections needed")
@@ -399,6 +407,8 @@ def run_screener(tok):
     total = len(SYMBOLS)
     cache.update({"status": "fetching", "progress": 5, "total": total,
                   "market_open": is_market_open()})
+    # NOTE: intentionally do NOT clear cache["data"] here — keep stale data
+    # visible in the dashboard until fresh results are ready
     print(f"[screener] {total} symbols ({cache['symbol_source']}) | {ist_now().strftime('%H:%M:%S IST')}")
 
     # Step 1: Get all quotes (fast — 4 batches)
@@ -455,7 +465,7 @@ def run_screener(tok):
 
     # Trigger ID fix in background if too many missing
     missing_count = cache.get("debug", {}).get("missing_count", 0)
-    if missing_count > 10 and cache["symbol_source"] in ("verified", "disk"):
+    if missing_count > 10 and cache["symbol_source"] in ("verified", "disk", "correct_ids_json"):
         print(f"[screener] {missing_count} missing — scheduling ID fix...")
         threading.Thread(target=fix_missing_ids, args=(tok,), daemon=True).start()
 
