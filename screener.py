@@ -517,21 +517,23 @@ def run_screener(tok):
                 if hist:
                     closes  = hist.get("close",  [])
                     volumes = hist.get("volume", [])
-                    # closes[-1] may or may not include today depending on Dhan settlement timing
-                    # Check if closes[-1] matches today's ltp (within 0.5%)
-                    if closes and abs(closes[-1] - ltp) / ltp < 0.005:
-                        # closes[-1] = today's close, closes[-2] = yesterday's close
+                    # Determine if today's bar is included in historical
+                    # Use 5% tolerance — if closes[-1] is within 5% of ltp, it's today's bar
+                    if closes and abs(closes[-1] - ltp) / ltp < 0.05:
+                        # closes[-1] = today's close, closes[-2] = yesterday
                         prev_close = closes[-2] if len(closes) >= 2 else 0
+                        ref_closes = closes  # use all closes including today
                     else:
-                        # closes[-1] = yesterday's close (today not settled yet in hist)
+                        # closes[-1] = yesterday's close (today not in hist yet)
                         prev_close = closes[-1] if closes else 0
+                        ref_closes = closes + [ltp]  # append today's ltp
 
                     chg_pct = round((ltp - prev_close) / prev_close * 100, 2) if prev_close else 0.0
 
-                    # Momentum 5D
+                    # Momentum 5D — use 6th bar back from today
                     mom5d = 0.0
-                    if len(closes) >= 6:
-                        c5 = closes[-6] if abs(closes[-1] - ltp) / ltp < 0.005 else closes[-5] if len(closes) >= 5 else 0
+                    if len(ref_closes) >= 6:
+                        c5 = ref_closes[-6]
                         if c5: mom5d = round((ltp - c5) / c5 * 100, 2)
 
                     # Volume ratio
