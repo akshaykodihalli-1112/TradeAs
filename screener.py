@@ -569,7 +569,7 @@ async def lifespan(app):
     threading.Thread(target=_boot,daemon=True).start()
     yield
 
-app = FastAPI(title="DhanScreen API", version="3.0", lifespan=lifespan)
+app = FastAPI(title="TradeAs API", version="3.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
@@ -703,3 +703,131 @@ def get_ltp_live(x_client_id:str=Header(None),x_access_token:str=Header(None)):
         time.sleep(0.3)
     return {"status":"ok","count":len(quotes),"quotes":quotes,
             "updated_at":ist_now().strftime("%H:%M:%S IST"),"market_open":is_market_open()}
+
+# ── Option Chain ───────────────────────────────────────────────────────────────
+_opt_cache = {"data": [], "updated_at": None, "status": "idle", "count": 0, "market_open": False}
+_opt_lock  = threading.Lock()
+
+def _analyze_options(tok, cid):
+    global _opt_cache
+    if not SYMBOLS or not tok: return
+    _opt_cache["status"] = "fetching"
+    headers = {"access-token": tok, "client-id": cid, "Content-Type": "application/json"}
+    results = []
+
+    for sym_info in SYMBOLS:
+        sym   = sym_info["symbol"]
+        eq_id = sym_info["security_id"]
+        spot  = next((x["ltp"] for x in cache.get("data", []) if x["symbol"] == sym), 0)
+        if not spot: continue
+        try:
+            r = requests.post(
+                f"{DHAN_BASE}/v2/optionchain",
+                json={"UnderlyingScrip": int(eq_id), "UnderlyingInstrument": "EQUITY", "ExpiryCode": 0},
+                headers=headers, timeout=10
+            )
+            if r.status_code == 429: time.sleep(5); continue
+            if r.status_code != 200: continue
+            strikes = r.json().get("data", [])
+            if not strikes: continue
+
+            total_ce_oi = total_pe_oi = total_ce_vol = total_pe_vol = 0
+            atm_ce_oi = atm_pe_oi = atm_ce_vol = atm_pe_vol = 0
+            atm_strike = 0
+            min_diff = float("inf")
+
+            for sd in strikes:
+                sp     = float(sd.get("strikePrice", 0))
+                ce     = sd.get("callOption", {})
+                pe     = sd.get("putOption",  {})
+                ce_oi  = int(ce.get("openInterest", 0))
+                pe_oi  = int(pe.get("openInterest", 0))
+                ce_vol = int(ce.get("volume", 0))
+                pe_vol = int(pe.get("volume", 0))
+                total_ce_oi += ce_oi; total_pe_oi += pe_oi
+                total_ce_vol += ce_vol; total_pe_vol += pe_vol
+                diff = abs(sp - spot)
+                if diff < min_diff:
+                    min_diff = diff; atm_strike = sp
+                    atm_ce_oi = ce_oi; atm_pe_oi = pe_oi
+                    atm_ce_vol = ce_vol; atm_pe_vol = pe_vol
+
+            if total_ce_oi + total_pe_oi == 0: continue
+            pcr          = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi else 0
+            ce_vol_ratio = round(atm_ce_vol / (atm_ce_oi / 100), 2) if atm_ce_oi else 0
+            pe_vol_ratio = round(atm_pe_vol / (atm_pe_oi / 100), 2) if atm_pe_oi else 0
+
+            bull = 0
+            if pcr < 0.7:                           bull += 2
+            if ce_vol_ratio > 5:                    bull += 2
+            if atm_pe_oi > atm_ce_oi * 1.5:        bull += 1
+            if total_ce_vol > total_pe_vol * 1.5:   bull += 1
+
+            bear = 0
+            if pcr > 1.3:                           bear += 2
+            if pe_vol_ratio > 5:                    bear += 2
+            if atm_ce_oi > atm_pe_oi * 1.5:        bear += 1
+            if total_pe_vol > total_ce_vol * 1.5:   bear += 1
+
+            signal = "neutral"
+            strength = 0
+            if bull >= 3 and bull > bear:   signal = "bullish"; strength = bull
+            elif bear >= 3 and bear > bull: signal = "bearish"; strength = bear
+
+            vol_spike = ""
+            if   ce_vol_ratio > 8 and pe_vol_ratio > 8: vol_spike = "BOTH"
+            elif ce_vol_ratio > 8:                       vol_spike = "CE"
+            elif pe_vol_ratio > 8:                       vol_spike = "PE"
+
+            results.append({
+                "symbol": sym, "spot": spot, "atm_strike": atm_strike,
+                "pcr": pcr, "signal": signal, "signal_strength": strength,
+                "ce_oi": total_ce_oi, "pe_oi": total_pe_oi,
+                "ce_vol": total_ce_vol, "pe_vol": total_pe_vol,
+                "atm_ce_oi": atm_ce_oi, "atm_pe_oi": atm_pe_oi,
+                "atm_ce_vol": atm_ce_vol, "atm_pe_vol": atm_pe_vol,
+                "ce_vol_ratio": ce_vol_ratio, "pe_vol_ratio": pe_vol_ratio,
+                "vol_spike": vol_spike,
+            })
+            time.sleep(0.3)
+        except Exception as e:
+            print(f"[opt] {sym}: {e}"); continue
+
+    results.sort(key=lambda x: x["signal_strength"], reverse=True)
+    _opt_cache.update({"data": results, "updated_at": ist_now().strftime("%H:%M:%S IST"),
+                       "status": "ok", "count": len(results), "market_open": is_market_open()})
+    print(f"[opt] done — {len(results)} symbols")
+
+def _run_opt_locked(tok, cid):
+    with _opt_lock: _analyze_options(tok, cid)
+
+def _opt_stale():
+    last = _opt_cache.get("updated_at")
+    if not last: return True
+    try:
+        t = datetime.strptime(last, "%H:%M:%S IST").replace(
+            year=ist_now().year, month=ist_now().month, day=ist_now().day, tzinfo=IST)
+        return (ist_now() - t).seconds > 60
+    except: return True
+
+@app.get("/api/options")
+def get_options(x_client_id:str=Header(None), x_access_token:str=Header(None),
+                refresh:bool=Query(False)):
+    cid=x_client_id or CREDS.get("client_id",""); tok=x_access_token or CREDS.get("access_token","")
+    if not cid or not tok: return {"status":"no_credentials","data":[]}
+    CREDS["client_id"]=cid; CREDS["access_token"]=tok
+    if (refresh or _opt_stale() or not _opt_cache["data"]) and not _opt_lock.locked():
+        threading.Thread(target=_run_opt_locked, args=(tok,cid), daemon=True).start()
+    return _opt_cache
+
+@app.get("/api/options/bullish")
+def opt_bullish(x_client_id:str=Header(None),x_access_token:str=Header(None)):
+    return {"data":[x for x in _opt_cache["data"] if x["signal"]=="bullish"]}
+
+@app.get("/api/options/bearish")
+def opt_bearish(x_client_id:str=Header(None),x_access_token:str=Header(None)):
+    return {"data":[x for x in _opt_cache["data"] if x["signal"]=="bearish"]}
+
+@app.get("/api/options/volspike")
+def opt_volspike(x_client_id:str=Header(None),x_access_token:str=Header(None)):
+    return {"data":[x for x in _opt_cache["data"] if x["vol_spike"]]}
