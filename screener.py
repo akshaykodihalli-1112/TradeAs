@@ -614,16 +614,34 @@ def get_ltp(x_client_id:str=Header(None),x_access_token:str=Header(None)):
 
 @app.get("/api/ltp/live")
 def get_ltp_live(x_client_id:str=Header(None),x_access_token:str=Header(None)):
-    """Lightweight: returns latest prices from cache only. No Dhan API call.
-    Used by dashboard for 10s price refresh."""
+    """Fast LTP-only fetch from Dhan marketfeed/ltp — used for 10s price refresh.
+    Much faster than /api/ltp as it only fetches last_price, no OHLC/volume."""
     cid=x_client_id or CREDS.get("client_id",""); tok=x_access_token or CREDS.get("access_token","")
     if not cid or not tok: return {"status":"no_credentials","quotes":{}}
-    # Build quotes map from existing screener cache — instant, no network
-    quotes = {r["symbol"]: {"ltp": r["ltp"], "prev_close": r["prev_close"]}
-              for r in cache.get("data", [])}
-    if not quotes:
-        # Cache empty — do a real fetch
-        ensure_symbols(tok)
-        quotes = get_all_quotes(tok)
+    ensure_symbols(tok)
+    headers={"access-token":tok,"client-id":cid,"Content-Type":"application/json"}
+    id_map={s["security_id"]:s["symbol"] for s in SYMBOLS}
+    # Also build prev_close from existing cache for change% computation
+    prev_map={r["symbol"]:r["prev_close"] for r in cache.get("data",[]) if r.get("prev_close")}
+    quotes={}
+    for i in range(0,len(SYMBOLS),100):
+        batch=[int(s["security_id"]) for s in SYMBOLS[i:i+100]]
+        for attempt in range(2):
+            try:
+                r=requests.post(f"{DHAN_BASE}/v2/marketfeed/ltp",
+                                json={"NSE_EQ":batch},headers=headers,timeout=10)
+                if r.status_code==200:
+                    for sid,q in r.json().get("data",{}).get("NSE_EQ",{}).items():
+                        sym=id_map.get(str(int(float(sid))))
+                        if sym:
+                            ltp=round(float(q.get("last_price",0)),2)
+                            pc=prev_map.get(sym,0)
+                            quotes[sym]={"ltp":ltp,"prev_close":pc}
+                    break
+                elif r.status_code==429:
+                    time.sleep(3*(attempt+1))
+            except Exception as e:
+                time.sleep(1)
+        time.sleep(0.3)
     return {"status":"ok","count":len(quotes),"quotes":quotes,
             "updated_at":ist_now().strftime("%H:%M:%S IST"),"market_open":is_market_open()}
