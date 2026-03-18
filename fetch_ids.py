@@ -59,47 +59,57 @@ def find_col(header, *keywords):
 
 def parse_csv(text):
     """Parse Dhan scrip master CSV. Returns (eq_lookup, fno_symbols)."""
-    eq_lookup   = {}  # symbol -> security_id  (NSE_EQ rows)
+    eq_lookup   = {}
     fno_symbols = set()
     reader      = csv.reader(StringIO(text))
     header      = None
-    seg_i = sym_i = id_i = inst_i = None
-    sample_segs = set()   # collect unique segment values for diagnostics
-    row_count   = 0
+    exch_i = seg_i = sym_i = id_i = inst_i = series_i = None
+    row_count = 0
 
     for row in reader:
-        # ── header row ────────────────────────────────────────────────
         if header is None:
             header = [h.strip().upper() for h in row]
-            print(f"  Columns detected: {header[:10]}")
-            seg_i  = find_col(header, "SEM_SEGMENT", "EXCH_SEG", "SEGMENT")
-            sym_i  = find_col(header, "SEM_TRADING_SYMBOL", "TRADING_SYMBOL", "SYMBOL_NAME", "SM_SYMBOL_NAME")
-            id_i   = find_col(header, "SEM_SMST_SECURITY_ID", "SECURITY_ID", "SCRIP_ID", "SM_SYMBOL_ID", "SMST_SECURITY_ID")
-            inst_i = find_col(header, "SEM_INSTRUMENT_NAME", "INSTRUMENT", "SEM_INSTRUMENT")
-            print(f"  Col indices -> seg={seg_i} sym={sym_i} id={id_i} inst={inst_i}")
-            if None in (seg_i, sym_i, id_i):
-                print("ERROR: could not find required columns in CSV header.")
+            print(f"  All columns: {header}")
+            exch_i   = find_col(header, "SEM_EXM_EXCH_ID", "EXCH_ID", "EXCHANGE")
+            seg_i    = find_col(header, "SEM_SEGMENT", "EXCH_SEG", "SEGMENT")
+            sym_i    = find_col(header, "SEM_TRADING_SYMBOL", "TRADING_SYMBOL", "SYMBOL_NAME", "SM_SYMBOL_NAME")
+            id_i     = find_col(header, "SEM_SMST_SECURITY_ID", "SECURITY_ID", "SCRIP_ID", "SM_SYMBOL_ID")
+            inst_i   = find_col(header, "SEM_INSTRUMENT_NAME", "INSTRUMENT", "SEM_INSTRUMENT")
+            series_i = find_col(header, "SEM_SERIES", "SERIES")
+            print(f"  Col indices -> exch={exch_i} seg={seg_i} sym={sym_i} id={id_i} inst={inst_i} series={series_i}")
+            if None in (sym_i, id_i):
+                print("ERROR: could not find symbol/id columns.")
                 return {}, set()
             continue
 
-        # ── skip short rows ───────────────────────────────────────────
-        max_i = max(seg_i, sym_i, id_i)
+        max_i = max(c for c in (exch_i, seg_i, sym_i, id_i, inst_i, series_i) if c is not None)
         if len(row) <= max_i:
             continue
 
-        seg = row[seg_i].strip().upper()
-        sym = row[sym_i].strip()
+        sym    = row[sym_i].strip()
+        seg    = row[seg_i].strip().upper()    if seg_i    is not None else ""
+        exch   = row[exch_i].strip().upper()   if exch_i   is not None else ""
+        inst   = row[inst_i].strip().upper()   if inst_i   is not None else ""
+        series = row[series_i].strip().upper() if series_i is not None else ""
         row_count += 1
-
-        # Collect sample segment values from first 500 rows for diagnostics
-        if row_count <= 500:
-            sample_segs.add(seg)
 
         if not sym:
             continue
 
-        # Match NSE equity segment — handle both "NSE_EQ" and "NSE EQ" variants
-        is_nse_eq = seg in ("NSE_EQ", "NSE EQ", "NSEEQ") or seg.startswith("NSE") and "EQ" in seg
+        # ── NSE Equity: new format uses seg="E", series="EQ"
+        #               old format used seg="NSE_EQ"
+        is_nse_eq = (
+            (exch == "NSE" and seg == "E" and series == "EQ") or
+            (seg in ("NSE_EQ", "NSE EQ", "NSEEQ")) or
+            (seg.startswith("NSE") and "EQ" in seg)
+        )
+
+        # ── NSE FNO: new format uses seg="D", inst="FUTSTK"/"OPTSTK"
+        #             old format used seg="NSE_FNO"
+        is_nse_fno = (
+            (exch == "NSE" and inst in ("FUTSTK", "OPTSTK")) or
+            "FNO" in seg or "NSE_FO" in seg
+        )
 
         if is_nse_eq and sym not in eq_lookup:
             try:
@@ -107,12 +117,12 @@ def parse_csv(text):
             except (ValueError, IndexError):
                 pass
 
-        elif ("FNO" in seg or "NSE_FO" in seg) and inst_i is not None and len(row) > inst_i:
-            if row[inst_i].strip().upper() in ("FUTSTK", "OPTSTK"):
-                fno_symbols.add(sym)
+        elif is_nse_fno:
+            fno_symbols.add(sym)
 
-    print(f"  Total rows parsed: {row_count}")
-    print(f"  Unique segment values seen (sample): {sorted(sample_segs)}")
+    print(f"  Total rows parsed : {row_count}")
+    print(f"  NSE_EQ matched    : {len(eq_lookup)}")
+    print(f"  NSE_FNO matched   : {len(fno_symbols)}")
     return eq_lookup, fno_symbols
 
 def fetch_ids():
