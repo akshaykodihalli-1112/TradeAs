@@ -199,26 +199,28 @@ def _parse_csv(text):
     eq, fno = {}, set()
     reader = csv.reader(StringIO(text))
     header = None
-    exch_i = seg_i = sym_i = id_i = inst_i = series_i = None
+    exch_i = seg_i = sym_i = id_i = inst_i = series_i = undl_i = None
     for row in reader:
         if header is None:
             header   = [h.strip().upper() for h in row]
             exch_i   = _find_col(header, "SEM_EXM_EXCH_ID", "EXCH_ID", "EXCHANGE")
             seg_i    = _find_col(header, "SEM_SEGMENT", "EXCH_SEG", "SEGMENT")
-            sym_i    = _find_col(header, "SEM_TRADING_SYMBOL", "TRADING_SYMBOL", "SYMBOL_NAME", "SM_SYMBOL_NAME")
+            sym_i    = _find_col(header, "SEM_TRADING_SYMBOL", "TRADING_SYMBOL")
             id_i     = _find_col(header, "SEM_SMST_SECURITY_ID", "SECURITY_ID", "SCRIP_ID", "SM_SYMBOL_ID")
             inst_i   = _find_col(header, "SEM_INSTRUMENT_NAME", "INSTRUMENT", "SEM_INSTRUMENT")
             series_i = _find_col(header, "SEM_SERIES", "SERIES")
+            undl_i   = _find_col(header, "SM_SYMBOL_NAME", "SYMBOL_NAME")
             if None in (sym_i, id_i): break
             continue
-        max_i = max(c for c in (exch_i, seg_i, sym_i, id_i, inst_i, series_i) if c is not None)
+        max_i = max(c for c in (exch_i, seg_i, sym_i, id_i, inst_i, series_i, undl_i) if c is not None)
         if len(row) <= max_i: continue
         sym    = row[sym_i].strip()
         seg    = row[seg_i].strip().upper()    if seg_i    is not None else ""
         exch   = row[exch_i].strip().upper()   if exch_i   is not None else ""
         inst   = row[inst_i].strip().upper()   if inst_i   is not None else ""
         series = row[series_i].strip().upper() if series_i is not None else ""
-        if not sym: continue
+        undl   = row[undl_i].strip()           if undl_i   is not None and len(row) > undl_i else ""
+        if not sym and not undl: continue
         is_nse_eq = (
             (exch == "NSE" and seg == "E" and series == "EQ") or
             seg in ("NSE_EQ", "NSE EQ", "NSEEQ") or
@@ -231,8 +233,8 @@ def _parse_csv(text):
         if is_nse_eq and sym not in eq:
             try: eq[sym] = str(int(float(row[id_i].strip())))
             except: pass
-        elif is_nse_fno:
-            fno.add(sym)
+        elif is_nse_fno and undl:
+            fno.add(undl)  # add underlying stock name, not contract name
     return eq, fno
 
 def ensure_symbols(tok=""):
@@ -821,25 +823,61 @@ def _analyze_options(tok, cid):
     headers = {"access-token": tok, "client-id": cid, "Content-Type": "application/json"}
     results = []
 
+    # Wait for screener data to be available (needed for spot prices)
+    wait = 0
+    while not cache.get("data") and wait < 120:
+        print(f"[opt] waiting for screener data... ({wait}s)")
+        time.sleep(5); wait += 5
+    if not cache.get("data"):
+        print(f"[opt] screener data not available — aborting")
+        _opt_cache["status"] = "idle"
+        return
+
+    # Build spot price map from screener cache
+    spot_map = {x["symbol"]: x["ltp"] for x in cache.get("data", [])}
+    print(f"[opt] starting analysis for {len(SYMBOLS)} symbols, spot_map has {len(spot_map)} entries")
+
+    # Build FNO scrip ID map from VERIFIED_IDS - we need NSE_FNO IDs not NSE_EQ
+    # Dhan optionchain needs the underlying's FNO scrip ID
+    # Strategy: use /v2/marketfeed/quote for NSE_FNO to get option chain data
+    # We'll fetch option OI/volume from the FNO segment directly
+
+    # First get all FNO quotes to find option strikes
+    # Dhan option chain correct endpoint: GET /v2/optionchain?UnderlyingScrip=X&UnderlyingInstrument=EQUITY
+    # But the scrip ID needed is from NSE_FNO segment, not NSE_EQ
+    # Let's try with the symbol name approach first
+
     for sym_info in SYMBOLS:
         sym   = sym_info["symbol"]
         eq_id = sym_info["security_id"]
-        spot  = next((x["ltp"] for x in cache.get("data", []) if x["symbol"] == sym), 0)
-        if not spot: continue
+        spot  = spot_map.get(sym, 0)
+        if not spot:
+            continue
         try:
-            r = requests.post(
+            # Try GET request with query params (some Dhan versions use GET)
+            r = requests.get(
                 f"{DHAN_BASE}/v2/optionchain",
-                json={"UnderlyingScrip": int(eq_id), "UnderlyingInstrument": "EQUITY", "ExpiryCode": 0},
+                params={"UnderlyingScrip": int(eq_id), "UnderlyingInstrument": "EQUITY", "ExpiryCode": 0},
                 headers=headers, timeout=10
             )
             if r.status_code == 429:
-                print(f"[opt] {sym} 429 rate limit — sleeping 5s")
+                print(f"[opt] {sym} 429 — sleeping 5s")
                 time.sleep(5); continue
             if r.status_code != 200:
-                print(f"[opt] {sym} status={r.status_code} response={r.text[:200]}")
-                continue
+                # Try with NSE_FNO segment approach
+                r2 = requests.post(
+                    f"{DHAN_BASE}/v2/optionchain",
+                    json={"UnderlyingScrip": int(eq_id), "UnderlyingSegment": "NSE_FNO",
+                          "UnderlyingInstrument": "FUTSTK", "ExpiryCode": 0},
+                    headers=headers, timeout=10
+                )
+                if r2.status_code != 200:
+                    if sym == "ANGELONE":  # log just one for diagnosis
+                        print(f"[opt] GET {r.status_code}: {r.text[:150]}")
+                        print(f"[opt] POST2 {r2.status_code}: {r2.text[:150]}")
+                    continue
+                r = r2
             resp = r.json()
-            # Log first successful response structure
             if not results and resp:
                 print(f"[opt] first response keys: {list(resp.keys())}")
                 if resp.get("data"):
@@ -847,7 +885,7 @@ def _analyze_options(tok, cid):
                     print(f"[opt] data sample: {str(first)[:300]}")
             strikes = resp.get("data", [])
             if not strikes:
-                print(f"[opt] {sym} empty data: {resp}")
+                print(f"[opt] {sym} empty data: {str(resp)[:150]}")
                 continue
 
             total_ce_oi = total_pe_oi = total_ce_vol = total_pe_vol = 0
@@ -888,8 +926,7 @@ def _analyze_options(tok, cid):
             if atm_ce_oi > atm_pe_oi * 1.5:        bear += 1
             if total_pe_vol > total_ce_vol * 1.5:   bear += 1
 
-            signal = "neutral"
-            strength = 0
+            signal = "neutral"; strength = 0
             if bull >= 3 and bull > bear:   signal = "bullish"; strength = bull
             elif bear >= 3 and bear > bull: signal = "bearish"; strength = bear
 
@@ -915,18 +952,19 @@ def _analyze_options(tok, cid):
     results.sort(key=lambda x: x["signal_strength"], reverse=True)
     _opt_cache.update({"data": results, "updated_at": ist_now().strftime("%H:%M:%S IST"),
                        "status": "ok", "count": len(results), "market_open": is_market_open()})
-    print(f"[opt] done — {len(results)} symbols")
+    print(f"[opt] done — {len(results)} symbols analysed")
 
 def _run_opt_locked(tok, cid):
     with _opt_lock: _analyze_options(tok, cid)
 
 def _opt_stale():
+    """Returns True only if data is older than 5 minutes."""
     last = _opt_cache.get("updated_at")
     if not last: return True
     try:
         t = datetime.strptime(last, "%H:%M:%S IST").replace(
             year=ist_now().year, month=ist_now().month, day=ist_now().day, tzinfo=IST)
-        return (ist_now() - t).seconds > 60
+        return (ist_now() - t).seconds > 300  # 5 min stale threshold
     except: return True
 
 @app.get("/api/options")
@@ -935,7 +973,10 @@ def get_options(x_client_id:str=Header(None), x_access_token:str=Header(None),
     cid=x_client_id or CREDS.get("client_id",""); tok=x_access_token or CREDS.get("access_token","")
     if not cid or not tok: return {"status":"no_credentials","data":[]}
     CREDS["client_id"]=cid; CREDS["access_token"]=tok
-    if (refresh or _opt_stale() or not _opt_cache["data"]) and not _opt_lock.locked():
+    # Only trigger if: forced refresh OR stale AND not already running
+    should_run = (refresh or (_opt_stale() and not _opt_cache["data"])) and not _opt_lock.locked()
+    if should_run:
+        print(f"[opt] triggering analysis (refresh={refresh} stale={_opt_stale()} locked={_opt_lock.locked()})")
         threading.Thread(target=_run_opt_locked, args=(tok,cid), daemon=True).start()
     return _opt_cache
 
