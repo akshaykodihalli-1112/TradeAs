@@ -173,27 +173,40 @@ def _parse_csv(text):
     eq, fno = {}, set()
     reader = csv.reader(StringIO(text))
     header = None
-    seg_i = sym_i = id_i = inst_i = None
+    exch_i = seg_i = sym_i = id_i = inst_i = series_i = None
     for row in reader:
         if header is None:
-            header = [h.strip().upper() for h in row]
-            seg_i  = _find_col(header, "SEM_SEGMENT", "EXCH_SEG", "SEGMENT")
-            sym_i  = _find_col(header, "SEM_TRADING_SYMBOL", "TRADING_SYMBOL", "SYMBOL_NAME", "SM_SYMBOL_NAME")
-            id_i   = _find_col(header, "SEM_SMST_SECURITY_ID", "SECURITY_ID", "SCRIP_ID", "SM_SYMBOL_ID", "SMST_SECURITY_ID")
-            inst_i = _find_col(header, "SEM_INSTRUMENT_NAME", "INSTRUMENT", "SEM_INSTRUMENT")
-            if None in (seg_i, sym_i, id_i): break
+            header   = [h.strip().upper() for h in row]
+            exch_i   = _find_col(header, "SEM_EXM_EXCH_ID", "EXCH_ID", "EXCHANGE")
+            seg_i    = _find_col(header, "SEM_SEGMENT", "EXCH_SEG", "SEGMENT")
+            sym_i    = _find_col(header, "SEM_TRADING_SYMBOL", "TRADING_SYMBOL", "SYMBOL_NAME", "SM_SYMBOL_NAME")
+            id_i     = _find_col(header, "SEM_SMST_SECURITY_ID", "SECURITY_ID", "SCRIP_ID", "SM_SYMBOL_ID")
+            inst_i   = _find_col(header, "SEM_INSTRUMENT_NAME", "INSTRUMENT", "SEM_INSTRUMENT")
+            series_i = _find_col(header, "SEM_SERIES", "SERIES")
+            if None in (sym_i, id_i): break
             continue
-        if len(row) <= max(seg_i, sym_i, id_i): continue
-        seg = row[seg_i].strip().upper()
-        sym = row[sym_i].strip()
+        max_i = max(c for c in (exch_i, seg_i, sym_i, id_i, inst_i, series_i) if c is not None)
+        if len(row) <= max_i: continue
+        sym    = row[sym_i].strip()
+        seg    = row[seg_i].strip().upper()    if seg_i    is not None else ""
+        exch   = row[exch_i].strip().upper()   if exch_i   is not None else ""
+        inst   = row[inst_i].strip().upper()   if inst_i   is not None else ""
+        series = row[series_i].strip().upper() if series_i is not None else ""
         if not sym: continue
-        is_nse_eq = seg in ("NSE_EQ", "NSE EQ", "NSEEQ") or (seg.startswith("NSE") and "EQ" in seg)
+        is_nse_eq = (
+            (exch == "NSE" and seg == "E" and series == "EQ") or
+            seg in ("NSE_EQ", "NSE EQ", "NSEEQ") or
+            (seg.startswith("NSE") and "EQ" in seg)
+        )
+        is_nse_fno = (
+            (exch == "NSE" and inst in ("FUTSTK", "OPTSTK")) or
+            "FNO" in seg or "NSE_FO" in seg
+        )
         if is_nse_eq and sym not in eq:
             try: eq[sym] = str(int(float(row[id_i].strip())))
             except: pass
-        elif ("FNO" in seg or "NSE_FO" in seg) and inst_i is not None and len(row) > inst_i:
-            if row[inst_i].strip().upper() in ("FUTSTK", "OPTSTK"):
-                fno.add(sym)
+        elif is_nse_fno:
+            fno.add(sym)
     return eq, fno
 
 def ensure_symbols(tok=""):
