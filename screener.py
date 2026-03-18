@@ -324,6 +324,8 @@ def get_all_quotes(tok):
     for i in range(0, len(SYMBOLS), 50):
         batch   = [int(s["security_id"]) for s in SYMBOLS[i:i+50]]
         payload = {"NSE_EQ": batch}
+        ohlc_data = {}  # from /v2/marketfeed/ohlc endpoint
+
         for ep in ["/v2/marketfeed/quote","/v2/marketfeed/ohlc"]:
             for attempt in range(3):
                 try:
@@ -331,33 +333,49 @@ def get_all_quotes(tok):
                     print(f"  quote i={i} {ep} → {r.status_code}")
                     if r.status_code==200:
                         raw = r.json().get("data",{}).get("NSE_EQ",{})
-                        # Log first entry's raw keys once for debugging
                         if not _logged and raw:
                             first_key = next(iter(raw))
-                            print(f"[debug] raw quote keys: {list(raw[first_key].keys())}")
-                            print(f"[debug] raw ohlc keys: {list(raw[first_key].get('ohlc',{}).keys())}")
-                            print(f"[debug] sample entry: {raw[first_key]}")
-                            _logged = True
-                        for sid,q in raw.items():
-                            sym = id_map.get(str(int(float(sid))))
-                            if sym:
-                                ohlc=q.get("ohlc",{})
-                                ltp=float(q.get("last_price",0))
-                                # prev_close = yesterday's close
-                                # Dhan field: top-level "prev_close" or "previous_close" or ohlc "prev_close"
-                                pc = float(q.get("prev_close") or q.get("previous_close") or
-                                           ohlc.get("prev_close") or ohlc.get("previous_close") or
-                                           q.get("close") or 0)
-                                quotes[sym]={"ltp":round(ltp,2),
-                                    "prev_close":round(pc,2),
-                                    "volume":int(q.get("volume",0)),
-                                    "open":round(float(ohlc.get("open",0)),2),
-                                    "high":round(float(ohlc.get("high",0)),2),
-                                    "low":round(float(ohlc.get("low",0)),2)}
+                            print(f"[debug] {ep} keys: {list(raw[first_key].keys())}")
+                            print(f"[debug] {ep} ohlc keys: {list(raw[first_key].get('ohlc',{}).keys())}")
+                            print(f"[debug] {ep} sample: {raw[first_key]}")
+                            if ep == "/v2/marketfeed/ohlc":
+                                _logged = True
+
+                        if ep == "/v2/marketfeed/quote":
+                            for sid, q in raw.items():
+                                sym = id_map.get(str(int(float(sid))))
+                                if sym:
+                                    ohlc       = q.get("ohlc", {})
+                                    ltp        = float(q.get("last_price", 0))
+                                    net_change = float(q.get("net_change", 0))
+                                    today_close = float(ohlc.get("close", 0))
+                                    # prev_close = today_close - net_change
+                                    # net_change = last_price - prev_close
+                                    pc = round(ltp - net_change, 2)
+                                    quotes[sym] = {
+                                        "ltp":        round(ltp, 2),
+                                        "prev_close": pc,
+                                        "volume":     int(q.get("volume", 0)),
+                                        "open":       round(float(ohlc.get("open", 0)), 2),
+                                        "high":       round(float(ohlc.get("high", 0)), 2),
+                                        "low":        round(float(ohlc.get("low", 0)), 2),
+                                    }
+                        else:  # ohlc endpoint — may have prev_close field
+                            for sid, q in raw.items():
+                                sym = id_map.get(str(int(float(sid))))
+                                if sym and sym in quotes:
+                                    ohlc = q.get("ohlc", {})
+                                    # Try to get prev_close from ohlc endpoint
+                                    pc = float(q.get("prev_close") or q.get("previous_close") or
+                                               ohlc.get("prev_close") or ohlc.get("previous_close") or 0)
+                                    if pc:
+                                        quotes[sym]["prev_close"] = round(pc, 2)
+                                    ohlc_data[sym] = q
                         break
                     elif r.status_code==429:
                         time.sleep(5*(attempt+1))
-                    else: break
+                    else:
+                        break
                 except Exception as e:
                     print(f"  quote err: {e}"); time.sleep(2)
         time.sleep(1.2)
