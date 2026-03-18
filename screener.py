@@ -78,6 +78,12 @@ VERIFIED_IDS = {
     "TVSMOTOR":"3559","UBL":"16713","ULTRACEMCO":"11532","UNIONBANK":"10754",
     "UPL":"11287","VEDL":"3063","VOLTAS":"3597","WIPRO":"3787",
     "ZEEL":"3812","ZOMATO":"23652","ZYDUSLIFE":"23148",
+    # Newly added FNO stocks — IDs from Dhan CSV (re-run fetch_ids.py to verify)
+    "WAAREEENER":"26009","PREMIERENE":"26000","SWIGGY":"26823","HYUNDAI":"26870",
+    "NTPCGREEN":"26753","RVNL":"20263","IRFC":"24202","IREDA":"26335",
+    "HUDCO":"20330","SJVN":"22084","NHPC":"13751","COCHINSHIP":"4163",
+    "MAZAGON":"22248","POLICYBZR":"23468","NYKAA":"23468","PAYTM":"23660",
+    "DELHIVERY":"25063","CARTRADE":"23613",
 }
 
 def ist_now(): return datetime.now(IST)
@@ -403,6 +409,16 @@ def run_screener(tok):
     ensure_symbols(tok)
     if not SYMBOLS:
         cache.update({"status": "error", "errors": ["No symbols"]}); return
+
+    # Don't fetch when market is closed — keep last session's data intact
+    if not is_market_open():
+        if cache.get("data"):
+            print(f"[screener] market closed — keeping last data ({len(cache['data'])} results)")
+            cache.update({"status": "ok", "market_open": False,
+                          "progress": 100, "errors": []})
+            return
+        # No data yet and market closed — still try once to get prev close prices
+        print(f"[screener] market closed, no cached data — fetching prev close prices once")
 
     total = len(SYMBOLS)
     cache.update({"status": "fetching", "progress": 5, "total": total,
