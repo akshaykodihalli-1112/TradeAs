@@ -167,7 +167,13 @@ def load_symbols_csv(tok=""):
             if r.status_code != 200 or len(r.text) < 10000: continue
             eq, fno = _parse_csv(r.text)
             if len(eq) < 100: continue
-            all_names = (fno | set(VERIFIED_IDS.keys())) if fno else set(VERIFIED_IDS.keys())
+            # Use CSV FNO list as authoritative — removes delisted stocks automatically
+            if len(fno) >= 50:
+                all_names = fno  # CSV is source of truth
+                print(f"[sym] using CSV FNO list: {len(fno)} symbols")
+            else:
+                all_names = set(VERIFIED_IDS.keys())  # fallback
+                print(f"[sym] CSV FNO list small ({len(fno)}) — using verified fallback")
             matched = [{"symbol":s,"security_id":eq[s],"exchange":"NSE"}
                        for s in sorted(all_names) if s in eq]
             if len(matched) < 100: continue
