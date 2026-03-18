@@ -7,9 +7,6 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from io import StringIO
 
-app = FastAPI(title="DhanScreen API", version="3.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
 DHAN_BASE = "https://api.dhan.co"
 IST       = ZoneInfo("Asia/Kolkata")
 SELF_URL  = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
@@ -503,6 +500,9 @@ async def lifespan(app):
         else: print("[boot] no creds — set DHAN_CLIENT_ID + DHAN_ACCESS_TOKEN on Render")
     threading.Thread(target=_boot,daemon=True).start()
     yield
+
+app = FastAPI(title="DhanScreen API", version="3.0", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
 @app.get("/")
