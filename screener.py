@@ -611,3 +611,19 @@ def get_ltp(x_client_id:str=Header(None),x_access_token:str=Header(None)):
     quotes=get_all_quotes(tok)
     return {"status":"ok","count":len(quotes),"quotes":quotes,
             "updated_at":ist_now().strftime("%H:%M:%S IST"),"market_open":is_market_open()}
+
+@app.get("/api/ltp/live")
+def get_ltp_live(x_client_id:str=Header(None),x_access_token:str=Header(None)):
+    """Lightweight: returns latest prices from cache only. No Dhan API call.
+    Used by dashboard for 10s price refresh."""
+    cid=x_client_id or CREDS.get("client_id",""); tok=x_access_token or CREDS.get("access_token","")
+    if not cid or not tok: return {"status":"no_credentials","quotes":{}}
+    # Build quotes map from existing screener cache — instant, no network
+    quotes = {r["symbol"]: {"ltp": r["ltp"], "prev_close": r["prev_close"]}
+              for r in cache.get("data", [])}
+    if not quotes:
+        # Cache empty — do a real fetch
+        ensure_symbols(tok)
+        quotes = get_all_quotes(tok)
+    return {"status":"ok","count":len(quotes),"quotes":quotes,
+            "updated_at":ist_now().strftime("%H:%M:%S IST"),"market_open":is_market_open()}
