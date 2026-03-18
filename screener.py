@@ -320,6 +320,7 @@ def get_all_quotes(tok):
     headers = {"access-token":tok,"client-id":cid,"Content-Type":"application/json"}
     id_map  = {s["security_id"]:s["symbol"] for s in SYMBOLS}
     quotes  = {}
+    _logged = False
     for i in range(0, len(SYMBOLS), 50):
         batch   = [int(s["security_id"]) for s in SYMBOLS[i:i+50]]
         payload = {"NSE_EQ": batch}
@@ -329,13 +330,26 @@ def get_all_quotes(tok):
                     r = requests.post(f"{DHAN_BASE}{ep}",json=payload,headers=headers,timeout=15)
                     print(f"  quote i={i} {ep} → {r.status_code}")
                     if r.status_code==200:
-                        for sid,q in r.json().get("data",{}).get("NSE_EQ",{}).items():
+                        raw = r.json().get("data",{}).get("NSE_EQ",{})
+                        # Log first entry's raw keys once for debugging
+                        if not _logged and raw:
+                            first_key = next(iter(raw))
+                            print(f"[debug] raw quote keys: {list(raw[first_key].keys())}")
+                            print(f"[debug] raw ohlc keys: {list(raw[first_key].get('ohlc',{}).keys())}")
+                            print(f"[debug] sample entry: {raw[first_key]}")
+                            _logged = True
+                        for sid,q in raw.items():
                             sym = id_map.get(str(int(float(sid))))
                             if sym:
                                 ohlc=q.get("ohlc",{})
                                 ltp=float(q.get("last_price",0))
+                                # prev_close = yesterday's close
+                                # Dhan field: top-level "prev_close" or "previous_close" or ohlc "prev_close"
+                                pc = float(q.get("prev_close") or q.get("previous_close") or
+                                           ohlc.get("prev_close") or ohlc.get("previous_close") or
+                                           q.get("close") or 0)
                                 quotes[sym]={"ltp":round(ltp,2),
-                                    "prev_close":round(float(ohlc.get("close",0)),2),
+                                    "prev_close":round(pc,2),
                                     "volume":int(q.get("volume",0)),
                                     "open":round(float(ohlc.get("open",0)),2),
                                     "high":round(float(ohlc.get("high",0)),2),
