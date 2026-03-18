@@ -826,10 +826,23 @@ def _analyze_options(tok, cid):
                 json={"UnderlyingScrip": int(eq_id), "UnderlyingInstrument": "EQUITY", "ExpiryCode": 0},
                 headers=headers, timeout=10
             )
-            if r.status_code == 429: time.sleep(5); continue
-            if r.status_code != 200: continue
-            strikes = r.json().get("data", [])
-            if not strikes: continue
+            if r.status_code == 429:
+                print(f"[opt] {sym} 429 rate limit — sleeping 5s")
+                time.sleep(5); continue
+            if r.status_code != 200:
+                print(f"[opt] {sym} status={r.status_code} response={r.text[:200]}")
+                continue
+            resp = r.json()
+            # Log first successful response structure
+            if not results and resp:
+                print(f"[opt] first response keys: {list(resp.keys())}")
+                if resp.get("data"):
+                    first = resp["data"][0] if isinstance(resp["data"], list) else resp["data"]
+                    print(f"[opt] data sample: {str(first)[:300]}")
+            strikes = resp.get("data", [])
+            if not strikes:
+                print(f"[opt] {sym} empty data: {resp}")
+                continue
 
             total_ce_oi = total_pe_oi = total_ce_vol = total_pe_vol = 0
             atm_ce_oi = atm_pe_oi = atm_ce_vol = atm_pe_vol = 0
