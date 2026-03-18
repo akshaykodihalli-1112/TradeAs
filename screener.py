@@ -485,42 +485,82 @@ def run_screener(tok):
         quotes = get_all_quotes(tok)
         if not quotes:
             cache.update({"status": "error", "errors": ["0 quotes returned"]}); return
-        cache["progress"] = 60
+        cache["progress"] = 20
+
+        # Historical is the ONLY source for prev_close after market close
+        # Dhan quote API has no prev_close field — ohlc.close = today's close
+        print(f"[screener] fetching historical for prev_close...")
+        hist_data = {}
+        syms = [s for s in SYMBOLS if s["symbol"] in quotes]
+        for i, sym in enumerate(syms):
+            hist = get_historical(sym["security_id"], tok)
+            if hist:
+                hist_data[sym["symbol"]] = hist
+            cache["progress"] = 20 + round((i + 1) / len(syms) * 70)
+            time.sleep(0.4)
+            if (i + 1) % 30 == 0:
+                time.sleep(2)
+
+        print(f"[screener] historical done: {len(hist_data)} fetched")
+        cache["progress"] = 92
 
         results, skipped = [], []
         for sym in SYMBOLS:
             try:
-                q = quotes.get(sym["symbol"])
-                if not q: skipped.append(f"{sym['symbol']}:no_quote"); continue
+                q    = quotes.get(sym["symbol"])
+                hist = hist_data.get(sym["symbol"])
+                if not q:
+                    skipped.append(f"{sym['symbol']}:no_quote"); continue
 
-                ltp        = q["ltp"]          # today's final traded price = close
-                prev_close = q["prev_close"]   # ohlc.close = yesterday's settled close
-                if not prev_close:
-                    skipped.append(f"{sym['symbol']}:no_prev_close"); continue
+                ltp = q["ltp"]  # today's close from quote API
 
-                chg_pct = round((ltp - prev_close) / prev_close * 100, 2)
+                if hist:
+                    closes  = hist.get("close",  [])
+                    volumes = hist.get("volume", [])
+                    # closes[-1] may or may not include today depending on Dhan settlement timing
+                    # Check if closes[-1] matches today's ltp (within 0.5%)
+                    if closes and abs(closes[-1] - ltp) / ltp < 0.005:
+                        # closes[-1] = today's close, closes[-2] = yesterday's close
+                        prev_close = closes[-2] if len(closes) >= 2 else 0
+                    else:
+                        # closes[-1] = yesterday's close (today not settled yet in hist)
+                        prev_close = closes[-1] if closes else 0
 
-                # Reuse momentum/vol from previous run if available
-                prev = next((r for r in cache.get("data", []) if r["symbol"] == sym["symbol"]), {})
+                    chg_pct = round((ltp - prev_close) / prev_close * 100, 2) if prev_close else 0.0
+
+                    # Momentum 5D
+                    mom5d = 0.0
+                    if len(closes) >= 6:
+                        c5 = closes[-6] if abs(closes[-1] - ltp) / ltp < 0.005 else closes[-5] if len(closes) >= 5 else 0
+                        if c5: mom5d = round((ltp - c5) / c5 * 100, 2)
+
+                    # Volume ratio
+                    vol_ratio = 0.0; avg_vol7d = 0
+                    if len(volumes) >= 8:
+                        avg_vol7d = int(sum(volumes[-8:-1]) / 7)
+                        vol_ratio = round(q["volume"] / avg_vol7d, 2) if avg_vol7d else 0.0
+                else:
+                    prev_close = 0.0; chg_pct = 0.0; mom5d = 0.0
+                    vol_ratio = 0.0; avg_vol7d = 0
+
+                print(f"[close] {sym['symbol']} ltp={ltp} prev={prev_close} chg={chg_pct}%") if sym["symbol"] in ("ANGELONE","RELIANCE","SBIN") else None
+
                 results.append({
                     "symbol":      sym["symbol"], "exchange": "NSE",
-                    "ltp":         ltp,           "prev_close": prev_close,
-                    "change":      chg_pct,       "momentum5d": prev.get("momentum5d", 0.0),
-                    "volumeRatio": prev.get("volumeRatio", 0.0), "todayVol": q["volume"],
-                    "avgVol7d":    prev.get("avgVol7d", 0),
+                    "ltp":         ltp,           "prev_close": round(prev_close, 2),
+                    "change":      chg_pct,       "momentum5d": mom5d,
+                    "volumeRatio": vol_ratio,     "todayVol":   q["volume"],
+                    "avgVol7d":    avg_vol7d,
                 })
             except Exception as e:
                 skipped.append(f"{sym['symbol']}:{e}")
+                print(f"[screener] {sym['symbol']} error: {e}")
 
         results.sort(key=lambda x: x["volumeRatio"], reverse=True)
         cache.update({"data": results, "updated_at": ist_now().strftime("%H:%M:%S IST"),
             "status": "ok", "count": len(results), "errors": [], "skipped": skipped[:20],
             "progress": 100, "market_open": False})
         print(f"[screener] closed-market done — {len(results)} ok | {len(skipped)} skipped")
-
-        # Enrich momentum/vol in background using historical
-        threading.Thread(target=_enrich_historical,
-                         args=(tok, quotes, False, today_str), daemon=True).start()
         return
 
     # ── Market OPEN ────────────────────────────────────────────────────────────
