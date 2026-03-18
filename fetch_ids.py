@@ -42,6 +42,10 @@ FNO_NAMES = [
     "TATAMOTORS","TATAPOWER","TATASTEEL","TCS","TECHM","TIINDIA","TITAN",
     "TORNTPHARM","TORNTPOWER","TRENT","TVSMOTOR","UBL","ULTRACEMCO","UNIONBANK",
     "UPL","VEDL","VOLTAS","WIPRO","ZEEL","ZOMATO","ZYDUSLIFE",
+    # Newly added FNO stocks
+    "WAAREEENER","PREMIERENE","SWIGGY","HYUNDAI","NTPCGREEN","RVNL",
+    "IRFC","IREDA","HUDCO","SJVN","NHPC","COCHINSHIP","MAZAGON",
+    "POLICYBZR","NYKAA","PAYTM","DELHIVERY","CARTRADE",
 ]
 
 CSV_URLS = [
@@ -162,10 +166,18 @@ def fetch_ids():
     print(f"\nNSE_EQ symbols found : {len(eq_lookup)}")
     print(f"FNO symbols in CSV   : {len(fno_symbols)}")
 
-    # ── Match FNO names to NSE_EQ IDs ────────────────────────────────
-    all_names = (fno_symbols | set(FNO_NAMES)) if fno_symbols else set(FNO_NAMES)
-    matched   = {s: eq_lookup[s] for s in sorted(all_names) if s in eq_lookup}
-    missing   = [s for s in sorted(all_names) if s not in eq_lookup]
+    # ── Use CSV FNO list as source of truth ───────────────────────────
+    # CSV tells us exactly which stocks are currently in F&O
+    # Hardcoded FNO_NAMES only used as fallback if CSV has no FNO data
+    if len(fno_symbols) >= 50:
+        all_names = fno_symbols  # CSV is authoritative — includes new, excludes removed
+        print(f"Using CSV FNO list ({len(fno_symbols)} symbols) — ignoring hardcoded list")
+    else:
+        all_names = set(FNO_NAMES)
+        print(f"CSV FNO list too small ({len(fno_symbols)}) — using hardcoded fallback")
+
+    matched = {s: eq_lookup[s] for s in sorted(all_names) if s in eq_lookup}
+    missing = [s for s in sorted(all_names) if s not in eq_lookup]
 
     print(f"Matched              : {len(matched)}")
     if missing:
