@@ -2,10 +2,27 @@ from fastapi import FastAPI, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.background import BackgroundScheduler
 from contextlib import asynccontextmanager
-import requests, threading, time, os, json, csv
+import requests, threading, time, os, json, csv, traceback
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from io import StringIO
+import builtins
+
+# ── In-memory log buffer ───────────────────────────────────────────────────────
+_log_buffer = []
+_log_lock   = threading.Lock()
+_orig_print = builtins.print
+
+def _patched_print(*args, **kwargs):
+    msg = " ".join(str(a) for a in args)
+    ts  = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%H:%M:%S")
+    with _log_lock:
+        _log_buffer.append(f"[{ts}] {msg}")
+        if len(_log_buffer) > 500:  # keep last 500 lines
+            _log_buffer.pop(0)
+    _orig_print(*args, **kwargs)
+
+builtins.print = _patched_print
 
 DHAN_BASE = "https://api.dhan.co"
 IST       = ZoneInfo("Asia/Kolkata")
@@ -417,86 +434,125 @@ def run_screener(tok):
     if not SYMBOLS:
         cache.update({"status": "error", "errors": ["No symbols"]}); return
 
-    # Don't fetch when market is closed — keep last session's data intact
-    if not is_market_open():
-        if cache.get("data"):
-            print(f"[screener] market closed — keeping last data ({len(cache['data'])} results)")
-            cache.update({"status": "ok", "market_open": False,
-                          "progress": 100, "errors": []})
+    market_open = is_market_open()
+    today_str   = ist_now().strftime("%Y-%m-%d")
+
+    # ── Market CLOSED ──────────────────────────────────────────────────────────
+    # Use historical only: (closes[-1] - closes[-2]) / closes[-2] * 100
+    # Run only once per session — if we already have today's settled data, keep it
+    if not market_open:
+        if cache.get("data") and cache.get("updated_at"):
+            print(f"[screener] market closed — keeping settled data ({len(cache['data'])} results)")
+            cache.update({"status": "ok", "market_open": False, "progress": 100, "errors": []})
             return
-        # No data yet and market closed — still try once to get prev close prices
-        print(f"[screener] market closed, no cached data — fetching prev close prices once")
+        # First run after close — fetch historical to get correct settled change%
+        print(f"[screener] market closed — fetching historical for settled change%")
+        total = len(SYMBOLS)
+        cache.update({"status": "fetching", "progress": 5, "total": total, "market_open": False})
 
+        quotes = get_all_quotes(tok)  # still need volume data
+        cache["progress"] = 20
+
+        hist_data = {}
+        syms = [s for s in SYMBOLS if s["symbol"] in quotes] if quotes else SYMBOLS
+        for i, sym in enumerate(syms):
+            hist = get_historical(sym["security_id"], tok)
+            if hist: hist_data[sym["symbol"]] = hist
+            cache["progress"] = 20 + round((i + 1) / len(syms) * 75)
+            time.sleep(0.4)
+            if (i + 1) % 30 == 0: time.sleep(2)
+
+        results, skipped = [], []
+        for sym in SYMBOLS:
+            try:
+                q    = (quotes or {}).get(sym["symbol"])
+                hist = hist_data.get(sym["symbol"])
+                if not hist:
+                    skipped.append(f"{sym['symbol']}:no_hist"); continue
+                closes  = hist.get("close",  [])
+                volumes = hist.get("volume", [])
+                if len(closes) < 2:
+                    skipped.append(f"{sym['symbol']}:no_hist"); continue
+
+                # CORRECT formula for market close
+                today_close = closes[-1]
+                prev_close  = closes[-2]
+                chg_pct     = round((today_close - prev_close) / prev_close * 100, 2) if prev_close else 0.0
+
+                # Momentum 5D
+                mom5d = 0.0
+                if len(closes) >= 7:
+                    c5 = closes[-7]
+                    if c5: mom5d = round((today_close - c5) / c5 * 100, 2)
+
+                # Volume ratio
+                vol_ratio = 0.0; avg_vol7d = 0
+                today_vol = q["volume"] if q else (volumes[-1] if volumes else 0)
+                if len(volumes) >= 8:
+                    avg_vol7d = int(sum(volumes[-8:-1]) / 7)
+                    vol_ratio = round(volumes[-1] / avg_vol7d, 2) if avg_vol7d else 0.0
+
+                results.append({
+                    "symbol":      sym["symbol"], "exchange": "NSE",
+                    "ltp":         today_close,   "prev_close": prev_close,
+                    "change":      chg_pct,        "momentum5d": mom5d,
+                    "volumeRatio": vol_ratio,      "todayVol":   today_vol,
+                    "avgVol7d":    avg_vol7d,
+                })
+            except Exception as e:
+                skipped.append(f"{sym['symbol']}:{e}")
+
+        results.sort(key=lambda x: x["volumeRatio"], reverse=True)
+        cache.update({"data": results, "updated_at": ist_now().strftime("%H:%M:%S IST"),
+            "status": "ok", "count": len(results), "errors": [], "skipped": skipped[:20],
+            "progress": 100, "market_open": False})
+        print(f"[screener] closed-market done — {len(results)} ok | {len(skipped)} skipped")
+        return
+
+    # ── Market OPEN ────────────────────────────────────────────────────────────
+    # Fast: quotes for live ltp + change%, historical in background for momentum/vol
     total = len(SYMBOLS)
-    cache.update({"status": "fetching", "progress": 5, "total": total,
-                  "market_open": is_market_open()})
-    print(f"[screener] {total} symbols ({cache['symbol_source']}) | {ist_now().strftime('%H:%M:%S IST')}")
+    cache.update({"status": "fetching", "progress": 5, "total": total, "market_open": True})
+    print(f"[screener] market open — {total} symbols | {ist_now().strftime('%H:%M:%S IST')}")
 
-    # Step 1: Get all quotes — fast, ~5-10 seconds
     quotes = get_all_quotes(tok)
     if not quotes:
         cache.update({"status": "error", "errors": ["0 quotes returned"]}); return
     cache["progress"] = 60
 
-    # Step 2: Build results immediately using quote's prev_close (no historical needed)
-    # This gets data on screen fast. Historical fetched in background to enrich later.
-    market_open = is_market_open()
-    today_str   = ist_now().strftime("%Y-%m-%d")
     results, skipped = [], []
-
     for sym in SYMBOLS:
         try:
             q = quotes.get(sym["symbol"])
-            if not q:
-                skipped.append(f"{sym['symbol']}:no_quote")
-                continue
-            # Reuse previous run's hist metrics if available — background will refresh
-            for r in cache.get("data", []):
-                if r["symbol"] == sym["symbol"] and r.get("avgVol7d", 0) > 0:
-                    pc = r["prev_close"]
-                    if market_open:
-                        # Live: use fresh ltp vs stored prev_close
-                        chg = round(((q["ltp"] - pc) / pc * 100), 2) if pc else 0
-                        ltp = q["ltp"]
-                    else:
-                        # Closed: keep the settled change from last enriched run
-                        chg = r["change"]
-                        ltp = r["ltp"]  # use settled close, not stale quote
-                    results.append({
-                        "symbol": sym["symbol"], "exchange": "NSE",
-                        "ltp": ltp, "prev_close": pc, "change": chg,
-                        "momentum5d": r["momentum5d"],
-                        "volumeRatio": r["volumeRatio"], "todayVol": q["volume"],
-                        "avgVol7d": r["avgVol7d"],
-                    })
-                    break
-            else:
-                # No prior data — use quote's prev_close as best available estimate
-                pc  = q.get("prev_close", 0)
-                ltp = q["ltp"]
-                chg = round(((ltp - pc) / pc * 100), 2) if pc else 0.0
-                results.append({
-                    "symbol": sym["symbol"], "exchange": "NSE",
-                    "ltp": ltp, "prev_close": pc, "change": chg,
-                    "momentum5d": 0.0, "volumeRatio": 0.0,
-                    "todayVol": q["volume"], "avgVol7d": 0,
-                })
+            if not q: skipped.append(f"{sym['symbol']}:no_quote"); continue
+            pc  = q.get("prev_close", 0)
+            ltp = q["ltp"]
+            chg = round((ltp - pc) / pc * 100, 2) if pc else 0.0
+            # Reuse momentum/vol from previous run if available
+            prev = next((r for r in cache.get("data", []) if r["symbol"] == sym["symbol"]), {})
+            results.append({
+                "symbol":      sym["symbol"], "exchange": "NSE",
+                "ltp":         ltp,           "prev_close": pc,
+                "change":      chg,           "momentum5d": prev.get("momentum5d", 0.0),
+                "volumeRatio": prev.get("volumeRatio", 0.0), "todayVol": q["volume"],
+                "avgVol7d":    prev.get("avgVol7d", 0),
+            })
         except Exception as e:
             skipped.append(f"{sym['symbol']}:{e}")
 
     results.sort(key=lambda x: x["volumeRatio"], reverse=True)
     cache.update({"data": results, "updated_at": ist_now().strftime("%H:%M:%S IST"),
         "status": "ok", "count": len(results), "errors": [], "skipped": skipped[:20],
-        "progress": 100, "market_open": is_market_open()})
-    print(f"[screener] fast pass done — {len(results)} ok | {len(skipped)} skipped")
+        "progress": 100, "market_open": True})
+    print(f"[screener] open-market done — {len(results)} ok | {len(skipped)} skipped")
 
-    # Step 3: Fetch historical in background to enrich momentum + volume ratio
-    threading.Thread(target=_enrich_historical, args=(tok, quotes, market_open, today_str), daemon=True).start()
+    # Enrich momentum + vol ratio in background
+    threading.Thread(target=_enrich_historical,
+                     args=(tok, quotes, True, today_str), daemon=True).start()
 
-    # Trigger ID fix if too many missing
+    # Fix missing IDs if needed
     missing_count = cache.get("debug", {}).get("missing_count", 0)
     if missing_count > 10 and cache["symbol_source"] in ("verified", "disk", "correct_ids_json"):
-        print(f"[screener] {missing_count} missing — scheduling ID fix...")
         threading.Thread(target=fix_missing_ids, args=(tok,), daemon=True).start()
 
 
@@ -626,7 +682,12 @@ def debug(x_client_id:str=Header(None),x_access_token:str=Header(None)):
             "env_client_id":bool(os.getenv("DHAN_CLIENT_ID")),"env_token":bool(os.getenv("DHAN_ACCESS_TOKEN")),
             "lock_held":_lock.locked(),"sample_symbols":SYMBOLS[:3],"last_debug":cache.get("debug",{})}
 
-@app.post("/api/symbols/refresh")
+@app.get("/api/logs")
+def get_logs(n:int=100):
+    """Returns last N log lines — useful for debugging without opening Render dashboard."""
+    with _log_lock:
+        lines = _log_buffer[-n:]
+    return {"count":len(lines),"logs":lines}
 def refresh_symbols(x_access_token:str=Header(None)):
     tok=x_access_token or CREDS.get("access_token","")
     ok=load_symbols_csv(tok)
