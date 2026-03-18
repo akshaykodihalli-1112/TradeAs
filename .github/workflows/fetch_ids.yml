@@ -1,0 +1,35 @@
+name: Fetch Dhan Security IDs
+
+on:
+  # Run automatically every Sunday at 6 AM IST (12:30 AM UTC)
+  schedule:
+    - cron: '30 0 * * 0'
+  # Also run manually from GitHub Actions tab anytime
+  workflow_dispatch:
+
+jobs:
+  fetch-ids:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Fetch correct IDs from Dhan CSV
+        run: python fetch_ids.py
+
+      - name: Commit and push correct_ids.json
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add correct_ids.json
+          git diff --staged --quiet || git commit -m "chore: update Dhan NSE_EQ security IDs [skip ci]"
+          git push
