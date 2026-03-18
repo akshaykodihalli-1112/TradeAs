@@ -407,52 +407,52 @@ def run_screener(tok):
     total = len(SYMBOLS)
     cache.update({"status": "fetching", "progress": 5, "total": total,
                   "market_open": is_market_open()})
-    # NOTE: intentionally do NOT clear cache["data"] here — keep stale data
-    # visible in the dashboard until fresh results are ready
     print(f"[screener] {total} symbols ({cache['symbol_source']}) | {ist_now().strftime('%H:%M:%S IST')}")
 
-    # Step 1: Get all quotes (fast — 4 batches)
+    # Step 1: Get all quotes — fast, ~5-10 seconds
     quotes = get_all_quotes(tok)
     if not quotes:
         cache.update({"status": "error", "errors": ["0 quotes returned"]}); return
-    cache["progress"] = 20
+    cache["progress"] = 60
 
-    # Step 2: Fetch historical for symbols that have quotes
-    # Only fetch for symbols we actually got quotes for — skip the missing ones
-    syms_with_quotes = [s for s in SYMBOLS if s["symbol"] in quotes]
-    print(f"[screener] fetching historical for {len(syms_with_quotes)} symbols...")
-
-    hist_data = {}  # symbol → hist dict
+    # Step 2: Build results immediately using quote's prev_close (no historical needed)
+    # This gets data on screen fast. Historical fetched in background to enrich later.
     market_open = is_market_open()
     today_str   = ist_now().strftime("%Y-%m-%d")
-
-    for i, sym in enumerate(syms_with_quotes):
-        hist = get_historical(sym["security_id"], tok)
-        if hist:
-            hist_data[sym["symbol"]] = hist
-        cache["progress"] = 20 + round((i + 1) / len(syms_with_quotes) * 70)
-        # Rate limit: 0.4s between historical calls
-        time.sleep(0.4)
-        if (i + 1) % 30 == 0:
-            print(f"  hist {i+1}/{len(syms_with_quotes)}")
-            time.sleep(2)  # extra pause every 30 calls
-
-    # Step 3: Build results
     results, skipped = [], []
+
     for sym in SYMBOLS:
         try:
             q = quotes.get(sym["symbol"])
             if not q:
                 skipped.append(f"{sym['symbol']}:no_quote")
                 continue
-            hist = hist_data.get(sym["symbol"])
-            chg_pct, prev_close, momentum5d, vol_ratio, avg_vol7d =                 compute_metrics(q, hist, market_open, today_str)
+            # Use existing historical if available from previous run
+            hist = None
+            for r in cache.get("data", []):
+                if r["symbol"] == sym["symbol"] and r.get("avgVol7d", 0) > 0:
+                    # Reuse previous hist metrics — will be refreshed by background fetch
+                    results.append({
+                        "symbol":      sym["symbol"], "exchange": "NSE",
+                        "ltp":         q["ltp"],      "prev_close": r["prev_close"],
+                        "change":      round(((q["ltp"]-r["prev_close"])/r["prev_close"]*100),2) if r["prev_close"] else 0,
+                        "momentum5d":  r["momentum5d"],
+                        "volumeRatio": r["volumeRatio"], "todayVol": q["volume"],
+                        "avgVol7d":    r["avgVol7d"],
+                    })
+                    hist = True
+                    break
+            if hist:
+                continue
+            # No prior data — use quote's prev_close, no volume ratio yet
+            pc = q.get("prev_close", 0)
+            chg = round(((q["ltp"]-pc)/pc*100),2) if pc else 0.0
             results.append({
                 "symbol":      sym["symbol"], "exchange": "NSE",
-                "ltp":         q["ltp"],      "prev_close": prev_close,
-                "change":      chg_pct,       "momentum5d": momentum5d,
-                "volumeRatio": vol_ratio,     "todayVol":   q["volume"],
-                "avgVol7d":    avg_vol7d,
+                "ltp":         q["ltp"],      "prev_close": pc,
+                "change":      chg,           "momentum5d": 0.0,
+                "volumeRatio": 0.0,           "todayVol":   q["volume"],
+                "avgVol7d":    0,
             })
         except Exception as e:
             skipped.append(f"{sym['symbol']}:{e}")
@@ -461,13 +461,55 @@ def run_screener(tok):
     cache.update({"data": results, "updated_at": ist_now().strftime("%H:%M:%S IST"),
         "status": "ok", "count": len(results), "errors": [], "skipped": skipped[:20],
         "progress": 100, "market_open": is_market_open()})
-    print(f"[screener] done — {len(results)} ok | {len(skipped)} skipped")
+    print(f"[screener] fast pass done — {len(results)} ok | {len(skipped)} skipped")
 
-    # Trigger ID fix in background if too many missing
+    # Step 3: Fetch historical in background to enrich momentum + volume ratio
+    threading.Thread(target=_enrich_historical, args=(tok, quotes, market_open, today_str), daemon=True).start()
+
+    # Trigger ID fix if too many missing
     missing_count = cache.get("debug", {}).get("missing_count", 0)
     if missing_count > 10 and cache["symbol_source"] in ("verified", "disk", "correct_ids_json"):
         print(f"[screener] {missing_count} missing — scheduling ID fix...")
         threading.Thread(target=fix_missing_ids, args=(tok,), daemon=True).start()
+
+
+def _enrich_historical(tok, quotes, market_open, today_str):
+    """Background: fetch historical data and update cache with momentum + vol ratio."""
+    global cache
+    print(f"[hist] starting background historical fetch for {len(quotes)} symbols...")
+    syms = [s for s in SYMBOLS if s["symbol"] in quotes]
+    hist_data = {}
+
+    for i, sym in enumerate(syms):
+        hist = get_historical(sym["security_id"], tok)
+        if hist:
+            hist_data[sym["symbol"]] = hist
+        time.sleep(0.4)
+        if (i + 1) % 30 == 0:
+            time.sleep(2)
+
+    print(f"[hist] got {len(hist_data)} historical records — updating cache...")
+
+    # Build result map from current cache
+    result_map = {r["symbol"]: dict(r) for r in cache.get("data", [])}
+
+    for sym_name, hist in hist_data.items():
+        if sym_name not in result_map: continue
+        q = quotes.get(sym_name)
+        if not q: continue
+        chg, pc, mom5d, vol_ratio, avg_vol7d = compute_metrics(q, hist, market_open, today_str)
+        result_map[sym_name].update({
+            "prev_close":  pc,
+            "change":      chg,
+            "momentum5d":  mom5d,
+            "volumeRatio": vol_ratio,
+            "avgVol7d":    avg_vol7d,
+        })
+
+    enriched = sorted(result_map.values(), key=lambda x: x["volumeRatio"], reverse=True)
+    cache.update({"data": enriched, "count": len(enriched),
+                  "updated_at": ist_now().strftime("%H:%M:%S IST")})
+    print(f"[hist] cache enriched with historical data ✓")
 
 def trigger_screener(cid="",tok=""):
     cid=cid or CREDS["client_id"]; tok=tok or CREDS["access_token"]
