@@ -495,20 +495,14 @@ def run_screener(tok):
                 if hist:
                     closes  = hist.get("close",  [])
                     volumes = hist.get("volume", [])
-                    # Determine if today's bar is included in historical
-                    # Use 5% tolerance — if closes[-1] is within 5% of ltp, it's today's bar
-                    if closes and abs(closes[-1] - ltp) / ltp < 0.05:
-                        # closes[-1] = today's close, closes[-2] = yesterday
-                        prev_close = closes[-2] if len(closes) >= 2 else 0
-                        ref_closes = closes  # use all closes including today
-                    else:
-                        # closes[-1] = yesterday's close (today not in hist yet)
-                        prev_close = closes[-1] if closes else 0
-                        ref_closes = closes + [ltp]  # append today's ltp
+                    # Dhan historical never includes today's bar after close
+                    # closes[-1] = yesterday's close, ltp = today's close
+                    prev_close = closes[-1] if closes else 0
+                    ref_closes = closes + [ltp]  # append today for momentum calc
 
                     chg_pct = round((ltp - prev_close) / prev_close * 100, 2) if prev_close else 0.0
 
-                    # Momentum 5D — use 6th bar back from today
+                    # Momentum 5D
                     mom5d = 0.0
                     if len(ref_closes) >= 6:
                         c5 = ref_closes[-6]
@@ -523,7 +517,7 @@ def run_screener(tok):
                     prev_close = 0.0; chg_pct = 0.0; mom5d = 0.0
                     vol_ratio = 0.0; avg_vol7d = 0
 
-                print(f"[close] {sym['symbol']} ltp={ltp} hist_last3={closes[-3:] if len(closes)>=3 else closes} prev={prev_close} chg={chg_pct}%") if sym["symbol"] in ("ANGELONE","RELIANCE","SBIN") else None
+                print(f"[close] {sym['symbol']} ltp={ltp} last3={closes[-3:]} prev={prev_close} chg={chg_pct}%") if sym["symbol"] in ("ANGELONE","SAIL","MANAPPURAM","RELIANCE") else None
 
                 results.append({
                     "symbol":      sym["symbol"], "exchange": "NSE",
