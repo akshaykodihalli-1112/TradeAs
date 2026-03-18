@@ -74,42 +74,45 @@ def parse_csv(text):
         if header is None:
             header = [h.strip().upper() for h in row]
             print(f"  All columns: {header}")
-            exch_i   = find_col(header, "SEM_EXM_EXCH_ID", "EXCH_ID", "EXCHANGE")
-            seg_i    = find_col(header, "SEM_SEGMENT", "EXCH_SEG", "SEGMENT")
-            sym_i    = find_col(header, "SEM_TRADING_SYMBOL", "TRADING_SYMBOL", "SYMBOL_NAME", "SM_SYMBOL_NAME")
-            id_i     = find_col(header, "SEM_SMST_SECURITY_ID", "SECURITY_ID", "SCRIP_ID", "SM_SYMBOL_ID")
-            inst_i   = find_col(header, "SEM_INSTRUMENT_NAME", "INSTRUMENT", "SEM_INSTRUMENT")
-            series_i = find_col(header, "SEM_SERIES", "SERIES")
-            print(f"  Col indices -> exch={exch_i} seg={seg_i} sym={sym_i} id={id_i} inst={inst_i} series={series_i}")
+            exch_i    = find_col(header, "SEM_EXM_EXCH_ID", "EXCH_ID", "EXCHANGE")
+            seg_i     = find_col(header, "SEM_SEGMENT", "EXCH_SEG", "SEGMENT")
+            sym_i     = find_col(header, "SEM_TRADING_SYMBOL", "TRADING_SYMBOL")
+            id_i      = find_col(header, "SEM_SMST_SECURITY_ID", "SECURITY_ID", "SCRIP_ID", "SM_SYMBOL_ID")
+            inst_i    = find_col(header, "SEM_INSTRUMENT_NAME", "INSTRUMENT", "SEM_INSTRUMENT")
+            series_i  = find_col(header, "SEM_SERIES", "SERIES")
+            # SM_SYMBOL_NAME = underlying stock name for FNO contracts (e.g. "ANGELONE")
+            # SEM_TRADING_SYMBOL = contract name (e.g. "ANGELONE-Mar2026-FUT")
+            undl_i    = find_col(header, "SM_SYMBOL_NAME", "SYMBOL_NAME")
+            print(f"  Col indices -> exch={exch_i} seg={seg_i} sym={sym_i} id={id_i} inst={inst_i} series={series_i} undl={undl_i}")
             if None in (sym_i, id_i):
                 print("ERROR: could not find symbol/id columns.")
                 return {}, set()
             continue
 
-        max_i = max(c for c in (exch_i, seg_i, sym_i, id_i, inst_i, series_i) if c is not None)
+        max_i = max(c for c in (exch_i, seg_i, sym_i, id_i, inst_i, series_i, undl_i) if c is not None)
         if len(row) <= max_i:
             continue
 
-        sym    = row[sym_i].strip()
+        sym    = row[sym_i].strip()  if sym_i   is not None else ""
         seg    = row[seg_i].strip().upper()    if seg_i    is not None else ""
         exch   = row[exch_i].strip().upper()   if exch_i   is not None else ""
         inst   = row[inst_i].strip().upper()   if inst_i   is not None else ""
         series = row[series_i].strip().upper() if series_i is not None else ""
+        # Underlying stock name for FNO rows (e.g. "ANGELONE", "RELIANCE")
+        undl   = row[undl_i].strip()           if undl_i   is not None and len(row) > undl_i else ""
         row_count += 1
 
-        if not sym:
+        if not sym and not undl:
             continue
 
-        # ── NSE Equity: new format uses seg="E", series="EQ"
-        #               old format used seg="NSE_EQ"
+        # ── NSE Equity: seg="E", series="EQ"
         is_nse_eq = (
             (exch == "NSE" and seg == "E" and series == "EQ") or
             (seg in ("NSE_EQ", "NSE EQ", "NSEEQ")) or
             (seg.startswith("NSE") and "EQ" in seg)
         )
 
-        # ── NSE FNO: new format uses seg="D", inst="FUTSTK"/"OPTSTK"
-        #             old format used seg="NSE_FNO"
+        # ── NSE FNO: inst="FUTSTK"/"OPTSTK" — use SM_SYMBOL_NAME as the underlying
         is_nse_fno = (
             (exch == "NSE" and inst in ("FUTSTK", "OPTSTK")) or
             "FNO" in seg or "NSE_FO" in seg
@@ -121,8 +124,8 @@ def parse_csv(text):
             except (ValueError, IndexError):
                 pass
 
-        elif is_nse_fno:
-            fno_symbols.add(sym)
+        elif is_nse_fno and undl:
+            fno_symbols.add(undl)  # add underlying name, not contract name
 
     print(f"  Total rows parsed : {row_count}")
     print(f"  NSE_EQ matched    : {len(eq_lookup)}")
