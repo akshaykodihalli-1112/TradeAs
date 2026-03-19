@@ -951,3 +951,161 @@ def opt_bearish(x_client_id:str=Header(None),x_access_token:str=Header(None)):
 @app.get("/api/options/volspike")
 def opt_volspike(x_client_id:str=Header(None),x_access_token:str=Header(None)):
     return {"data":[x for x in _opt_cache["data"] if x["vol_spike"]]}
+
+# ── Breakout Scanner ────────────────────────────────────────────────────────────
+_bk_cache = {"data": [], "updated_at": None, "status": "idle", "market_open": False}
+_bk_lock  = threading.Lock()
+
+RANGE_START = "09:15"  # Opening range start
+RANGE_END   = "10:00"  # Opening range end (45 min)
+
+def _compute_breakout(tok):
+    global _bk_cache
+    if not SYMBOLS or not tok: return
+    _bk_cache["status"] = "fetching"
+    headers = {"access-token": tok, "Content-Type": "application/json"}
+
+    now        = ist_now()
+    today      = now.strftime("%Y-%m-%d")
+    spot_map   = {x["symbol"]: x["ltp"] for x in cache.get("data", [])}
+    vol_map    = {x["symbol"]: (x.get("todayVol",0), x.get("avgVol7d",0))
+                  for x in cache.get("data", [])}
+
+    print(f"[bk] starting breakout scan for {len(SYMBOLS)} symbols...")
+    results = []
+
+    for sym_info in SYMBOLS:
+        sym = sym_info["symbol"]
+        ltp = spot_map.get(sym, 0)
+        if not ltp: continue
+
+        try:
+            # Fetch intraday 1-min data for today
+            payload = {
+                "securityId":      sym_info["security_id"],
+                "exchangeSegment": "NSE_EQ",
+                "instrument":      "EQUITY",
+                "expiryCode":      0,
+                "fromDate":        today,
+                "toDate":          today,
+            }
+            r = requests.post(f"{DHAN_BASE}/v2/charts/intraday",
+                              json=payload, headers=headers, timeout=10)
+            if r.status_code == 429: time.sleep(3); continue
+            if r.status_code != 200: continue
+
+            d = r.json()
+            timestamps = d.get("timestamp", [])
+            opens      = d.get("open",  [])
+            highs      = d.get("high",  [])
+            lows       = d.get("low",   [])
+            volumes    = d.get("volume",[])
+
+            if not timestamps: continue
+
+            # Extract opening range bars (9:15 to 10:00)
+            or_highs = []; or_lows = []; or_vols = []
+            for i, ts in enumerate(timestamps):
+                try:
+                    t = datetime.fromtimestamp(ts, IST).strftime("%H:%M")
+                    if RANGE_START <= t < RANGE_END:
+                        or_highs.append(highs[i])
+                        or_lows.append(lows[i])
+                        or_vols.append(volumes[i])
+                except: continue
+
+            if len(or_highs) < 3: continue  # not enough bars yet
+
+            range_high = max(or_highs)
+            range_low  = min(or_lows)
+            range_vol  = sum(or_vols)
+            range_width = round((range_high - range_low) / range_low * 100, 2) if range_low else 0
+
+            # Skip stocks with very wide range (false signals)
+            if range_width > 5: continue
+
+            # Detect breakout
+            direction = None
+            breakout_pct = 0.0
+            if ltp > range_high:
+                direction    = "bull"
+                breakout_pct = round((ltp - range_high) / range_high * 100, 2)
+            elif ltp < range_low:
+                direction    = "bear"
+                breakout_pct = round((ltp - range_low) / range_low * 100, 2)
+
+            if not direction: continue
+
+            # Volume confirmation
+            today_vol, avg_vol = vol_map.get(sym, (0, 0))
+            vol_ratio    = round(today_vol / avg_vol, 2) if avg_vol else 0
+            vol_confirmed = vol_ratio >= 1.5
+
+            # Momentum confirmation: breakout > 0.3%
+            momentum_ok = abs(breakout_pct) >= 0.3
+
+            results.append({
+                "symbol":       sym,
+                "ltp":          ltp,
+                "rangeHigh":    round(range_high, 2),
+                "rangeLow":     round(range_low,  2),
+                "rangeWidth":   range_width,
+                "direction":    direction,
+                "breakoutPct":  breakout_pct,
+                "volRatio":     vol_ratio,
+                "vol_confirmed": vol_confirmed,
+                "momentum_ok":  momentum_ok,
+                "todayVol":     today_vol,
+            })
+            time.sleep(0.3)
+
+        except Exception as e:
+            print(f"[bk] {sym}: {e}"); continue
+
+    results.sort(key=lambda x: abs(x["breakoutPct"]), reverse=True)
+    _bk_cache.update({
+        "data":        results,
+        "updated_at":  ist_now().strftime("%H:%M:%S IST"),
+        "status":      "ok",
+        "count":       len(results),
+        "market_open": is_market_open(),
+        "range_end":   RANGE_END,
+    })
+    print(f"[bk] done — {len(results)} breakouts found")
+
+def _run_bk_locked(tok):
+    with _bk_lock: _compute_breakout(tok)
+
+def _bk_stale():
+    last = _bk_cache.get("updated_at")
+    if not last: return True
+    try:
+        t = datetime.strptime(last, "%H:%M:%S IST").replace(
+            year=ist_now().year, month=ist_now().month, day=ist_now().day, tzinfo=IST)
+        return (ist_now() - t).seconds > 60
+    except: return True
+
+@app.get("/api/breakout")
+def get_breakout(x_client_id:str=Header(None), x_access_token:str=Header(None),
+                 refresh:bool=Query(False)):
+    cid = x_client_id or CREDS.get("client_id","")
+    tok = x_access_token or CREDS.get("access_token","")
+    if not cid or not tok: return {"status":"no_credentials","data":[]}
+    CREDS["client_id"]=cid; CREDS["access_token"]=tok
+
+    now = ist_now()
+    # Only scan after opening range is complete (after 10:00 IST)
+    range_complete = now.replace(hour=10, minute=0, second=0, microsecond=0)
+    market_open = is_market_open()
+
+    if market_open and now < range_complete:
+        mins_left = int((range_complete - now).seconds / 60)
+        return {"status":"waiting", "data":[], "market_open":True,
+                "message":f"Opening range not complete yet — {mins_left} min remaining",
+                "range_end": RANGE_END}
+
+    should_run = (refresh or _bk_stale()) and not _bk_lock.locked()
+    if should_run and (market_open or refresh):
+        threading.Thread(target=_run_bk_locked, args=(tok,), daemon=True).start()
+
+    return _bk_cache
