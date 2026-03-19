@@ -1,201 +1,156 @@
 """
 GitHub Actions script — runs automatically every Sunday at 6 AM IST.
-Downloads Dhan scrip master CSV, extracts NSE_EQ security IDs for all
-FNO stocks, and saves correct_ids.json to the repo.
+
+Strategy:
+  1. Fetch active NSE_FNO instruments from Dhan API → get underlying symbols
+  2. Fetch NSE_EQ instruments from Dhan API → get security IDs
+  3. Match underlying symbols to NSE_EQ security IDs
+  4. Save correct_ids.json
+
+Requires env vars: DHAN_ACCESS_TOKEN, DHAN_CLIENT_ID
 
 Can also be run locally:
     pip install requests
-    python fetch_ids.py
+    DHAN_ACCESS_TOKEN=xxx DHAN_CLIENT_ID=xxx python fetch_ids.py
 """
 import requests
-import csv
 import json
 import sys
-from io import StringIO
+import os
 
-FNO_NAMES = [
-    "ABBOTINDIA","ABCAPITAL","ABFRL","ACC","ADANIENT","ADANIPORTS","ALKEM",
-    "AMBUJACEM","ANGELONE","APLAPOLLO","APOLLOHOSP","APOLLOTYRE","ASHOKLEY",
-    "ASIANPAINT","ASTRAL","ATGL","ATUL","AUBANK","AUROPHARMA","AXISBANK",
-    "BAJAJ-AUTO","BAJAJFINSV","BAJFINANCE","BALKRISIND","BANDHANBNK","BANKBARODA",
-    "BATAINDIA","BEL","BERGEPAINT","BHARATFORG","BHARTIARTL","BHEL","BIOCON",
-    "BOSCHLTD","BPCL","BRITANNIA","BSOFT","CANBK","CANFINHOME","CDSL","CGPOWER",
-    "CHAMBLFERT","CHOLAFIN","CIPLA","COALINDIA","COFORGE","COLPAL","CONCOR",
-    "COROMANDEL","CROMPTON","CUB","CUMMINSIND","DABUR","DALBHARAT","DEEPAKNTR",
-    "DELTACORP","DIVISLAB","DIXON","DLF","DMART","DRREDDY","EICHERMOT","ESCORTS",
-    "EXIDEIND","FEDERALBNK","FORCEMOT","FORTIS","GAIL","GLENMARK","GMRINFRA",
-    "GNFC","GODREJCP","GODREJPROP","GRANULES","GRASIM","GUJGASLTD","HAL",
-    "HAVELLS","HCLTECH","HDFCAMC","HDFCBANK","HDFCLIFE","HEROMOTOCO","HFCL",
-    "HINDALCO","HINDCOPPER","HINDPETRO","HINDUNILVR","ICICIBANK","ICICIGI",
-    "ICICIPRULI","IDEA","IDFCFIRSTB","IEX","IGL","INDHOTEL","INDIACEM",
-    "INDIAMART","INDIGO","INDUSINDBK","INDUSTOWER","INFY","IOC","IPCALAB",
-    "IRCTC","ITC","JINDALSTEL","JKCEMENT","JSWENERGY","JSWSTEEL","JUBLFOOD",
-    "KALYANKJIL","KEI","KOTAKBANK","KPITTECH","LALPATHLAB","LAURUSLABS",
-    "LICHSGFIN","LICI","LT","LTIM","LTTS","LUPIN","M&M","M&MFIN","MANAPPURAM",
-    "MARICO","MARUTI","MAXHEALTH","MCX","METROPOLIS","MFSL","MOTHERSON",
-    "MPHASIS","MRF","MUTHOOTFIN","NATIONALUM","NAUKRI","NAVINFLUOR","NESTLEIND",
-    "NMDC","NTPC","OBEROIRLTY","OFSS","ONGC","PAGEIND","PEL","PERSISTENT",
-    "PETRONET","PFC","PIDILITIND","PIIND","PNB","POLYCAB","POWERGRID","PVRINOX",
-    "RAMCOCEM","RBLBANK","RECLTD","RELIANCE","SAIL","SBICARD","SBILIFE","SBIN",
-    "SHREECEM","SHRIRAMFIN","SIEMENS","SRF","SUNPHARMA","SUNTV","SUPREMEIND",
-    "SUZLON","SYNGENE","TATACHEM","TATACOMM","TATACONSUM","TATAELXSI",
-    "TATAMOTORS","TATAPOWER","TATASTEEL","TCS","TECHM","TIINDIA","TITAN",
-    "TORNTPHARM","TORNTPOWER","TRENT","TVSMOTOR","UBL","ULTRACEMCO","UNIONBANK",
-    "UPL","VEDL","VOLTAS","WIPRO","ZEEL","ZOMATO","ZYDUSLIFE",
-    # Newly added FNO stocks
-    "WAAREEENER","PREMIERENE","SWIGGY","HYUNDAI","NTPCGREEN","RVNL",
-    "IRFC","IREDA","HUDCO","SJVN","NHPC","COCHINSHIP","MAZAGON",
-    "POLICYBZR","NYKAA","PAYTM","DELHIVERY","CARTRADE",
-]
+DHAN_BASE    = "https://api.dhan.co"
+ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN", "")
+CLIENT_ID    = os.getenv("DHAN_CLIENT_ID", "")
 
-CSV_URLS = [
-    "https://images.dhan.co/api-data/api-scrip-master.csv",
-    "https://images.dhan.co/api-data/api-scrip-master-detailed.csv",
-]
+def get_headers():
+    return {
+        "access-token": ACCESS_TOKEN,
+        "client-id":    CLIENT_ID,
+        "Content-Type": "application/json",
+    }
 
-def find_col(header, *keywords):
-    """Return the first column index whose header contains any of the keywords."""
-    for i, h in enumerate(header):
-        for kw in keywords:
-            if kw in h:
-                return i
-    return None
-
-def parse_csv(text):
-    """Parse Dhan scrip master CSV. Returns (eq_lookup, fno_symbols)."""
-    eq_lookup   = {}
-    fno_symbols = set()
-    reader      = csv.reader(StringIO(text))
-    header      = None
-    exch_i = seg_i = sym_i = id_i = inst_i = series_i = None
-    row_count = 0
-
-    for row in reader:
-        if header is None:
-            header = [h.strip().upper() for h in row]
-            print(f"  All columns: {header}")
-            exch_i    = find_col(header, "SEM_EXM_EXCH_ID", "EXCH_ID", "EXCHANGE")
-            seg_i     = find_col(header, "SEM_SEGMENT", "EXCH_SEG", "SEGMENT")
-            sym_i     = find_col(header, "SEM_TRADING_SYMBOL", "TRADING_SYMBOL")
-            id_i      = find_col(header, "SEM_SMST_SECURITY_ID", "SECURITY_ID", "SCRIP_ID", "SM_SYMBOL_ID")
-            inst_i    = find_col(header, "SEM_INSTRUMENT_NAME", "INSTRUMENT", "SEM_INSTRUMENT")
-            series_i  = find_col(header, "SEM_SERIES", "SERIES")
-            # SM_SYMBOL_NAME = underlying stock name for FNO contracts (e.g. "ANGELONE")
-            # SEM_TRADING_SYMBOL = contract name (e.g. "ANGELONE-Mar2026-FUT")
-            undl_i    = find_col(header, "SM_SYMBOL_NAME", "SYMBOL_NAME")
-            print(f"  Col indices -> exch={exch_i} seg={seg_i} sym={sym_i} id={id_i} inst={inst_i} series={series_i} undl={undl_i}")
-            if None in (sym_i, id_i):
-                print("ERROR: could not find symbol/id columns.")
-                return {}, set()
-            continue
-
-        max_i = max(c for c in (exch_i, seg_i, sym_i, id_i, inst_i, series_i, undl_i) if c is not None)
-        if len(row) <= max_i:
-            continue
-
-        sym    = row[sym_i].strip()  if sym_i   is not None else ""
-        seg    = row[seg_i].strip().upper()    if seg_i    is not None else ""
-        exch   = row[exch_i].strip().upper()   if exch_i   is not None else ""
-        inst   = row[inst_i].strip().upper()   if inst_i   is not None else ""
-        series = row[series_i].strip().upper() if series_i is not None else ""
-        # Underlying stock name for FNO rows (e.g. "ANGELONE", "RELIANCE")
-        undl   = row[undl_i].strip()           if undl_i   is not None and len(row) > undl_i else ""
-        row_count += 1
-
-        if not sym and not undl:
-            continue
-
-        # ── NSE Equity: seg="E", series="EQ"
-        is_nse_eq = (
-            (exch == "NSE" and seg == "E" and series == "EQ") or
-            (seg in ("NSE_EQ", "NSE EQ", "NSEEQ")) or
-            (seg.startswith("NSE") and "EQ" in seg)
+def fetch_segment(segment):
+    """Fetch instrument list for a given exchange segment from Dhan API."""
+    print(f"  Fetching {segment}...")
+    try:
+        r = requests.get(
+            f"{DHAN_BASE}/v2/instrument/{segment}",
+            headers=get_headers(),
+            timeout=60
         )
-
-        # ── NSE FNO: inst="FUTSTK"/"OPTSTK" — use SM_SYMBOL_NAME as the underlying
-        is_nse_fno = (
-            (exch == "NSE" and inst in ("FUTSTK", "OPTSTK")) or
-            "FNO" in seg or "NSE_FO" in seg
-        )
-
-        if is_nse_eq and sym not in eq_lookup:
-            try:
-                eq_lookup[sym] = str(int(float(row[id_i].strip())))
-            except (ValueError, IndexError):
-                pass
-
-        elif is_nse_fno and undl:
-            fno_symbols.add(undl)  # add underlying name, not contract name
-
-    print(f"  Total rows parsed : {row_count}")
-    print(f"  NSE_EQ matched    : {len(eq_lookup)}")
-    print(f"  NSE_FNO matched   : {len(fno_symbols)}")
-    return eq_lookup, fno_symbols
+        print(f"  {segment} → HTTP {r.status_code}, size={len(r.text):,} bytes")
+        if r.status_code == 200:
+            return r.json()
+        elif r.status_code == 401:
+            print(f"  ERROR: Unauthorized — check DHAN_ACCESS_TOKEN and DHAN_CLIENT_ID")
+            return None
+        else:
+            print(f"  ERROR: {r.text[:200]}")
+            return None
+    except requests.RequestException as e:
+        print(f"  Request failed: {e}")
+        return None
 
 def fetch_ids():
     print("=" * 60)
-    print("Dhan Security ID Fetcher")
+    print("Dhan Security ID Fetcher (Live API)")
     print("=" * 60)
 
-    # ── Try each CSV URL ──────────────────────────────────────────────
-    text = None
-    for url in CSV_URLS:
-        print(f"\nTrying: {url}")
-        try:
-            r = requests.get(url, timeout=60)
-            print(f"  HTTP {r.status_code}  Size: {len(r.text):,} bytes")
-            if r.status_code == 200 and len(r.text) > 10_000:
-                text = r.text
-                print("  Download OK")
-                break
-            else:
-                print(f"  Skipping — response too small or non-200")
-        except requests.RequestException as e:
-            print(f"  Request failed: {e}")
-
-    if text is None:
-        print("\nFATAL: Could not download CSV from any URL.")
-        print("Check your internet connection or whether Dhan changed the URL.")
+    if not ACCESS_TOKEN or not CLIENT_ID:
+        print("\nFATAL: DHAN_ACCESS_TOKEN and DHAN_CLIENT_ID env vars required.")
+        print("Set them in GitHub Secrets or export locally.")
         sys.exit(1)
 
-    # ── Parse ─────────────────────────────────────────────────────────
-    print("\nParsing CSV...")
-    eq_lookup, fno_symbols = parse_csv(text)
+    print(f"\nCredentials: client_id={'SET' if CLIENT_ID else 'MISSING'} token={'SET' if ACCESS_TOKEN else 'MISSING'}")
 
-    if not eq_lookup:
-        print("FATAL: No NSE_EQ entries found. CSV format may have changed.")
+    # ── Step 1: Get active NSE_FNO instruments ────────────────────────
+    print("\nStep 1: Fetching active NSE_FNO instruments...")
+    fno_data = fetch_segment("NSE_FNO")
+    if not fno_data:
+        print("FATAL: Could not fetch NSE_FNO instruments.")
         sys.exit(1)
 
-    print(f"\nNSE_EQ symbols found : {len(eq_lookup)}")
-    print(f"FNO symbols in CSV   : {len(fno_symbols)}")
+    # Log sample to understand structure
+    if fno_data:
+        print(f"  Sample FNO item keys: {list(fno_data[0].keys())[:10]}")
+        print(f"  Sample FNO item: {fno_data[0]}")
 
-    # ── Use CSV FNO list as source of truth ───────────────────────────
-    # CSV tells us exactly which stocks are currently in F&O
-    # Hardcoded FNO_NAMES only used as fallback if CSV has no FNO data
-    if len(fno_symbols) >= 50:
-        all_names = fno_symbols  # CSV is authoritative — includes new, excludes removed
-        print(f"Using CSV FNO list ({len(fno_symbols)} symbols) — ignoring hardcoded list")
-    else:
-        all_names = set(FNO_NAMES)
-        print(f"CSV FNO list too small ({len(fno_symbols)}) — using hardcoded fallback")
+    # Extract unique underlying symbols — only FUTSTK/OPTSTK
+    fno_underlyings = set()
+    for item in fno_data:
+        inst = str(item.get("INSTRUMENT", item.get("SEM_INSTRUMENT_NAME", ""))).upper()
+        if inst in ("FUTSTK", "OPTSTK"):
+            undl = (item.get("SM_SYMBOL_NAME") or
+                    item.get("UNDERLYING_SYMBOL") or
+                    item.get("SYMBOL_NAME") or "").strip()
+            if undl:
+                fno_underlyings.add(undl)
 
-    matched = {s: eq_lookup[s] for s in sorted(all_names) if s in eq_lookup}
-    missing = [s for s in sorted(all_names) if s not in eq_lookup]
+    print(f"  Active FNO underlying stocks: {len(fno_underlyings)}")
+    if fno_underlyings:
+        print(f"  Sample: {sorted(fno_underlyings)[:10]}")
 
-    print(f"Matched              : {len(matched)}")
+    if len(fno_underlyings) < 10:
+        print("WARNING: Very few FNO underlyings. Dumping first 3 items for diagnosis:")
+        for item in fno_data[:3]:
+            print(f"  {item}")
+        sys.exit(1)
+
+    # ── Step 2: Get NSE_EQ instruments for security IDs ──────────────
+    print("\nStep 2: Fetching NSE_EQ instruments for security IDs...")
+    eq_data = fetch_segment("NSE_EQ")
+    if not eq_data:
+        print("FATAL: Could not fetch NSE_EQ instruments.")
+        sys.exit(1)
+
+    if eq_data:
+        print(f"  Sample EQ item keys: {list(eq_data[0].keys())[:10]}")
+
+    # Build symbol → security_id map (series=EQ only)
+    eq_lookup = {}
+    for item in eq_data:
+        series = str(item.get("SERIES", item.get("SEM_SERIES", ""))).upper()
+        if series != "EQ":
+            continue
+        sym = (item.get("SM_SYMBOL_NAME") or
+               item.get("SYMBOL_NAME") or
+               item.get("SEM_TRADING_SYMBOL") or "").strip()
+        sid = (item.get("SEM_SMST_SECURITY_ID") or
+               item.get("SECURITY_ID") or
+               item.get("SCRIP_ID") or "")
+        if sym and sid:
+            try:
+                eq_lookup[sym] = str(int(float(str(sid))))
+            except (ValueError, TypeError):
+                pass
+
+    print(f"  NSE_EQ symbols found: {len(eq_lookup)}")
+
+    if len(eq_lookup) < 100:
+        print("FATAL: Too few NSE_EQ symbols. Dumping first 3 items for diagnosis:")
+        for item in eq_data[:3]:
+            print(f"  {item}")
+        sys.exit(1)
+
+    # ── Step 3: Match FNO underlyings to NSE_EQ IDs ──────────────────
+    print("\nStep 3: Matching...")
+    matched = {s: eq_lookup[s] for s in sorted(fno_underlyings) if s in eq_lookup}
+    missing = [s for s in sorted(fno_underlyings) if s not in eq_lookup]
+
+    print(f"  Matched : {len(matched)}")
     if missing:
-        print(f"Not found in NSE_EQ  : {missing}")
+        print(f"  Missing : {missing}")
 
-    if len(matched) < 100:
-        print("FATAL: Fewer than 100 symbols matched — something went wrong.")
+    if len(matched) < 50:
+        print("FATAL: Fewer than 50 symbols matched — something went wrong.")
         sys.exit(1)
 
-    # ── Save JSON ─────────────────────────────────────────────────────
+    # ── Step 4: Save JSON ─────────────────────────────────────────────
     output_path = "correct_ids.json"
     with open(output_path, "w") as f:
         json.dump(matched, f, indent=2)
     print(f"\nSaved {len(matched)} IDs to {output_path}")
-    print("Done.")
+    print("Done. ✓")
 
 if __name__ == "__main__":
     fetch_ids()
