@@ -71,7 +71,7 @@ def fetch_ids():
         inst = row.get("INSTRUMENT", "").strip().upper()
         if inst == "FUTSTK":
             undl = row.get("UNDERLYING_SYMBOL", "").strip()
-            if undl and not undl.startswith("0"):  # skip test symbols like 011NSETEST
+            if undl and not undl[0].isdigit():  # skip test symbols like 011NSETEST, 101NSETEST
                 fno_underlyings.add(undl)
 
     print(f"  Active FNO stocks (FUTSTK only): {len(fno_underlyings)}")
@@ -88,13 +88,15 @@ def fetch_ids():
 
     print(f"  Sample row: {dict(list(eq_rows[0].items())[:8])}")
 
-    # Build SYMBOL_NAME → SECURITY_ID map for EQ series only
+    # Build UNDERLYING_SYMBOL → SECURITY_ID map for EQ series only
+    # UNDERLYING_SYMBOL = trading symbol e.g. "ANGELONE", "RELIANCE"
+    # SYMBOL_NAME = full company name e.g. "Angel One Limited"
     eq_lookup = {}
     for row in eq_rows:
         series = row.get("SERIES", "").strip().upper()
         if series != "EQ":
             continue
-        sym = row.get("SYMBOL_NAME", "").strip()
+        sym = row.get("UNDERLYING_SYMBOL", "").strip()  # trading symbol
         sid = row.get("SECURITY_ID", "").strip()
         if sym and sid:
             try:
