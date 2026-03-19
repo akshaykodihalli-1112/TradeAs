@@ -1,10 +1,8 @@
 name: Fetch Dhan Security IDs
 
 on:
-  # Run automatically every Sunday at 6 AM IST (12:30 AM UTC)
   schedule:
     - cron: '30 0 * * 0'
-  # Also run manually from GitHub Actions tab anytime
   workflow_dispatch:
 
 jobs:
@@ -14,6 +12,8 @@ jobs:
       contents: write
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      DHAN_ACCESS_TOKEN: ${{ secrets.DHAN_ACCESS_TOKEN }}
+      DHAN_CLIENT_ID: ${{ secrets.DHAN_CLIENT_ID }}
 
     steps:
       - name: Checkout repo
@@ -29,7 +29,7 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      - name: Fetch correct IDs from Dhan CSV
+      - name: Fetch active FNO IDs from Dhan API
         run: python fetch_ids.py
 
       - name: Commit and push correct_ids.json
