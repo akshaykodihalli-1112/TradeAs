@@ -1123,10 +1123,10 @@ _ps_cache = {"data": [], "status": "idle", "updated_at": None, "count": 0}
 _ps_lock  = threading.Lock()
 
 def _fetch_option_score(tok, cid, sym_info, spot, direction, nearest_expiry, headers):
-    """Fetch option chain for ONE stock and return OI-based score boost (0-4)."""
+    """Fetch option chain for ONE stock — returns score, opt_data, atm_strike, strike_analysis."""
     eq_id = sym_info["security_id"]
     try:
-        time.sleep(3)  # rate limit: 1 req per 3s
+        time.sleep(3)
         r = requests.post(
             f"{DHAN_BASE}/v2/optionchain",
             json={"UnderlyingScrip": int(eq_id), "UnderlyingSeg": "NSE_EQ", "Expiry": nearest_expiry},
@@ -1134,35 +1134,68 @@ def _fetch_option_score(tok, cid, sym_info, spot, direction, nearest_expiry, hea
         )
         if r.status_code == 429:
             print(f"[ps-opt] {sym_info['symbol']} 429 — sleeping 6s"); time.sleep(6)
-            return 0, {}, None
+            return 0, {}, None, []
         if r.status_code != 200:
             print(f"[ps-opt] {sym_info['symbol']} {r.status_code}: {r.text[:80]}")
-            return 0, {}, None
+            return 0, {}, None, []
 
         resp = r.json()
-        if resp.get("status") != "success": return 0, {}, None
+        if resp.get("status") != "success": return 0, {}, None, []
         oc = resp.get("data", {}).get("oc", {})
-        if not oc: return 0, {}, None
+        if not oc: return 0, {}, None, []
 
-        # Aggregate OI and vol
+        # Aggregate totals + find ATM
         total_ce_oi = total_pe_oi = total_ce_vol = total_pe_vol = 0
         atm_ce_oi = atm_pe_oi = atm_ce_vol = atm_pe_vol = 0
         atm_ce_prev_oi = atm_pe_prev_oi = 0
         atm_strike = 0; min_diff = float("inf")
 
+        # Collect all strikes for analysis
+        strike_rows = []
         for strike_str, sd in oc.items():
             sp   = float(strike_str)
             ce   = sd.get("ce", {}); pe = sd.get("pe", {})
-            total_ce_oi  += int(ce.get("oi", 0));  total_pe_oi  += int(pe.get("oi", 0))
-            total_ce_vol += int(ce.get("volume",0)); total_pe_vol += int(pe.get("volume",0))
-            if abs(sp - spot) < min_diff:
-                min_diff = abs(sp - spot); atm_strike = sp
-                atm_ce_oi      = int(ce.get("oi", 0))
-                atm_pe_oi      = int(pe.get("oi", 0))
-                atm_ce_vol     = int(ce.get("volume", 0))
-                atm_pe_vol     = int(pe.get("volume", 0))
-                atm_ce_prev_oi = int(ce.get("previous_oi", 0))
-                atm_pe_prev_oi = int(pe.get("previous_oi", 0))
+            ce_oi  = int(ce.get("oi", 0)); pe_oi  = int(pe.get("oi", 0))
+            ce_vol = int(ce.get("volume", 0)); pe_vol = int(pe.get("volume", 0))
+            ce_ltp = float(ce.get("last_price", 0)); pe_ltp = float(pe.get("last_price", 0))
+            ce_iv  = float(ce.get("implied_volatility", 0))
+            pe_iv  = float(pe.get("implied_volatility", 0))
+            ce_delta = float(ce.get("greeks", {}).get("delta", 0))
+            pe_delta = float(pe.get("greeks", {}).get("delta", 0))
+            ce_gamma = float(ce.get("greeks", {}).get("gamma", 0))
+            pe_gamma = float(pe.get("greeks", {}).get("gamma", 0))
+            ce_prev_oi = int(ce.get("previous_oi", 0))
+            pe_prev_oi = int(pe.get("previous_oi", 0))
+
+            total_ce_oi  += ce_oi;  total_pe_oi  += pe_oi
+            total_ce_vol += ce_vol; total_pe_vol += pe_vol
+
+            moneyness = "ATM"
+            if direction == "bull":
+                if sp < spot * 0.995:  moneyness = "ITM"
+                elif sp > spot * 1.005: moneyness = "OTM"
+            else:
+                if sp > spot * 1.005:  moneyness = "ITM"
+                elif sp < spot * 0.995: moneyness = "OTM"
+
+            strike_rows.append({
+                "strike": sp, "moneyness": moneyness,
+                "ce_ltp": ce_ltp, "pe_ltp": pe_ltp,
+                "ce_oi": ce_oi, "pe_oi": pe_oi,
+                "ce_vol": ce_vol, "pe_vol": pe_vol,
+                "ce_delta": round(ce_delta, 3), "pe_delta": round(pe_delta, 3),
+                "ce_gamma": round(ce_gamma, 4), "pe_gamma": round(pe_gamma, 4),
+                "ce_iv": round(ce_iv, 1), "pe_iv": round(pe_iv, 1),
+                "ce_oi_change": ce_oi - ce_prev_oi,
+                "pe_oi_change": pe_oi - pe_prev_oi,
+            })
+
+            diff = abs(sp - spot)
+            if diff < min_diff:
+                min_diff = diff; atm_strike = sp
+                atm_ce_oi = ce_oi; atm_pe_oi = pe_oi
+                atm_ce_vol = ce_vol; atm_pe_vol = pe_vol
+                atm_ce_prev_oi = ce_prev_oi; atm_pe_prev_oi = pe_prev_oi
 
         pcr = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi else 0
         ce_vol_ratio = round(atm_ce_vol / (atm_ce_oi / 100), 2) if atm_ce_oi else 0
@@ -1170,16 +1203,36 @@ def _fetch_option_score(tok, cid, sym_info, spot, direction, nearest_expiry, hea
         ce_oi_change = atm_ce_oi - atm_ce_prev_oi
         pe_oi_change = atm_pe_oi - atm_pe_prev_oi
 
-        # Score boost based on options confirmation
+        # Score boost
         opt_score = 0
         if direction == "bull":
-            if pcr < 0.7:                        opt_score += 2  # low PCR = CE heavy = bullish
-            if ce_vol_ratio > 5:                  opt_score += 1  # CE volume surge at ATM
-            if ce_oi_change > 0:                  opt_score += 1  # fresh CE OI = new bull positions
+            if pcr < 0.7:        opt_score += 2
+            if ce_vol_ratio > 5:  opt_score += 1
+            if ce_oi_change > 0:  opt_score += 1
         else:
-            if pcr > 1.3:                        opt_score += 2  # high PCR = PE heavy = bearish
-            if pe_vol_ratio > 5:                  opt_score += 1  # PE volume surge at ATM
-            if pe_oi_change > 0:                  opt_score += 1  # fresh PE OI = new bear positions
+            if pcr > 1.3:        opt_score += 2
+            if pe_vol_ratio > 5:  opt_score += 1
+            if pe_oi_change > 0:  opt_score += 1
+
+        # Pick best 5 strikes near ATM for popup (2 ITM, ATM, 2 OTM)
+        strike_rows.sort(key=lambda x: abs(x["strike"] - spot))
+        best_strikes = strike_rows[:5]
+        best_strikes.sort(key=lambda x: x["strike"])
+
+        # Find max profit strike — highest delta×gamma ratio near ATM
+        # For bull: CE with highest (delta + gamma×10) near spot
+        # For bear: PE with highest (abs(delta) + gamma×10) near spot
+        best_strike = None
+        best_score_opt = -999
+        for s in best_strikes:
+            if direction == "bull":
+                score_opt = s["ce_delta"] + s["ce_gamma"] * 10
+                if score_opt > best_score_opt and s["ce_ltp"] > 0:
+                    best_score_opt = score_opt; best_strike = s
+            else:
+                score_opt = abs(s["pe_delta"]) + s["pe_gamma"] * 10
+                if score_opt > best_score_opt and s["pe_ltp"] > 0:
+                    best_score_opt = score_opt; best_strike = s
 
         opt_data = {
             "pcr": pcr, "atm_strike": atm_strike,
@@ -1188,13 +1241,15 @@ def _fetch_option_score(tok, cid, sym_info, spot, direction, nearest_expiry, hea
             "atm_ce_vol": atm_ce_vol, "atm_pe_vol": atm_pe_vol,
             "ce_vol_ratio": ce_vol_ratio, "pe_vol_ratio": pe_vol_ratio,
             "ce_oi_change": ce_oi_change, "pe_oi_change": pe_oi_change,
+            "best_strike": best_strike,
+            "expiry": nearest_expiry,
         }
-        print(f"[ps-opt] {sym_info['symbol']} pcr={pcr} ce_vol_ratio={ce_vol_ratio:.1f} pe_vol_ratio={pe_vol_ratio:.1f} opt_score=+{opt_score}")
-        return opt_score, opt_data, atm_strike
+        print(f"[ps-opt] {sym_info['symbol']} pcr={pcr} best_strike={best_strike['strike'] if best_strike else 'n/a'} opt_score=+{opt_score}")
+        return opt_score, opt_data, atm_strike, best_strikes
 
     except Exception as e:
         print(f"[ps-opt] {sym_info['symbol']} error: {e}")
-        return 0, {}, None
+        return 0, {}, None, []
 
 
 def _compute_power_strike(tok):
@@ -1264,6 +1319,8 @@ def _compute_power_strike(tok):
             "mode": mode, "setup_note": setup_note, "strategy": "Power Strike",
             "action": f"Buy {atm_strike} {'CE' if direction=='bull' else 'PE'}" if atm_strike else "—",
             "opt_data": {}, "opt_score": 0,
+            "signal_time": ist_now().strftime("%H:%M IST"),  # timestamp when detected
+            "strikes": [],  # will be populated after option chain fetch
         })
 
     print(f"[ps] equity filter: {len(candidates)} candidates — now fetching option chains...")
@@ -1293,21 +1350,30 @@ def _compute_power_strike(tok):
         for c in candidates:
             si = sym_map.get(c["symbol"])
             if not si: continue
-            opt_score, opt_data, opt_atm = _fetch_option_score(
+            opt_score, opt_data, opt_atm, best_strikes = _fetch_option_score(
                 tok, cid, si, c["ltp"], c["direction"], nearest_expiry, headers)
             c["opt_score"]  = opt_score
             c["opt_data"]   = opt_data
-            c["score"]      = c["eq_score"] + opt_score  # combined score
+            c["strikes"]    = best_strikes
+            c["score"]      = c["eq_score"] + opt_score
             c["signal_strength"] = "strong" if c["score"] >= 6 else "moderate" if c["score"] >= 3 else "weak"
-            # Update setup note with option confirmation
             if opt_data:
                 pcr = opt_data.get("pcr", 0)
                 cvr = opt_data.get("ce_vol_ratio", 0)
                 pvr = opt_data.get("pe_vol_ratio", 0)
                 opt_label = f"PCR={pcr} | {'CE' if c['direction']=='bull' else 'PE'} vol={cvr if c['direction']=='bull' else pvr:.1f}×"
                 c["setup_note"] = c["setup_note"] + f" | {opt_label}"
-                if opt_atm: c["atm_strike"] = opt_atm  # use confirmed ATM from option chain
-                c["action"] = f"Buy {c['atm_strike']} {'CE' if c['direction']=='bull' else 'PE'}" if c["atm_strike"] else "—"
+                if opt_atm: c["atm_strike"] = opt_atm
+                # Use best strike from delta/gamma analysis
+                best = opt_data.get("best_strike")
+                if best:
+                    opt_type = "CE" if c["direction"] == "bull" else "PE"
+                    c["best_strike"] = best["strike"]
+                    c["best_ltp"]    = best["ce_ltp"] if c["direction"] == "bull" else best["pe_ltp"]
+                    c["best_delta"]  = best["ce_delta"] if c["direction"] == "bull" else best["pe_delta"]
+                    c["best_gamma"]  = best["ce_gamma"] if c["direction"] == "bull" else best["pe_gamma"]
+                    c["best_iv"]     = best["ce_iv"] if c["direction"] == "bull" else best["pe_iv"]
+                    c["action"] = f"Buy {best['strike']} {opt_type} @ ₹{best['ce_ltp'] if c['direction']=='bull' else best['pe_ltp']}"
     else:
         print(f"[ps] could not get expiry — skipping option enrichment")
 
