@@ -984,7 +984,7 @@ def _compute_breakout(tok):
     vol_map  = {x["symbol"]: (x.get("todayVol",0), x.get("avgVol7d",0))
                 for x in cache.get("data", [])}
 
-    print(f"[bk] starting breakout scan for {len(SYMBOLS)} symbols, range {from_dt}→{to_dt}")
+    print(f"[bk] starting breakout scan for {len(SYMBOLS)} symbols...")
     results = []
 
     for sym_info in SYMBOLS:
@@ -1006,41 +1006,59 @@ def _compute_breakout(tok):
                               json=payload, headers=headers, timeout=10)
             if r.status_code == 429:
                 print(f"[bk] {sym} 429 — sleeping 3s"); time.sleep(3); continue
-            if r.status_code != 200:
-                print(f"[bk] {sym} {r.status_code}: {r.text[:120]}"); continue
+            if r.status_code != 200: continue
 
             d          = r.json()
             timestamps = d.get("timestamp", [])
             highs      = d.get("high",  [])
             lows       = d.get("low",   [])
+            closes     = d.get("close", [])
             volumes    = d.get("volume",[])
             if not timestamps: continue
 
-            # Extract opening range bars 9:15–10:00
-            or_highs = []; or_lows = []; or_vols = []
+            # ── Opening Range 9:15–10:00 ──────────────────────────────────
+            or_highs = []; or_lows = []
             for i, ts in enumerate(timestamps):
                 try:
                     t = datetime.fromtimestamp(ts, IST).strftime("%H:%M")
                     if RANGE_START <= t < RANGE_END:
                         or_highs.append(highs[i])
                         or_lows.append(lows[i])
-                        or_vols.append(volumes[i])
                 except: continue
 
             if len(or_highs) < 3: continue
-
             range_high  = max(or_highs)
             range_low   = min(or_lows)
             range_width = round((range_high - range_low) / range_low * 100, 2) if range_low else 0
-            if range_width > 5: continue  # skip gappers
+            if range_width > 5: continue
 
-            direction = None; breakout_pct = 0.0
-            if ltp > range_high:
-                direction = "bull"
-                breakout_pct = round((ltp - range_high) / range_high * 100, 2)
-            elif ltp < range_low:
-                direction = "bear"
-                breakout_pct = round((ltp - range_low) / range_low * 100, 2)
+            # ── Find EXACT time breakout first triggered ──────────────────
+            # Walk candles after 10:00 — first candle to break range
+            signal_time  = None
+            signal_price = 0.0
+            signal_pct   = 0.0
+            direction    = None
+            breakout_pct = 0.0
+
+            for i, ts in enumerate(timestamps):
+                try:
+                    t = datetime.fromtimestamp(ts, IST).strftime("%H:%M")
+                    if t < RANGE_END: continue  # skip opening range candles
+                    if direction: break          # already found signal
+
+                    if highs[i] > range_high:
+                        direction    = "bull"
+                        signal_time  = t
+                        signal_price = round(highs[i], 2)
+                        signal_pct   = round((highs[i] - range_high) / range_high * 100, 2)
+                        breakout_pct = round((ltp - range_high) / range_high * 100, 2)
+                    elif lows[i] < range_low:
+                        direction    = "bear"
+                        signal_time  = t
+                        signal_price = round(lows[i], 2)
+                        signal_pct   = round((lows[i] - range_low) / range_low * 100, 2)
+                        breakout_pct = round((ltp - range_low) / range_low * 100, 2)
+                except: continue
 
             if not direction: continue
 
@@ -1053,15 +1071,17 @@ def _compute_breakout(tok):
                 "symbol":        sym,
                 "ltp":           ltp,
                 "rangeHigh":     round(range_high, 2),
-                "rangeLow":      round(range_low,  2),
+                "rangeLow":      round(range_low, 2),
                 "rangeWidth":    range_width,
                 "direction":     direction,
-                "breakoutPct":   breakout_pct,
+                "breakoutPct":   breakout_pct,   # current % from range
+                "signalPct":     signal_pct,      # % at exact signal candle
+                "signal_price":  signal_price,    # price when it first broke
+                "signal_time":   signal_time,     # e.g. "09:25"
                 "volRatio":      vol_ratio,
                 "vol_confirmed": vol_confirmed,
                 "momentum_ok":   momentum_ok,
                 "todayVol":      today_vol,
-                "signal_time":   ist_now().strftime("%H:%M IST"),
             })
             time.sleep(0.3)
 
