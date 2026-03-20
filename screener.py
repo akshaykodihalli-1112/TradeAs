@@ -966,6 +966,11 @@ def _compute_breakout(tok):
     cid = CREDS.get("client_id", "")
     headers = {"access-token": tok, "client-id": cid, "Content-Type": "application/json"}
 
+    now     = ist_now()
+    today   = now.strftime("%Y-%m-%d")
+    from_dt = f"{today} 09:15:00"
+    to_dt   = f"{today} 15:30:00"
+
     # Wait for screener data
     wait = 0
     while not cache.get("data") and wait < 120:
@@ -975,91 +980,92 @@ def _compute_breakout(tok):
         print(f"[bk] screener data not available — aborting")
         _bk_cache["status"] = "idle"; return
 
-    vol_map = {x["symbol"]: (x.get("todayVol",0), x.get("avgVol7d",0))
-               for x in cache.get("data", [])}
+    spot_map = {x["symbol"]: x["ltp"] for x in cache.get("data", [])}
+    vol_map  = {x["symbol"]: (x.get("todayVol",0), x.get("avgVol7d",0))
+                for x in cache.get("data", [])}
 
-    print(f"[bk] starting breakout scan for {len(SYMBOLS)} symbols using quote OHLC...")
-
-    # Fetch today's OHLC via marketfeed/quote (already have access, same as screener)
-    id_map   = {s["security_id"]: s["symbol"] for s in SYMBOLS}
-    ohlc_map = {}
-
-    for i in range(0, len(SYMBOLS), 50):
-        batch = [int(s["security_id"]) for s in SYMBOLS[i:i+50]]
-        for attempt in range(3):
-            try:
-                r = requests.post(f"{DHAN_BASE}/v2/marketfeed/quote",
-                                  json={"NSE_EQ": batch}, headers=headers, timeout=15)
-                if r.status_code == 429: time.sleep(5*(attempt+1)); continue
-                if r.status_code != 200:
-                    print(f"[bk] quote batch {i} status={r.status_code}")
-                    break
-                for sid, q in r.json().get("data",{}).get("NSE_EQ",{}).items():
-                    sym = id_map.get(str(int(float(sid))))
-                    if sym:
-                        ohlc = q.get("ohlc", {})
-                        ohlc_map[sym] = {
-                            "open": float(ohlc.get("open", 0)),
-                            "high": float(ohlc.get("high", 0)),
-                            "low":  float(ohlc.get("low",  0)),
-                            "ltp":  float(q.get("last_price", 0)),
-                        }
-                break
-            except Exception as e:
-                print(f"[bk] quote error: {e}"); time.sleep(2)
-        time.sleep(1)
-
-    print(f"[bk] got OHLC for {len(ohlc_map)} symbols")
-
+    print(f"[bk] starting breakout scan for {len(SYMBOLS)} symbols, range {from_dt}→{to_dt}")
     results = []
+
     for sym_info in SYMBOLS:
-        sym  = sym_info["symbol"]
-        ohlc = ohlc_map.get(sym)
-        if not ohlc or not ohlc["ltp"]: continue
+        sym = sym_info["symbol"]
+        ltp = spot_map.get(sym, 0)
+        if not ltp: continue
 
-        ltp       = ohlc["ltp"]
-        day_high  = ohlc["high"]
-        day_low   = ohlc["low"]
-        day_open  = ohlc["open"]
-        if not day_high or not day_low or not day_open: continue
+        try:
+            payload = {
+                "securityId":      str(sym_info["security_id"]),
+                "exchangeSegment": "NSE_EQ",
+                "instrument":      "EQUITY",
+                "interval":        "1",
+                "oi":              False,
+                "fromDate":        from_dt,
+                "toDate":          to_dt,
+            }
+            r = requests.post(f"{DHAN_BASE}/v2/charts/intraday",
+                              json=payload, headers=headers, timeout=10)
+            if r.status_code == 429:
+                print(f"[bk] {sym} 429 — sleeping 3s"); time.sleep(3); continue
+            if r.status_code != 200:
+                print(f"[bk] {sym} {r.status_code}: {r.text[:120]}"); continue
 
-        range_width = round((day_high - day_low) / day_low * 100, 2)
-        if range_width > 8: continue  # skip gappers
+            d          = r.json()
+            timestamps = d.get("timestamp", [])
+            highs      = d.get("high",  [])
+            lows       = d.get("low",   [])
+            volumes    = d.get("volume",[])
+            if not timestamps: continue
 
-        # Bullish: ltp within 0.5% of day high
-        # Bearish: ltp within 0.5% of day low
-        near_high = (day_high - ltp) / day_high * 100
-        near_low  = (ltp - day_low)  / day_low  * 100
+            # Extract opening range bars 9:15–10:00
+            or_highs = []; or_lows = []; or_vols = []
+            for i, ts in enumerate(timestamps):
+                try:
+                    t = datetime.fromtimestamp(ts, IST).strftime("%H:%M")
+                    if RANGE_START <= t < RANGE_END:
+                        or_highs.append(highs[i])
+                        or_lows.append(lows[i])
+                        or_vols.append(volumes[i])
+                except: continue
 
-        direction    = None
-        breakout_pct = 0.0
-        if near_high <= 0.5:
-            direction    = "bull"
-            breakout_pct = round((ltp - day_open) / day_open * 100, 2)
-        elif near_low <= 0.5:
-            direction    = "bear"
-            breakout_pct = round((ltp - day_open) / day_open * 100, 2)
+            if len(or_highs) < 3: continue
 
-        if not direction: continue
+            range_high  = max(or_highs)
+            range_low   = min(or_lows)
+            range_width = round((range_high - range_low) / range_low * 100, 2) if range_low else 0
+            if range_width > 5: continue  # skip gappers
 
-        today_vol, avg_vol = vol_map.get(sym, (0, 0))
-        vol_ratio     = round(today_vol / avg_vol, 2) if avg_vol else 0
-        vol_confirmed = vol_ratio >= 1.5
-        momentum_ok   = abs(breakout_pct) >= 0.5
+            direction = None; breakout_pct = 0.0
+            if ltp > range_high:
+                direction = "bull"
+                breakout_pct = round((ltp - range_high) / range_high * 100, 2)
+            elif ltp < range_low:
+                direction = "bear"
+                breakout_pct = round((ltp - range_low) / range_low * 100, 2)
 
-        results.append({
-            "symbol":        sym,
-            "ltp":           ltp,
-            "rangeHigh":     round(day_high, 2),
-            "rangeLow":      round(day_low,  2),
-            "rangeWidth":    range_width,
-            "direction":     direction,
-            "breakoutPct":   breakout_pct,
-            "volRatio":      vol_ratio,
-            "vol_confirmed": vol_confirmed,
-            "momentum_ok":   momentum_ok,
-            "todayVol":      today_vol,
-        })
+            if not direction: continue
+
+            today_vol, avg_vol = vol_map.get(sym, (0, 0))
+            vol_ratio     = round(today_vol / avg_vol, 2) if avg_vol else 0
+            vol_confirmed = vol_ratio >= 1.5
+            momentum_ok   = abs(breakout_pct) >= 0.3
+
+            results.append({
+                "symbol":        sym,
+                "ltp":           ltp,
+                "rangeHigh":     round(range_high, 2),
+                "rangeLow":      round(range_low,  2),
+                "rangeWidth":    range_width,
+                "direction":     direction,
+                "breakoutPct":   breakout_pct,
+                "volRatio":      vol_ratio,
+                "vol_confirmed": vol_confirmed,
+                "momentum_ok":   momentum_ok,
+                "todayVol":      today_vol,
+            })
+            time.sleep(0.3)
+
+        except Exception as e:
+            print(f"[bk] {sym}: {e}"); continue
 
     results.sort(key=lambda x: abs(x["breakoutPct"]), reverse=True)
     _bk_cache.update({
@@ -1108,3 +1114,354 @@ def get_breakout(x_client_id:str=Header(None), x_access_token:str=Header(None),
         threading.Thread(target=_run_bk_locked, args=(tok,), daemon=True).start()
 
     return _bk_cache
+
+# ══════════════════════════════════════════════════════════════════════════════
+# POWER STRIKE — Directional Momentum + Options Setup Scanner
+# Flags stocks with: large move + vol spike + OI buildup at nearest strike
+# ══════════════════════════════════════════════════════════════════════════════
+_ps_cache = {"data": [], "status": "idle", "updated_at": None, "count": 0}
+_ps_lock  = threading.Lock()
+
+def _fetch_option_score(tok, cid, sym_info, spot, direction, nearest_expiry, headers):
+    """Fetch option chain for ONE stock and return OI-based score boost (0-4)."""
+    eq_id = sym_info["security_id"]
+    try:
+        time.sleep(3)  # rate limit: 1 req per 3s
+        r = requests.post(
+            f"{DHAN_BASE}/v2/optionchain",
+            json={"UnderlyingScrip": int(eq_id), "UnderlyingSeg": "NSE_EQ", "Expiry": nearest_expiry},
+            headers=headers, timeout=15
+        )
+        if r.status_code == 429:
+            print(f"[ps-opt] {sym_info['symbol']} 429 — sleeping 6s"); time.sleep(6)
+            return 0, {}, None
+        if r.status_code != 200:
+            print(f"[ps-opt] {sym_info['symbol']} {r.status_code}: {r.text[:80]}")
+            return 0, {}, None
+
+        resp = r.json()
+        if resp.get("status") != "success": return 0, {}, None
+        oc = resp.get("data", {}).get("oc", {})
+        if not oc: return 0, {}, None
+
+        # Aggregate OI and vol
+        total_ce_oi = total_pe_oi = total_ce_vol = total_pe_vol = 0
+        atm_ce_oi = atm_pe_oi = atm_ce_vol = atm_pe_vol = 0
+        atm_ce_prev_oi = atm_pe_prev_oi = 0
+        atm_strike = 0; min_diff = float("inf")
+
+        for strike_str, sd in oc.items():
+            sp   = float(strike_str)
+            ce   = sd.get("ce", {}); pe = sd.get("pe", {})
+            total_ce_oi  += int(ce.get("oi", 0));  total_pe_oi  += int(pe.get("oi", 0))
+            total_ce_vol += int(ce.get("volume",0)); total_pe_vol += int(pe.get("volume",0))
+            if abs(sp - spot) < min_diff:
+                min_diff = abs(sp - spot); atm_strike = sp
+                atm_ce_oi      = int(ce.get("oi", 0))
+                atm_pe_oi      = int(pe.get("oi", 0))
+                atm_ce_vol     = int(ce.get("volume", 0))
+                atm_pe_vol     = int(pe.get("volume", 0))
+                atm_ce_prev_oi = int(ce.get("previous_oi", 0))
+                atm_pe_prev_oi = int(pe.get("previous_oi", 0))
+
+        pcr = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi else 0
+        ce_vol_ratio = round(atm_ce_vol / (atm_ce_oi / 100), 2) if atm_ce_oi else 0
+        pe_vol_ratio = round(atm_pe_vol / (atm_pe_oi / 100), 2) if atm_pe_oi else 0
+        ce_oi_change = atm_ce_oi - atm_ce_prev_oi
+        pe_oi_change = atm_pe_oi - atm_pe_prev_oi
+
+        # Score boost based on options confirmation
+        opt_score = 0
+        if direction == "bull":
+            if pcr < 0.7:                        opt_score += 2  # low PCR = CE heavy = bullish
+            if ce_vol_ratio > 5:                  opt_score += 1  # CE volume surge at ATM
+            if ce_oi_change > 0:                  opt_score += 1  # fresh CE OI = new bull positions
+        else:
+            if pcr > 1.3:                        opt_score += 2  # high PCR = PE heavy = bearish
+            if pe_vol_ratio > 5:                  opt_score += 1  # PE volume surge at ATM
+            if pe_oi_change > 0:                  opt_score += 1  # fresh PE OI = new bear positions
+
+        opt_data = {
+            "pcr": pcr, "atm_strike": atm_strike,
+            "ce_oi": total_ce_oi, "pe_oi": total_pe_oi,
+            "atm_ce_oi": atm_ce_oi, "atm_pe_oi": atm_pe_oi,
+            "atm_ce_vol": atm_ce_vol, "atm_pe_vol": atm_pe_vol,
+            "ce_vol_ratio": ce_vol_ratio, "pe_vol_ratio": pe_vol_ratio,
+            "ce_oi_change": ce_oi_change, "pe_oi_change": pe_oi_change,
+        }
+        print(f"[ps-opt] {sym_info['symbol']} pcr={pcr} ce_vol_ratio={ce_vol_ratio:.1f} pe_vol_ratio={pe_vol_ratio:.1f} opt_score=+{opt_score}")
+        return opt_score, opt_data, atm_strike
+
+    except Exception as e:
+        print(f"[ps-opt] {sym_info['symbol']} error: {e}")
+        return 0, {}, None
+
+
+def _compute_power_strike(tok):
+    """Power Strike — equity filter first, then option chain only for candidates."""
+    global _ps_cache
+    _ps_cache["status"] = "fetching"
+    cid = CREDS.get("client_id", "")
+
+    wait = 0
+    while not cache.get("data") and wait < 120:
+        print(f"[ps] waiting for screener data... ({wait}s)")
+        time.sleep(5); wait += 5
+    if not cache.get("data"):
+        print(f"[ps] no screener data — aborting")
+        _ps_cache["status"] = "idle"; return
+
+    market_open = is_market_open()
+    mode = "live" if market_open else "closed"
+    headers = {"access-token": tok, "client-id": cid, "Content-Type": "application/json"}
+    print(f"[ps] Power Strike scan — mode={mode}...")
+
+    # ── Step 1: Equity filter ─────────────────────────────────────────────────
+    candidates = []
+    sym_map = {s["symbol"]: s for s in SYMBOLS}
+
+    for row in cache.get("data", []):
+        sym       = row["symbol"]
+        ltp       = row.get("ltp", 0)
+        change    = row.get("change", 0)
+        vol_ratio = row.get("volumeRatio", 0)
+        mom5d     = row.get("momentum5d", 0)
+        today_vol = row.get("todayVol", 0)
+        avg_vol   = row.get("avgVol7d", 0)
+        if not ltp: continue
+        if abs(change) < 2.5: continue
+        if vol_ratio < 1.5:   continue
+
+        direction = "bull" if change > 0 else "bear"
+        momentum_confirms = (direction == "bull" and mom5d > -5) or \
+                            (direction == "bear" and mom5d < 5)
+
+        eq_score = 0
+        if abs(change) >= 2.5:  eq_score += 1
+        if abs(change) >= 4.0:  eq_score += 1
+        if vol_ratio >= 2.0:    eq_score += 1
+        if vol_ratio >= 3.0:    eq_score += 1
+        if momentum_confirms:   eq_score += 1
+        if eq_score < 2: continue
+
+        strike_step = 50 if ltp >= 500 else 25 if ltp >= 100 else 10
+        atm_base    = round(ltp / strike_step) * strike_step
+        atm_strike  = atm_base if ltp < atm_base else atm_base + strike_step if direction == "bull" else atm_base - strike_step
+        est_delta   = 0.60 if (ltp > atm_strike if direction=="bull" else ltp < atm_strike) else 0.45
+
+        if market_open:
+            setup_note = f"Live: {'+' if change>0 else ''}{change:.2f}% on {vol_ratio:.1f}× vol"
+        else:
+            setup_note = f"Closed {'+' if change>0 else ''}{change:.2f}% | vol={vol_ratio:.1f}× | 5D={mom5d:.1f}%"
+
+        candidates.append({
+            "symbol": sym, "ltp": ltp, "change": change, "direction": direction,
+            "volRatio": vol_ratio, "todayVol": today_vol, "avgVol": avg_vol,
+            "momentum5d": mom5d, "momentum_ok": momentum_confirms,
+            "eq_score": eq_score, "score": eq_score,
+            "signal_strength": "strong" if eq_score >= 4 else "moderate",
+            "atm_strike": atm_strike, "est_delta": est_delta,
+            "mode": mode, "setup_note": setup_note, "strategy": "Power Strike",
+            "action": f"Buy {atm_strike} {'CE' if direction=='bull' else 'PE'}" if atm_strike else "—",
+            "opt_data": {}, "opt_score": 0,
+        })
+
+    print(f"[ps] equity filter: {len(candidates)} candidates — now fetching option chains...")
+    _ps_cache["status"] = f"fetching options for {len(candidates)} stocks..."
+
+    # ── Step 2: Get nearest expiry once ───────────────────────────────────────
+    nearest_expiry = None
+    if candidates:
+        for c in candidates[:5]:
+            si = sym_map.get(c["symbol"])
+            if not si: continue
+            try:
+                r = requests.post(f"{DHAN_BASE}/v2/optionchain/expirylist",
+                                  json={"UnderlyingScrip": int(si["security_id"]), "UnderlyingSeg": "NSE_EQ"},
+                                  headers=headers, timeout=10)
+                time.sleep(3)
+                if r.status_code == 200:
+                    dates = r.json().get("data", [])
+                    if dates:
+                        nearest_expiry = dates[0]
+                        print(f"[ps] expiry: {nearest_expiry}")
+                        break
+            except: continue
+
+    # ── Step 3: Fetch option chain only for candidates ─────────────────────────
+    if nearest_expiry:
+        for c in candidates:
+            si = sym_map.get(c["symbol"])
+            if not si: continue
+            opt_score, opt_data, opt_atm = _fetch_option_score(
+                tok, cid, si, c["ltp"], c["direction"], nearest_expiry, headers)
+            c["opt_score"]  = opt_score
+            c["opt_data"]   = opt_data
+            c["score"]      = c["eq_score"] + opt_score  # combined score
+            c["signal_strength"] = "strong" if c["score"] >= 6 else "moderate" if c["score"] >= 3 else "weak"
+            # Update setup note with option confirmation
+            if opt_data:
+                pcr = opt_data.get("pcr", 0)
+                cvr = opt_data.get("ce_vol_ratio", 0)
+                pvr = opt_data.get("pe_vol_ratio", 0)
+                opt_label = f"PCR={pcr} | {'CE' if c['direction']=='bull' else 'PE'} vol={cvr if c['direction']=='bull' else pvr:.1f}×"
+                c["setup_note"] = c["setup_note"] + f" | {opt_label}"
+                if opt_atm: c["atm_strike"] = opt_atm  # use confirmed ATM from option chain
+                c["action"] = f"Buy {c['atm_strike']} {'CE' if c['direction']=='bull' else 'PE'}" if c["atm_strike"] else "—"
+    else:
+        print(f"[ps] could not get expiry — skipping option enrichment")
+
+    results = sorted(candidates, key=lambda x: (x["score"], abs(x["change"])), reverse=True)
+    _ps_cache.update({
+        "data": results, "status": "ok",
+        "updated_at": ist_now().strftime("%H:%M:%S IST"),
+        "count": len(results),
+        "bulls": len([r for r in results if r["direction"]=="bull"]),
+        "bears": len([r for r in results if r["direction"]=="bear"]),
+        "market_open": market_open, "mode": mode,
+    })
+    print(f"[ps] done — {len(results)} signals | mode={mode}")
+
+# ── Next Day Watchlist ─────────────────────────────────────────────────────────
+_nd_cache = {"data": [], "status": "idle", "updated_at": None, "count": 0}
+_nd_lock  = threading.Lock()
+
+def _compute_next_day(tok):
+    """Next Day — stocks aligned for tomorrow based on today's closed data."""
+    global _nd_cache
+    _nd_cache["status"] = "fetching"
+
+    wait = 0
+    while not cache.get("data") and wait < 120:
+        print(f"[nd] waiting for screener data... ({wait}s)")
+        time.sleep(5); wait += 5
+    if not cache.get("data"):
+        print(f"[nd] no screener data — aborting")
+        _nd_cache["status"] = "idle"; return
+
+    print(f"[nd] Next Day scan starting...")
+    results = []
+
+    for row in cache.get("data", []):
+        sym       = row["symbol"]
+        ltp       = row.get("ltp", 0)
+        change    = row.get("change", 0)
+        vol_ratio = row.get("volumeRatio", 0)
+        mom5d     = row.get("momentum5d", 0)
+        today_vol = row.get("todayVol", 0)
+        avg_vol   = row.get("avgVol7d", 0)
+        if not ltp: continue
+
+        # Next Day filters:
+        # 1. Move ≥ 2.0% (lower bar — continuation plays)
+        # 2. Vol ≥ 1.5× (institutional conviction)
+        # 3. Move ≤ 8% (skip exhaustion/gap candidates)
+        # 4. 5D momentum aligned with today's direction
+        if abs(change) < 2.0: continue
+        if vol_ratio < 1.5:   continue
+        if abs(change) > 8.0: continue
+
+        direction = "bull" if change > 0 else "bear"
+
+        # Momentum must align for next-day continuation
+        mom_aligned = (direction == "bull" and mom5d >= 0) or \
+                      (direction == "bear" and mom5d <= 0)
+        if not mom_aligned: continue
+
+        score = 0
+        if abs(change) >= 2.0:   score += 1
+        if abs(change) >= 3.5:   score += 1
+        if vol_ratio >= 2.0:     score += 1
+        if vol_ratio >= 3.0:     score += 1
+        if abs(mom5d) >= 3.0:    score += 1  # strong 5D alignment
+        if score < 2: continue
+
+        # Risk level for tomorrow's entry
+        risk = "HIGH" if abs(change) >= 6 else "MED" if abs(change) >= 4 else "LOW"
+
+        # Slightly OTM strike for next-day entry (better R:R than ITM)
+        strike_step = 50 if ltp >= 500 else 25 if ltp >= 100 else 10
+        atm_base    = round(ltp / strike_step) * strike_step
+        if direction == "bull":
+            atm_strike = atm_base + strike_step  # one step OTM CE
+        else:
+            atm_strike = atm_base - strike_step  # one step OTM PE
+        est_delta = 0.40  # OTM entry
+
+        print(f"[nd] {sym} dir={direction} chg={change:.2f}% vol={vol_ratio:.1f}x score={score} risk={risk}")
+        results.append({
+            "symbol": sym, "ltp": ltp, "change": change, "direction": direction,
+            "volRatio": vol_ratio, "todayVol": today_vol, "avgVol": avg_vol,
+            "momentum5d": mom5d, "score": score,
+            "signal_strength": "strong" if score >= 4 else "moderate",
+            "atm_strike": atm_strike, "est_delta": est_delta, "risk": risk,
+            "setup_note": f"Closed {'+' if change>0 else ''}{change:.2f}% | 5D={mom5d:.1f}% | Risk={risk}",
+            "action": f"Tomorrow: Buy {atm_strike} {'CE' if direction=='bull' else 'PE'}" if atm_strike else "—",
+        })
+
+    results.sort(key=lambda x: (x["score"], abs(x["change"])), reverse=True)
+    _nd_cache.update({
+        "data": results, "status": "ok",
+        "updated_at": ist_now().strftime("%H:%M:%S IST"),
+        "count": len(results),
+        "bulls": len([r for r in results if r["direction"]=="bull"]),
+        "bears": len([r for r in results if r["direction"]=="bear"]),
+        "market_open": is_market_open(),
+    })
+    print(f"[nd] done — {len(results)} next-day signals")
+
+def _run_nd_locked(tok):
+    with _nd_lock: _compute_next_day(tok)
+
+def _nd_stale():
+    last = _nd_cache.get("updated_at")
+    if not last: return True
+    try:
+        t = datetime.strptime(last, "%H:%M:%S IST").replace(
+            year=ist_now().year, month=ist_now().month, day=ist_now().day, tzinfo=IST)
+        return (ist_now() - t).seconds > 300
+    except: return True
+
+@app.get("/api/nextday")
+def get_next_day(x_client_id:str=Header(None), x_access_token:str=Header(None),
+                 refresh:bool=Query(False)):
+    cid = x_client_id or CREDS.get("client_id","")
+    tok = x_access_token or CREDS.get("access_token","")
+    if not cid or not tok: return {"status":"no_credentials","data":[]}
+    CREDS["client_id"]=cid; CREDS["access_token"]=tok
+    should_run = (refresh or _nd_stale()) and not _nd_lock.locked()
+    if should_run:
+        threading.Thread(target=_run_nd_locked, args=(tok,), daemon=True).start()
+    return _nd_cache
+
+def _run_ps_locked(tok):
+    with _ps_lock: _compute_power_strike(tok)
+
+def _ps_stale():
+    last = _ps_cache.get("updated_at")
+    if not last: return True
+    try:
+        t = datetime.strptime(last, "%H:%M:%S IST").replace(
+            year=ist_now().year, month=ist_now().month, day=ist_now().day, tzinfo=IST)
+        return (ist_now() - t).seconds > 300
+    except: return True
+
+@app.get("/api/powerstrike")
+def get_power_strike(x_client_id:str=Header(None), x_access_token:str=Header(None),
+                     refresh:bool=Query(False)):
+    cid = x_client_id or CREDS.get("client_id","")
+    tok = x_access_token or CREDS.get("access_token","")
+    if not cid or not tok: return {"status":"no_credentials","data":[]}
+    CREDS["client_id"]=cid; CREDS["access_token"]=tok
+    should_run = (refresh or _ps_stale()) and not _ps_lock.locked()
+    if should_run:
+        threading.Thread(target=_run_ps_locked, args=(tok,), daemon=True).start()
+    return _ps_cache
+
+@app.get("/api/powerstrike/bull")
+def ps_bull(x_client_id:str=Header(None),x_access_token:str=Header(None)):
+    return {"data":[x for x in _ps_cache["data"] if x["direction"]=="bull"]}
+
+@app.get("/api/powerstrike/bear")
+def ps_bear(x_client_id:str=Header(None),x_access_token:str=Header(None)):
+    return {"data":[x for x in _ps_cache["data"] if x["direction"]=="bear"]}
