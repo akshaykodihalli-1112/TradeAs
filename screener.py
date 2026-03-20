@@ -963,7 +963,8 @@ def _compute_breakout(tok):
     global _bk_cache
     if not SYMBOLS or not tok: return
     _bk_cache["status"] = "fetching"
-    headers = {"access-token": tok, "Content-Type": "application/json"}
+    cid = CREDS.get("client_id", "")
+    headers = {"access-token": tok, "client-id": cid, "Content-Type": "application/json"}
 
     now      = ist_now()
     today    = now.strftime("%Y-%m-%d")
