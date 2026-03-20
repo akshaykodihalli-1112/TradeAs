@@ -1061,6 +1061,7 @@ def _compute_breakout(tok):
                 "vol_confirmed": vol_confirmed,
                 "momentum_ok":   momentum_ok,
                 "todayVol":      today_vol,
+                "signal_time":   ist_now().strftime("%H:%M IST"),
             })
             time.sleep(0.3)
 
