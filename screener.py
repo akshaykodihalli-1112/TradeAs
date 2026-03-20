@@ -966,19 +966,7 @@ def _compute_breakout(tok):
     cid = CREDS.get("client_id", "")
     headers = {"access-token": tok, "client-id": cid, "Content-Type": "application/json"}
 
-    now      = ist_now()
-    today    = now.strftime("%Y-%m-%d")
-    # Intraday API requires datetime format with time
-    from_dt  = f"{today} 09:15:00"
-    to_dt    = f"{today} 15:30:00"
-
-    spot_map = {x["symbol"]: x["ltp"] for x in cache.get("data", [])}
-    vol_map  = {x["symbol"]: (x.get("todayVol",0), x.get("avgVol7d",0))
-                for x in cache.get("data", [])}
-
-    print(f"[bk] starting breakout scan for {len(SYMBOLS)} symbols, range {from_dt}→{to_dt}")
-
-    # Wait for screener data to be available (needed for spot prices)
+    # Wait for screener data
     wait = 0
     while not cache.get("data") and wait < 120:
         print(f"[bk] waiting for screener data... ({wait}s)")
@@ -987,119 +975,91 @@ def _compute_breakout(tok):
         print(f"[bk] screener data not available — aborting")
         _bk_cache["status"] = "idle"; return
 
-    spot_map = {x["symbol"]: x["ltp"] for x in cache.get("data", [])}
-    vol_map  = {x["symbol"]: (x.get("todayVol",0), x.get("avgVol7d",0))
-                for x in cache.get("data", [])}
-    print(f"[bk] spot_map has {len(spot_map)} entries, first 3: {list(spot_map.items())[:3]}")
+    vol_map = {x["symbol"]: (x.get("todayVol",0), x.get("avgVol7d",0))
+               for x in cache.get("data", [])}
+
+    print(f"[bk] starting breakout scan for {len(SYMBOLS)} symbols using quote OHLC...")
+
+    # Fetch today's OHLC via marketfeed/quote (already have access, same as screener)
+    id_map   = {s["security_id"]: s["symbol"] for s in SYMBOLS}
+    ohlc_map = {}
+
+    for i in range(0, len(SYMBOLS), 50):
+        batch = [int(s["security_id"]) for s in SYMBOLS[i:i+50]]
+        for attempt in range(3):
+            try:
+                r = requests.post(f"{DHAN_BASE}/v2/marketfeed/quote",
+                                  json={"NSE_EQ": batch}, headers=headers, timeout=15)
+                if r.status_code == 429: time.sleep(5*(attempt+1)); continue
+                if r.status_code != 200:
+                    print(f"[bk] quote batch {i} status={r.status_code}")
+                    break
+                for sid, q in r.json().get("data",{}).get("NSE_EQ",{}).items():
+                    sym = id_map.get(str(int(float(sid))))
+                    if sym:
+                        ohlc = q.get("ohlc", {})
+                        ohlc_map[sym] = {
+                            "open": float(ohlc.get("open", 0)),
+                            "high": float(ohlc.get("high", 0)),
+                            "low":  float(ohlc.get("low",  0)),
+                            "ltp":  float(q.get("last_price", 0)),
+                        }
+                break
+            except Exception as e:
+                print(f"[bk] quote error: {e}"); time.sleep(2)
+        time.sleep(1)
+
+    print(f"[bk] got OHLC for {len(ohlc_map)} symbols")
 
     results = []
-    skipped_no_ltp = 0
-    skipped_no_bars = 0
-    skipped_wide_range = 0
-    skipped_no_breakout = 0
-    api_errors = 0
-
     for sym_info in SYMBOLS:
-        sym = sym_info["symbol"]
-        ltp = spot_map.get(sym, 0)
-        if not ltp: continue
+        sym  = sym_info["symbol"]
+        ohlc = ohlc_map.get(sym)
+        if not ohlc or not ohlc["ltp"]: continue
 
-        try:
-            # Fetch intraday 1-min data — correct payload per Dhan docs
-            payload = {
-                "securityId":      str(sym_info["security_id"]),
-                "exchangeSegment": "NSE_EQ",
-                "instrument":      "EQUITY",
-                "interval":        "1",
-                "oi":              False,
-                "fromDate":        from_dt,
-                "toDate":          to_dt,
-            }
-            r = requests.post(f"{DHAN_BASE}/v2/charts/intraday",
-                              json=payload, headers=headers, timeout=10)
-            if r.status_code == 429:
-                print(f"[bk] {sym} 429 — sleeping 3s")
-                time.sleep(3); continue
-            if r.status_code != 200:
-                print(f"[bk] {sym} {r.status_code}: {r.text[:150]}")
-                continue
+        ltp       = ohlc["ltp"]
+        day_high  = ohlc["high"]
+        day_low   = ohlc["low"]
+        day_open  = ohlc["open"]
+        if not day_high or not day_low or not day_open: continue
 
-            d = r.json()
-            timestamps = d.get("timestamp", [])
-            highs      = d.get("high",  [])
-            lows       = d.get("low",   [])
-            volumes    = d.get("volume",[])
+        range_width = round((day_high - day_low) / day_low * 100, 2)
+        if range_width > 8: continue  # skip gappers
 
-            # Log first 3 symbols so we can see what data looks like
-            if len(results) == 0 and sym in [s["symbol"] for s in SYMBOLS[:3]]:
-                print(f"[bk] {sym} status={r.status_code} ts_count={len(timestamps)} keys={list(d.keys())}")
-                if timestamps:
-                    import datetime as dt_mod
-                    first_t = dt_mod.datetime.fromtimestamp(timestamps[0], IST).strftime("%H:%M")
-                    last_t  = dt_mod.datetime.fromtimestamp(timestamps[-1], IST).strftime("%H:%M")
-                    print(f"[bk] {sym} bars={len(timestamps)} first={first_t} last={last_t} h[0]={highs[0] if highs else 'n/a'}")
-                else:
-                    print(f"[bk] {sym} empty response: {str(d)[:200]}")
+        # Bullish: ltp within 0.5% of day high
+        # Bearish: ltp within 0.5% of day low
+        near_high = (day_high - ltp) / day_high * 100
+        near_low  = (ltp - day_low)  / day_low  * 100
 
-            if not timestamps:
-                continue
+        direction    = None
+        breakout_pct = 0.0
+        if near_high <= 0.5:
+            direction    = "bull"
+            breakout_pct = round((ltp - day_open) / day_open * 100, 2)
+        elif near_low <= 0.5:
+            direction    = "bear"
+            breakout_pct = round((ltp - day_open) / day_open * 100, 2)
 
-            # Extract opening range bars (9:15 to 10:00)
-            or_highs = []; or_lows = []; or_vols = []
-            for i, ts in enumerate(timestamps):
-                try:
-                    t = datetime.fromtimestamp(ts, IST).strftime("%H:%M")
-                    if RANGE_START <= t < RANGE_END:
-                        or_highs.append(highs[i])
-                        or_lows.append(lows[i])
-                        or_vols.append(volumes[i])
-                except: continue
+        if not direction: continue
 
-            if len(or_highs) < 3:
-                continue  # not enough bars yet
+        today_vol, avg_vol = vol_map.get(sym, (0, 0))
+        vol_ratio     = round(today_vol / avg_vol, 2) if avg_vol else 0
+        vol_confirmed = vol_ratio >= 1.5
+        momentum_ok   = abs(breakout_pct) >= 0.5
 
-            range_high  = max(or_highs)
-            range_low   = min(or_lows)
-            range_width = round((range_high - range_low) / range_low * 100, 2) if range_low else 0
-
-            # Skip stocks with very wide range (gappers — false signals)
-            if range_width > 5: continue
-
-            # Detect breakout
-            direction    = None
-            breakout_pct = 0.0
-            if ltp > range_high:
-                direction    = "bull"
-                breakout_pct = round((ltp - range_high) / range_high * 100, 2)
-            elif ltp < range_low:
-                direction    = "bear"
-                breakout_pct = round((ltp - range_low) / range_low * 100, 2)
-
-            if not direction: continue
-
-            # Volume + momentum confirmation
-            today_vol, avg_vol = vol_map.get(sym, (0, 0))
-            vol_ratio     = round(today_vol / avg_vol, 2) if avg_vol else 0
-            vol_confirmed = vol_ratio >= 1.5
-            momentum_ok   = abs(breakout_pct) >= 0.3
-
-            results.append({
-                "symbol":        sym,
-                "ltp":           ltp,
-                "rangeHigh":     round(range_high, 2),
-                "rangeLow":      round(range_low,  2),
-                "rangeWidth":    range_width,
-                "direction":     direction,
-                "breakoutPct":   breakout_pct,
-                "volRatio":      vol_ratio,
-                "vol_confirmed": vol_confirmed,
-                "momentum_ok":   momentum_ok,
-                "todayVol":      today_vol,
-            })
-            time.sleep(0.3)
-
-        except Exception as e:
-            print(f"[bk] {sym}: {e}"); continue
+        results.append({
+            "symbol":        sym,
+            "ltp":           ltp,
+            "rangeHigh":     round(day_high, 2),
+            "rangeLow":      round(day_low,  2),
+            "rangeWidth":    range_width,
+            "direction":     direction,
+            "breakoutPct":   breakout_pct,
+            "volRatio":      vol_ratio,
+            "vol_confirmed": vol_confirmed,
+            "momentum_ok":   momentum_ok,
+            "todayVol":      today_vol,
+        })
 
     results.sort(key=lambda x: abs(x["breakoutPct"]), reverse=True)
     _bk_cache.update({
