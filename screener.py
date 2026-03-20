@@ -965,13 +965,17 @@ def _compute_breakout(tok):
     _bk_cache["status"] = "fetching"
     headers = {"access-token": tok, "Content-Type": "application/json"}
 
-    now        = ist_now()
-    today      = now.strftime("%Y-%m-%d")
-    spot_map   = {x["symbol"]: x["ltp"] for x in cache.get("data", [])}
-    vol_map    = {x["symbol"]: (x.get("todayVol",0), x.get("avgVol7d",0))
-                  for x in cache.get("data", [])}
+    now      = ist_now()
+    today    = now.strftime("%Y-%m-%d")
+    # Intraday API requires datetime format with time
+    from_dt  = f"{today} 09:15:00"
+    to_dt    = f"{today} 15:30:00"
 
-    print(f"[bk] starting breakout scan for {len(SYMBOLS)} symbols...")
+    spot_map = {x["symbol"]: x["ltp"] for x in cache.get("data", [])}
+    vol_map  = {x["symbol"]: (x.get("todayVol",0), x.get("avgVol7d",0))
+                for x in cache.get("data", [])}
+
+    print(f"[bk] starting breakout scan for {len(SYMBOLS)} symbols, range {from_dt}→{to_dt}")
     results = []
 
     for sym_info in SYMBOLS:
@@ -980,28 +984,34 @@ def _compute_breakout(tok):
         if not ltp: continue
 
         try:
-            # Fetch intraday 1-min data for today
+            # Fetch intraday 1-min data — correct payload per Dhan docs
             payload = {
-                "securityId":      sym_info["security_id"],
+                "securityId":      str(sym_info["security_id"]),
                 "exchangeSegment": "NSE_EQ",
                 "instrument":      "EQUITY",
-                "expiryCode":      0,
-                "fromDate":        today,
-                "toDate":          today,
+                "interval":        "1",
+                "oi":              False,
+                "fromDate":        from_dt,
+                "toDate":          to_dt,
             }
             r = requests.post(f"{DHAN_BASE}/v2/charts/intraday",
                               json=payload, headers=headers, timeout=10)
-            if r.status_code == 429: time.sleep(3); continue
-            if r.status_code != 200: continue
+            if r.status_code == 429:
+                print(f"[bk] {sym} 429 — sleeping 3s")
+                time.sleep(3); continue
+            if r.status_code != 200:
+                if sym in ("RELIANCE", "INFY"):  # log just first couple
+                    print(f"[bk] {sym} {r.status_code}: {r.text[:150]}")
+                continue
 
             d = r.json()
             timestamps = d.get("timestamp", [])
-            opens      = d.get("open",  [])
             highs      = d.get("high",  [])
             lows       = d.get("low",   [])
             volumes    = d.get("volume",[])
 
-            if not timestamps: continue
+            if not timestamps:
+                continue
 
             # Extract opening range bars (9:15 to 10:00)
             or_highs = []; or_lows = []; or_vols = []
@@ -1014,18 +1024,18 @@ def _compute_breakout(tok):
                         or_vols.append(volumes[i])
                 except: continue
 
-            if len(or_highs) < 3: continue  # not enough bars yet
+            if len(or_highs) < 3:
+                continue  # not enough bars yet
 
-            range_high = max(or_highs)
-            range_low  = min(or_lows)
-            range_vol  = sum(or_vols)
+            range_high  = max(or_highs)
+            range_low   = min(or_lows)
             range_width = round((range_high - range_low) / range_low * 100, 2) if range_low else 0
 
-            # Skip stocks with very wide range (false signals)
+            # Skip stocks with very wide range (gappers — false signals)
             if range_width > 5: continue
 
             # Detect breakout
-            direction = None
+            direction    = None
             breakout_pct = 0.0
             if ltp > range_high:
                 direction    = "bull"
@@ -1036,26 +1046,24 @@ def _compute_breakout(tok):
 
             if not direction: continue
 
-            # Volume confirmation
+            # Volume + momentum confirmation
             today_vol, avg_vol = vol_map.get(sym, (0, 0))
-            vol_ratio    = round(today_vol / avg_vol, 2) if avg_vol else 0
+            vol_ratio     = round(today_vol / avg_vol, 2) if avg_vol else 0
             vol_confirmed = vol_ratio >= 1.5
-
-            # Momentum confirmation: breakout > 0.3%
-            momentum_ok = abs(breakout_pct) >= 0.3
+            momentum_ok   = abs(breakout_pct) >= 0.3
 
             results.append({
-                "symbol":       sym,
-                "ltp":          ltp,
-                "rangeHigh":    round(range_high, 2),
-                "rangeLow":     round(range_low,  2),
-                "rangeWidth":   range_width,
-                "direction":    direction,
-                "breakoutPct":  breakout_pct,
-                "volRatio":     vol_ratio,
+                "symbol":        sym,
+                "ltp":           ltp,
+                "rangeHigh":     round(range_high, 2),
+                "rangeLow":      round(range_low,  2),
+                "rangeWidth":    range_width,
+                "direction":     direction,
+                "breakoutPct":   breakout_pct,
+                "volRatio":      vol_ratio,
                 "vol_confirmed": vol_confirmed,
-                "momentum_ok":  momentum_ok,
-                "todayVol":     today_vol,
+                "momentum_ok":   momentum_ok,
+                "todayVol":      today_vol,
             })
             time.sleep(0.3)
 
