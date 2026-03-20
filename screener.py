@@ -977,7 +977,27 @@ def _compute_breakout(tok):
                 for x in cache.get("data", [])}
 
     print(f"[bk] starting breakout scan for {len(SYMBOLS)} symbols, range {from_dt}→{to_dt}")
+
+    # Wait for screener data to be available (needed for spot prices)
+    wait = 0
+    while not cache.get("data") and wait < 120:
+        print(f"[bk] waiting for screener data... ({wait}s)")
+        time.sleep(5); wait += 5
+    if not cache.get("data"):
+        print(f"[bk] screener data not available — aborting")
+        _bk_cache["status"] = "idle"; return
+
+    spot_map = {x["symbol"]: x["ltp"] for x in cache.get("data", [])}
+    vol_map  = {x["symbol"]: (x.get("todayVol",0), x.get("avgVol7d",0))
+                for x in cache.get("data", [])}
+    print(f"[bk] spot_map has {len(spot_map)} entries, first 3: {list(spot_map.items())[:3]}")
+
     results = []
+    skipped_no_ltp = 0
+    skipped_no_bars = 0
+    skipped_wide_range = 0
+    skipped_no_breakout = 0
+    api_errors = 0
 
     for sym_info in SYMBOLS:
         sym = sym_info["symbol"]
@@ -1001,8 +1021,7 @@ def _compute_breakout(tok):
                 print(f"[bk] {sym} 429 — sleeping 3s")
                 time.sleep(3); continue
             if r.status_code != 200:
-                if sym in ("RELIANCE", "INFY"):  # log just first couple
-                    print(f"[bk] {sym} {r.status_code}: {r.text[:150]}")
+                print(f"[bk] {sym} {r.status_code}: {r.text[:150]}")
                 continue
 
             d = r.json()
@@ -1010,6 +1029,17 @@ def _compute_breakout(tok):
             highs      = d.get("high",  [])
             lows       = d.get("low",   [])
             volumes    = d.get("volume",[])
+
+            # Log first 3 symbols so we can see what data looks like
+            if len(results) == 0 and sym in [s["symbol"] for s in SYMBOLS[:3]]:
+                print(f"[bk] {sym} status={r.status_code} ts_count={len(timestamps)} keys={list(d.keys())}")
+                if timestamps:
+                    import datetime as dt_mod
+                    first_t = dt_mod.datetime.fromtimestamp(timestamps[0], IST).strftime("%H:%M")
+                    last_t  = dt_mod.datetime.fromtimestamp(timestamps[-1], IST).strftime("%H:%M")
+                    print(f"[bk] {sym} bars={len(timestamps)} first={first_t} last={last_t} h[0]={highs[0] if highs else 'n/a'}")
+                else:
+                    print(f"[bk] {sym} empty response: {str(d)[:200]}")
 
             if not timestamps:
                 continue
@@ -1091,7 +1121,7 @@ def _bk_stale():
     try:
         t = datetime.strptime(last, "%H:%M:%S IST").replace(
             year=ist_now().year, month=ist_now().month, day=ist_now().day, tzinfo=IST)
-        return (ist_now() - t).seconds > 60
+        return (ist_now() - t).seconds > 300  # 5 min stale
     except: return True
 
 @app.get("/api/breakout")
