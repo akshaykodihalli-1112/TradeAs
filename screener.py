@@ -962,185 +962,277 @@ def opt_volspike(x_client_id:str=Header(None),x_access_token:str=Header(None)):
     return {"data":[x for x in _opt_cache["data"] if x["vol_spike"]]}
 
 # ── Breakout Scanner ────────────────────────────────────────────────────────────
+# Strategy:
+#   Opening range  = 9:15 to 9:45 merged into one range
+#                    range_high = MAX high of all 1-min candles 9:15–9:45
+#                    range_low  = MIN low  of all 1-min candles 9:15–9:45
+#
+#   LIVE (9:50 candle CLOSE-based):
+#     9:50 close > range_high  → Bull breakout
+#     9:50 close < range_low   → Bear breakdown
+#
+#   CLOSED market (first close-based break after 9:45):
+#     Walk candles after 9:45 — first candle whose CLOSE > range_high or < range_low
+# ─────────────────────────────────────────────────────────────────────────────────
 _bk_cache = {"data": [], "updated_at": None, "status": "idle", "market_open": False}
 _bk_lock  = threading.Lock()
 
-RANGE_START = "09:15"  # Opening range start
-RANGE_END   = "10:00"  # Opening range end (45 min)
+RANGE_START  = "09:15"   # First candle included in range
+RANGE_END    = "09:45"   # Last  candle included in range (inclusive)
+CONFIRM_TIME = "09:50"   # Live: the candle whose CLOSE confirms the breakout
+
+def _last_trading_day() -> str:
+    """Return the most recent NSE trading day (Mon–Fri) as YYYY-MM-DD."""
+    d = ist_now()
+    if is_market_open():
+        return d.strftime("%Y-%m-%d")
+    # If today is a weekday and past 9:15 (market has traded today)
+    if d.weekday() < 5 and (d.hour > 9 or (d.hour == 9 and d.minute >= 15)):
+        return d.strftime("%Y-%m-%d")
+    # Step back to last weekday
+    d -= timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d.strftime("%Y-%m-%d")
+
 
 def _compute_breakout(tok):
     global _bk_cache
     if not SYMBOLS or not tok: return
     _bk_cache["status"] = "fetching"
-    cid = CREDS.get("client_id", "")
-    headers = {"access-token": tok, "client-id": cid, "Content-Type": "application/json"}
 
-    now     = ist_now()
-    today   = now.strftime("%Y-%m-%d")
-    from_dt = f"{today} 09:15:00"
-    to_dt   = f"{today} 15:30:00"
+    cid         = CREDS.get("client_id", "")
+    headers     = {"access-token": tok, "client-id": cid, "Content-Type": "application/json"}
+    market_open = is_market_open()
+    today       = _last_trading_day()
+    from_dt     = f"{today} 09:15:00"
+    to_dt       = f"{today} 15:30:00"
 
-    # Wait for screener data
+    print(f"[bk] date={today} mode={'LIVE' if market_open else 'CLOSED'} "
+          f"range={RANGE_START}-{RANGE_END} confirm={CONFIRM_TIME+' close' if market_open else 'all-day close'}")
+
+    # Wait up to 2 min for screener data (vol ratios)
     wait = 0
     while not cache.get("data") and wait < 120:
         print(f"[bk] waiting for screener data... ({wait}s)")
         time.sleep(5); wait += 5
-    if not cache.get("data"):
-        print(f"[bk] screener data not available — aborting")
-        _bk_cache["status"] = "idle"; return
 
-    spot_map = {x["symbol"]: x["ltp"] for x in cache.get("data", [])}
-    vol_map  = {x["symbol"]: (x.get("todayVol",0), x.get("avgVol7d",0))
-                for x in cache.get("data", [])}
+    vol_map = {x["symbol"]: (x.get("todayVol", 0), x.get("avgVol7d", 0))
+               for x in cache.get("data", [])}
 
-    print(f"[bk] starting breakout scan for {len(SYMBOLS)} symbols...")
-    results = []
+    print(f"[bk] scanning {len(SYMBOLS)} symbols...")
+    results      = []
+    ok_count     = 0
+    no_range     = 0
+    no_break     = 0
+    empty_count  = 0
 
     for sym_info in SYMBOLS:
         sym = sym_info["symbol"]
-        ltp = spot_map.get(sym, 0)
-        if not ltp: continue
-
         try:
-            payload = {
-                "securityId":      str(sym_info["security_id"]),
-                "exchangeSegment": "NSE_EQ",
-                "instrument":      "EQUITY",
-                "interval":        "1",
-                "oi":              False,
-                "fromDate":        from_dt,
-                "toDate":          to_dt,
-            }
-            r = requests.post(f"{DHAN_BASE}/v2/charts/intraday",
-                              json=payload, headers=headers, timeout=10)
+            r = requests.post(
+                f"{DHAN_BASE}/v2/charts/intraday",
+                json={"securityId": str(sym_info["security_id"]),
+                      "exchangeSegment": "NSE_EQ", "instrument": "EQUITY",
+                      "interval": "1", "oi": False,
+                      "fromDate": from_dt, "toDate": to_dt},
+                headers=headers, timeout=10)
+
             if r.status_code == 429:
-                print(f"[bk] {sym} 429 — sleeping 3s"); time.sleep(3); continue
+                print(f"[bk] {sym} 429 — sleeping 5s"); time.sleep(5); continue
             if r.status_code != 200: continue
 
             d          = r.json()
             timestamps = d.get("timestamp", [])
-            highs      = d.get("high",  [])
-            lows       = d.get("low",   [])
-            closes     = d.get("close", [])
-            volumes    = d.get("volume",[])
-            if not timestamps: continue
+            highs      = d.get("high",   [])
+            lows       = d.get("low",    [])
+            closes     = d.get("close",  [])
+            volumes    = d.get("volume", [])
 
-            # ── Opening Range 9:15–10:00 ──────────────────────────────────
-            or_highs = []; or_lows = []
+            if not timestamps:
+                empty_count += 1; continue
+
+            # ── Step 1: Build opening range 9:15–9:45 ────────────────────
+            # Merge all 1-min candles from 9:15 to 9:45 (inclusive) into
+            # a single range.  range_high = max of all highs,
+            #                  range_low  = min of all lows.
+            range_highs = []
+            range_lows  = []
+            range_ref   = None   # close of the 9:45 candle
+
             for i, ts in enumerate(timestamps):
-                try:
-                    t = datetime.fromtimestamp(ts, IST).strftime("%H:%M")
-                    if RANGE_START <= t < RANGE_END:
-                        or_highs.append(highs[i])
-                        or_lows.append(lows[i])
-                except: continue
+                t = datetime.fromtimestamp(ts, IST).strftime("%H:%M")
+                if RANGE_START <= t <= RANGE_END:
+                    range_highs.append(highs[i])
+                    range_lows.append(lows[i])
+                    range_ref = closes[i]   # last assignment = 9:45 close
 
-            if len(or_highs) < 3: continue
-            range_high  = max(or_highs)
-            range_low   = min(or_lows)
-            range_width = round((range_high - range_low) / range_low * 100, 2) if range_low else 0
-            if range_width > 5: continue
+            if len(range_highs) < 2:        # need at least a few candles
+                no_range += 1; continue
+            if range_ref is None or range_ref <= 0:
+                no_range += 1; continue
 
-            # ── Find EXACT time breakout first triggered ──────────────────
-            # Walk candles after 10:00 — first candle to break range
+            range_high = round(max(range_highs), 2)
+            range_low  = round(min(range_lows),  2)
+            range_ref  = round(range_ref, 2)
+
+            # ── Step 2: Detect close-based breakout ──────────────────────
+            #
+            # LIVE   → check ONLY the 9:50 candle CLOSE
+            #          close > range_high → bull
+            #          close < range_low  → bear
+            #
+            # CLOSED → walk candles AFTER 9:45, find FIRST close-based break
+
             signal_time  = None
             signal_price = 0.0
             signal_pct   = 0.0
             direction    = None
-            breakout_pct = 0.0
+            ltp          = range_ref   # updated to last close seen
 
             for i, ts in enumerate(timestamps):
-                try:
-                    t = datetime.fromtimestamp(ts, IST).strftime("%H:%M")
-                    if t < RANGE_END: continue  # skip opening range candles
-                    if direction: break          # already found signal
+                t = datetime.fromtimestamp(ts, IST).strftime("%H:%M")
+                if t <= RANGE_END: continue          # skip range candles
 
-                    if highs[i] > range_high:
+                ltp = closes[i]                       # track latest price
+
+                if market_open:
+                    # ── LIVE: only the 9:50 candle's CLOSE matters ───────
+                    if t != CONFIRM_TIME: continue
+                    if closes[i] > range_high:
                         direction    = "bull"
                         signal_time  = t
-                        signal_price = round(highs[i], 2)
-                        signal_pct   = round((highs[i] - range_high) / range_high * 100, 2)
-                        breakout_pct = round((ltp - range_high) / range_high * 100, 2)
-                    elif lows[i] < range_low:
+                        signal_price = round(closes[i], 2)
+                        signal_pct   = round((closes[i] - range_high) / range_high * 100, 2)
+                    elif closes[i] < range_low:
                         direction    = "bear"
                         signal_time  = t
-                        signal_price = round(lows[i], 2)
-                        signal_pct   = round((lows[i] - range_low) / range_low * 100, 2)
-                        breakout_pct = round((ltp - range_low) / range_low * 100, 2)
-                except: continue
+                        signal_price = round(closes[i], 2)
+                        signal_pct   = round((closes[i] - range_low) / range_low * 100, 2)
+                    break   # only one candle checked in live mode
 
-            if not direction: continue
+                else:
+                    # ── CLOSED: first candle whose CLOSE breaks range ────
+                    if direction is None:
+                        if closes[i] > range_high:
+                            direction    = "bull"
+                            signal_time  = t
+                            signal_price = round(closes[i], 2)
+                            signal_pct   = round((closes[i] - range_high) / range_high * 100, 2)
+                        elif closes[i] < range_low:
+                            direction    = "bear"
+                            signal_time  = t
+                            signal_price = round(closes[i], 2)
+                            signal_pct   = round((closes[i] - range_low) / range_low * 100, 2)
+
+            if not direction:
+                no_break += 1; continue
+
+            # current move from range reference
+            if direction == "bull":
+                current_pct = round((ltp - range_high) / range_high * 100, 2)
+            else:
+                current_pct = round((ltp - range_low) / range_low * 100, 2)
 
             today_vol, avg_vol = vol_map.get(sym, (0, 0))
-            vol_ratio     = round(today_vol / avg_vol, 2) if avg_vol else 0
+            vol_ratio     = round(today_vol / avg_vol, 2) if avg_vol else 0.0
             vol_confirmed = vol_ratio >= 1.5
-            momentum_ok   = abs(breakout_pct) >= 0.3
+            ok_count     += 1
 
             results.append({
                 "symbol":        sym,
-                "ltp":           ltp,
-                "rangeHigh":     round(range_high, 2),
-                "rangeLow":      round(range_low, 2),
-                "rangeWidth":    range_width,
+                "ltp":           round(ltp, 2),
+                "rangeHigh":     range_high,
+                "rangeLow":      range_low,
+                "rangeRef":      range_ref,
                 "direction":     direction,
-                "breakoutPct":   breakout_pct,   # current % from range
-                "signalPct":     signal_pct,      # % at exact signal candle
-                "signal_price":  signal_price,    # price when it first broke
-                "signal_time":   signal_time,     # e.g. "09:25"
+                "signal_time":   signal_time,
+                "signal_price":  signal_price,
+                "signalPct":     signal_pct,    # % move on breakout candle
+                "current_pct":   current_pct,   # current % from range
                 "volRatio":      vol_ratio,
                 "vol_confirmed": vol_confirmed,
-                "momentum_ok":   momentum_ok,
                 "todayVol":      today_vol,
+                "mode":          "live" if market_open else "closed",
             })
-            time.sleep(0.3)
+            time.sleep(0.25)
 
         except Exception as e:
             print(f"[bk] {sym}: {e}"); continue
 
-    results.sort(key=lambda x: abs(x["breakoutPct"]), reverse=True)
+    print(f"[bk] done: ok={ok_count} no_range={no_range} no_break={no_break} empty={empty_count}")
+
+    results.sort(key=lambda x: abs(x["current_pct"]), reverse=True)
     _bk_cache.update({
-        "data":        results,
-        "updated_at":  ist_now().strftime("%H:%M:%S IST"),
-        "status":      "ok",
-        "count":       len(results),
-        "market_open": is_market_open(),
-        "range_end":   RANGE_END,
+        "data":         results,
+        "updated_at":   ist_now().strftime("%H:%M:%S IST"),
+        "status":       "ok",
+        "count":        len(results),
+        "bulls":        sum(1 for r in results if r["direction"] == "bull"),
+        "bears":        sum(1 for r in results if r["direction"] == "bear"),
+        "vol_confirmed":sum(1 for r in results if r["vol_confirmed"]),
+        "market_open":  market_open,
+        "mode":         "live" if market_open else "closed",
+        "trading_date": today,
+        "range_start":  RANGE_START,
+        "range_end":    RANGE_END,
+        "confirm_time": CONFIRM_TIME if market_open else "all-day",
     })
-    print(f"[bk] done — {len(results)} breakouts found")
+    print(f"[bk] {len(results)} breakouts "
+          f"({_bk_cache['bulls']} bull / {_bk_cache['bears']} bear) mode={'LIVE' if market_open else 'CLOSED'}")
+
 
 def _run_bk_locked(tok):
     with _bk_lock: _compute_breakout(tok)
 
+
 def _bk_stale():
+    """Stale if: no data, different trading day, or older than 5 min (live) / 1 hr (closed)."""
+    if not _bk_cache.get("updated_at"):
+        return True
+    cached_date = _bk_cache.get("trading_date", "")
+    if cached_date and cached_date != _last_trading_day():
+        return True
     last = _bk_cache.get("updated_at")
-    if not last: return True
     try:
         t = datetime.strptime(last, "%H:%M:%S IST").replace(
             year=ist_now().year, month=ist_now().month, day=ist_now().day, tzinfo=IST)
-        return (ist_now() - t).seconds > 300  # 5 min stale
-    except: return True
+        threshold = 300 if is_market_open() else 3600
+        return (ist_now() - t).seconds > threshold
+    except:
+        return True
+
 
 @app.get("/api/breakout")
-def get_breakout(x_client_id:str=Header(None), x_access_token:str=Header(None),
-                 refresh:bool=Query(False)):
-    cid = x_client_id or CREDS.get("client_id","")
-    tok = x_access_token or CREDS.get("access_token","")
-    if not cid or not tok: return {"status":"no_credentials","data":[]}
-    CREDS["client_id"]=cid; CREDS["access_token"]=tok
+def get_breakout(x_client_id: str = Header(None), x_access_token: str = Header(None),
+                 refresh: bool = Query(False)):
+    cid = x_client_id or CREDS.get("client_id", "")
+    tok = x_access_token or CREDS.get("access_token", "")
+    if not cid or not tok:
+        return {"status": "no_credentials", "data": []}
+    CREDS["client_id"] = cid; CREDS["access_token"] = tok
 
-    now = ist_now()
-    # Only scan after opening range is complete (after 10:00 IST)
-    range_complete = now.replace(hour=10, minute=0, second=0, microsecond=0)
+    now         = ist_now()
     market_open = is_market_open()
 
-    if market_open and now < range_complete:
-        mins_left = int((range_complete - now).seconds / 60)
-        return {"status":"waiting", "data":[], "market_open":True,
-                "message":f"Opening range not complete yet — {mins_left} min remaining",
-                "range_end": RANGE_END}
+    # Live: wait until 9:50 candle is available (i.e. current time >= 9:51)
+    if market_open:
+        ready_at = now.replace(hour=9, minute=51, second=0, microsecond=0)
+        if now < ready_at:
+            mins_left = max(1, int((ready_at - now).seconds / 60))
+            return {
+                "status":      "waiting",
+                "data":        [],
+                "market_open": True,
+                "message":      f"Building 9:15–9:45 range, waiting for 9:50 close — {mins_left} min left",
+                "range_start":  RANGE_START,
+                "range_end":    RANGE_END,
+                "confirm_time": CONFIRM_TIME,
+            }
 
-    should_run = (refresh or _bk_stale()) and not _bk_lock.locked()
-    if should_run and (market_open or refresh):
+    # Run if: forced refresh, stale, or no data yet
+    should_run = (refresh or _bk_stale() or not _bk_cache.get("data")) and not _bk_lock.locked()
+    if should_run:
         threading.Thread(target=_run_bk_locked, args=(tok,), daemon=True).start()
 
     return _bk_cache
