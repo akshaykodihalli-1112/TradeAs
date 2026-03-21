@@ -285,6 +285,8 @@ def get_all_quotes(tok):
     id_map  = {s["security_id"]:s["symbol"] for s in SYMBOLS}
     quotes  = {}
     _logged = False
+    _last_err = ""
+
     for i in range(0, len(SYMBOLS), 50):
         batch   = [int(s["security_id"]) for s in SYMBOLS[i:i+50]]
         payload = {"NSE_EQ": batch}
@@ -303,11 +305,14 @@ def get_all_quotes(tok):
                     for sid, q in raw.items():
                         sym = id_map.get(str(int(float(sid))))
                         if sym:
-                            ohlc = q.get("ohlc", {})
-                            ltp  = float(q.get("last_price", 0))
+                            ohlc       = q.get("ohlc", {})
+                            ltp        = float(q.get("last_price", 0))
+                            # ohlc.close = previous day's close (settled price)
+                            # This IS available from Dhan quote API — use it for change%
+                            prev_close = round(float(ohlc.get("close", 0)), 2)
                             quotes[sym] = {
                                 "ltp":        round(ltp, 2),
-                                "prev_close": 0,  # not available from Dhan quote API
+                                "prev_close": prev_close,
                                 "volume":     int(q.get("volume", 0)),
                                 "open":       round(float(ohlc.get("open", 0)), 2),
                                 "high":       round(float(ohlc.get("high", 0)), 2),
@@ -317,14 +322,73 @@ def get_all_quotes(tok):
                 elif r.status_code == 429:
                     time.sleep(5 * (attempt + 1))
                 else:
+                    # Log the actual error body so we can see WHY it failed
+                    try:
+                        _last_err = r.text[:300]
+                    except:
+                        _last_err = f"HTTP {r.status_code}"
+                    print(f"  quote non-200: {r.status_code} | {_last_err}")
                     break
             except Exception as e:
                 print(f"  quote err: {e}"); time.sleep(2)
         time.sleep(1.2)
+
     missing=[s["symbol"] for s in SYMBOLS if s["symbol"] not in quotes]
     print(f"[quotes] got={len(quotes)} missing={len(missing)} sample={missing[:5]}")
+    if _last_err:
+        print(f"[quotes] last API error: {_last_err}")
     cache["debug"]={"quotes_fetched":len(quotes),"missing_count":len(missing),
-                    "missing_sample":missing[:10]}
+                    "missing_sample":missing[:10],"last_api_error":_last_err}
+
+    # ── Fallback: if quote API returned nothing, try LTP endpoint ──────────────
+    # Dhan's /v2/marketfeed/ltp works even after market hours and on weekends.
+    if not quotes:
+        print(f"[quotes] quote API returned 0 results — falling back to LTP endpoint...")
+        quotes = _get_all_ltp(tok, id_map, headers)
+        if quotes:
+            cache["debug"]["fallback_used"] = "ltp"
+            cache["debug"]["quotes_fetched"] = len(quotes)
+            cache["debug"]["missing_count"]  = len([s for s in SYMBOLS if s["symbol"] not in quotes])
+
+    return quotes
+
+
+def _get_all_ltp(tok, id_map, headers):
+    """
+    Fallback quotes via /v2/marketfeed/ltp — available 24/7, returns last traded price.
+    Does NOT include ohlc, so prev_close must come from historical data.
+    """
+    quotes = {}
+    for i in range(0, len(SYMBOLS), 100):
+        batch   = [int(s["security_id"]) for s in SYMBOLS[i:i+100]]
+        payload = {"NSE_EQ": batch}
+        for attempt in range(3):
+            try:
+                r = requests.post(f"{DHAN_BASE}/v2/marketfeed/ltp",
+                                  json=payload, headers=headers, timeout=15)
+                print(f"  ltp i={i} → {r.status_code}")
+                if r.status_code == 200:
+                    raw = r.json().get("data", {}).get("NSE_EQ", {})
+                    for sid, q in raw.items():
+                        sym = id_map.get(str(int(float(sid))))
+                        if sym:
+                            ltp = float(q.get("last_price", 0) or q.get("ltp", 0))
+                            quotes[sym] = {
+                                "ltp":        round(ltp, 2),
+                                "prev_close": 0,  # not in LTP response — will come from historical
+                                "volume":     int(q.get("volume", 0)),
+                                "open": 0, "high": 0, "low": 0,
+                            }
+                    break
+                elif r.status_code == 429:
+                    time.sleep(5 * (attempt + 1))
+                else:
+                    print(f"  ltp non-200: {r.status_code} | {r.text[:200]}")
+                    break
+            except Exception as e:
+                print(f"  ltp err: {e}"); time.sleep(2)
+        time.sleep(0.8)
+    print(f"[ltp] fallback got={len(quotes)}")
     return quotes
 
 def get_historical(security_id, tok):
@@ -425,15 +489,18 @@ def run_screener(tok):
         cache.update({"status": "fetching", "progress": 5, "total": total, "market_open": False})
 
         quotes = get_all_quotes(tok)
+        # On weekends / after hours the quote API may return empty — don't hard-fail.
+        # Historical data alone is enough to compute change% and volume ratios.
         if not quotes:
-            cache.update({"status": "error", "errors": ["0 quotes returned"]}); return
+            print(f"[screener] quote API returned 0 — will rely entirely on historical data")
+            cache.update({"status": "fetching", "errors": ["quote API empty — using historical only"]})
         cache["progress"] = 20
 
-        # Historical is the ONLY source for prev_close after market close
-        # Dhan quote API has no prev_close field — ohlc.close = today's close
-        print(f"[screener] fetching historical for prev_close...")
+        # Historical provides prev_close, momentum, and vol ratio.
+        # Fetch for ALL symbols — even if quotes is empty (weekend/after-hours).
+        print(f"[screener] fetching historical for prev_close + momentum...")
         hist_data = {}
-        syms = [s for s in SYMBOLS if s["symbol"] in quotes]
+        syms = SYMBOLS  # fetch historical for everyone, not just quote-matched
         for i, sym in enumerate(syms):
             hist = get_historical(sym["security_id"], tok)
             if hist:
@@ -451,46 +518,53 @@ def run_screener(tok):
             try:
                 q    = quotes.get(sym["symbol"])
                 hist = hist_data.get(sym["symbol"])
-                if not q:
-                    skipped.append(f"{sym['symbol']}:no_quote"); continue
 
-                ltp = q["ltp"]  # today's close from quote API
+                # ── Determine LTP ──────────────────────────────────────────────
+                if q:
+                    ltp = q["ltp"]
+                elif hist and hist.get("close"):
+                    # No quote data (weekend/after-hours) — use last historical close
+                    ltp = hist["close"][-1]
+                else:
+                    skipped.append(f"{sym['symbol']}:no_ltp"); continue
 
+                if not ltp:
+                    skipped.append(f"{sym['symbol']}:ltp=0"); continue
+
+                # ── Determine prev_close ───────────────────────────────────────
+                if q and q.get("prev_close"):
+                    # ohlc.close from quote API = previous day's settled price ✓
+                    prev_close = q["prev_close"]
+                elif hist and hist.get("close") and len(hist["close"]) >= 2:
+                    closes = hist["close"]
+                    # If last hist close ≈ ltp, today is included → use [-2]
+                    if abs(closes[-1] - ltp) / max(ltp, 0.01) < 0.001:
+                        prev_close = closes[-2]
+                    else:
+                        prev_close = closes[-1]
+                # ── Compute change%, momentum, vol ratio from historical ────────
+                chg_pct = round((ltp - prev_close) / prev_close * 100, 2) if prev_close else 0.0
+
+                mom5d = 0.0; vol_ratio = 0.0; avg_vol7d = 0
                 if hist:
                     closes  = hist.get("close",  [])
                     volumes = hist.get("volume", [])
-
-                    # Dhan DOES include today's bar in historical after market close.
-                    # Confirmed from logs: last3=[270.0, 264.15, 259.25] and ltp=259.25
-                    # So closes[-1] == ltp (today) and closes[-2] == yesterday.
-                    # Strategy: if closes[-1] matches ltp closely, today is included.
+                    # Build ref_closes: includes today
                     if closes and abs(closes[-1] - ltp) / max(ltp, 0.01) < 0.001:
-                        # Today IS in historical — use closes[-2] as prev_close
-                        prev_close = closes[-2] if len(closes) >= 2 else 0
-                        ref_closes = closes  # today already appended by Dhan
+                        ref_closes = closes
                     else:
-                        # Today NOT in historical — closes[-1] is yesterday
-                        prev_close = closes[-1] if closes else 0
-                        ref_closes = closes + [ltp]  # append today manually
+                        ref_closes = closes + [ltp]
 
-                    chg_pct = round((ltp - prev_close) / prev_close * 100, 2) if prev_close else 0.0
-
-                    # Momentum 5D — use last 6 values of ref_closes
-                    mom5d = 0.0
                     if len(ref_closes) >= 6:
                         c5 = ref_closes[-6]
                         if c5: mom5d = round((ltp - c5) / c5 * 100, 2)
 
-                    # Volume ratio — avg of 7 days before today
-                    vol_ratio = 0.0; avg_vol7d = 0
+                    today_vol = (q["volume"] if q else 0)
                     if len(volumes) >= 8:
                         avg_vol7d = int(sum(volumes[-8:-1]) / 7)
-                        vol_ratio = round(q["volume"] / avg_vol7d, 2) if avg_vol7d else 0.0
-                else:
-                    prev_close = 0.0; chg_pct = 0.0; mom5d = 0.0
-                    vol_ratio = 0.0; avg_vol7d = 0
+                        vol_ratio = round(today_vol / avg_vol7d, 2) if avg_vol7d else 0.0
 
-                print(f"[close] {sym['symbol']} ltp={ltp} prev={prev_close} chg={chg_pct}% ref_len={len(ref_closes) if hist else 0}") if sym["symbol"] in ("ANGELONE","SAIL","MANAPPURAM","RELIANCE") else None
+                print(f"[close] {sym['symbol']} ltp={ltp} prev={prev_close} chg={chg_pct}%") if sym["symbol"] in ("ANGELONE","SAIL","MANAPPURAM","RELIANCE") else None
 
                 results.append({
                     "symbol":      sym["symbol"], "exchange": "NSE",
