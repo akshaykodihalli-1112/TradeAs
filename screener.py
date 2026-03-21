@@ -1305,20 +1305,25 @@ def _compute_power_strike(tok):
         today_vol = row.get("todayVol", 0)
         avg_vol   = row.get("avgVol7d", 0)
         if not ltp: continue
-        if abs(change) < 2.5: continue
-        if vol_ratio < 1.5:   continue
+        # Relaxed thresholds when market closed — use settled daily data
+        chg_min = 1.0 if not market_open else 2.5
+        vol_min  = 1.0 if not market_open else 1.5
+        if abs(change) < chg_min: continue
+        if vol_ratio < vol_min:   continue
 
         direction = "bull" if change > 0 else "bear"
         momentum_confirms = (direction == "bull" and mom5d > -5) or \
                             (direction == "bear" and mom5d < 5)
 
         eq_score = 0
-        if abs(change) >= 2.5:  eq_score += 1
-        if abs(change) >= 4.0:  eq_score += 1
-        if vol_ratio >= 2.0:    eq_score += 1
-        if vol_ratio >= 3.0:    eq_score += 1
+        if abs(change) >= 1.0:  eq_score += 1   # any move
+        if abs(change) >= 2.5:  eq_score += 1   # decent
+        if abs(change) >= 4.0:  eq_score += 1   # strong
+        if vol_ratio >= 1.5:    eq_score += 1
+        if vol_ratio >= 2.5:    eq_score += 1
         if momentum_confirms:   eq_score += 1
-        if eq_score < 2: continue
+        min_eq = 2 if market_open else 1
+        if eq_score < min_eq: continue
 
         strike_step = 50 if ltp >= 500 else 25 if ltp >= 100 else 10
         atm_base    = round(ltp / strike_step) * strike_step
@@ -1439,21 +1444,20 @@ def _compute_next_day(tok):
         avg_vol   = row.get("avgVol7d", 0)
         if not ltp: continue
 
-        # Next Day filters:
-        # 1. Move ≥ 2.0% (lower bar — continuation plays)
-        # 2. Vol ≥ 1.5× (institutional conviction)
-        # 3. Move ≤ 8% (skip exhaustion/gap candidates)
-        # 4. 5D momentum aligned with today's direction
-        if abs(change) < 2.0: continue
-        if vol_ratio < 1.5:   continue
+        # Next Day filters — relaxed when market closed
+        _mo = is_market_open()
+        chg_min_nd = 1.0 if not _mo else 2.0
+        vol_min_nd  = 1.0 if not _mo else 1.5
+        if abs(change) < chg_min_nd: continue
+        if vol_ratio < vol_min_nd:   continue
         if abs(change) > 8.0: continue
 
         direction = "bull" if change > 0 else "bear"
 
-        # Momentum must align for next-day continuation
-        mom_aligned = (direction == "bull" and mom5d >= 0) or \
-                      (direction == "bear" and mom5d <= 0)
-        if not mom_aligned: continue
+        if _mo:
+            mom_aligned = (direction == "bull" and mom5d >= 0) or \
+                          (direction == "bear" and mom5d <= 0)
+            if not mom_aligned: continue
 
         score = 0
         if abs(change) >= 2.0:   score += 1
@@ -1602,8 +1606,8 @@ _OIS_SECTOR_MAP = {
     "HAVELLS":"Consumer","VGUARD":"Consumer","POLYCAB":"Consumer",
     "CROMPTON":"Consumer","VOLTAS":"Consumer",
 }
-_OIS_AVOID_BEAR  = {"FMCG", "Pharma"}   # never buy PE on these
-_OIS_AVOID_BULL  = {"Pharma"}           # usually avoid CE on Pharma too
+_OIS_AVOID_BEAR  = set()   # no sector exclusions
+_OIS_AVOID_BULL  = set()   # no sector exclusions
 _OIS_SCORE_MIN   = 50                   # filter threshold
 _OIS_SCORE_HIGH  = 75                   # high-probability threshold
 
@@ -1691,13 +1695,10 @@ def _ois_compute_score(row: dict, opt_data: dict) -> int:
     score += 20 if itm["moneyness"] == "ITM" else 8
 
     # ── Factor 3: Sector + Move Size (20 pts) ──────────────────────────────
-    avoid = _OIS_AVOID_BEAR if direction == "bear" else _OIS_AVOID_BULL
-    if sector not in avoid:
-        if change >= 4.0:    score += 20
-        elif change >= 2.5:  score += 15
-        elif change >= 1.5:  score += 10
-    else:
-        score += 5   # defensive sector — partial only
+    # Factor 3: all sectors included
+    if change >= 4.0:    score += 20
+    elif change >= 2.5:  score += 15
+    elif change >= 1.5:  score += 10
 
     # ── Factor 4: PCR + OI Change Alignment (20 pts) ──────────────────────
     if direction == "bull":
@@ -1724,33 +1725,43 @@ def _compute_ois(tok: str):
     """
     global _ois_cache
     _ois_cache["status"] = "fetching"
-    print(f"[ois] starting OI Strategy scan...")
+    market_open = is_market_open()
+    print(f"[ois] starting OI Strategy scan... market_open={market_open}")
 
-    # Wait up to 3 min for Power Strike enriched data
-    wait = 0
-    while not _ps_cache.get("data") and wait < 180:
-        print(f"[ois] waiting for Power Strike data... ({wait}s)")
-        time.sleep(5); wait += 5
+    source_data = []
 
-    source_data = _ps_cache.get("data", [])
+    if market_open:
+        # Live market: wait for Power Strike which has option chain data
+        wait = 0
+        while not _ps_cache.get("data") and wait < 180:
+            print(f"[ois] waiting for Power Strike data... ({wait}s)")
+            time.sleep(5); wait += 5
+        source_data = _ps_cache.get("data", [])
+        if not source_data:
+            print(f"[ois] no PS data live — using screener cache")
 
-    # Fallback: if PS never ran, build candidates directly from screener cache
+    # Closed market OR live fallback — build from screener cache directly
+    # Lower thresholds: settled daily data, not intraday spikes
     if not source_data:
-        print(f"[ois] no PS data — building from screener cache directly")
+        chg_min = 0.5 if not market_open else 1.5
+        vol_min  = 0.5 if not market_open else 1.2
         for row in cache.get("data", []):
             chg = row.get("change", 0)
             vr  = row.get("volumeRatio", 0)
-            if abs(chg) >= 1.5 and vr >= 1.2:
-                source_data.append({
-                    **row,
-                    "direction":  "bull" if chg > 0 else "bear",
-                    "opt_data":   {},
-                    "opt_score":  0,
-                    "eq_score":   2,
-                    "strikes":    [],
-                    "volRatio":   vr,
-                })
-
+            ltp = row.get("ltp", 0)
+            if not ltp: continue
+            if abs(chg) < chg_min: continue
+            if vr < vol_min: continue
+            source_data.append({
+                **row,
+                "direction":  "bull" if chg > 0 else "bear",
+                "opt_data":   {},
+                "opt_score":  0,
+                "eq_score":   2 if abs(chg) >= 2.5 else 1,
+                "strikes":    [],
+                "volRatio":   vr,
+            })
+        print(f"[ois] screener fallback: {len(source_data)} candidates")
     print(f"[ois] scoring {len(source_data)} candidates...")
     results = []
 
