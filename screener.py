@@ -997,25 +997,30 @@ def _compute_breakout(tok):
     cid     = CREDS.get("client_id", "")
     headers = {"access-token": tok, "client-id": cid, "Content-Type": "application/json"}
     now     = ist_now()
-    today   = _last_trading_day()          # ← last trading day, not always today
+    today   = _last_trading_day()
+    # Dhan intraday accepts "YYYY-MM-DD HH:MM:SS" format
     from_dt = f"{today} 09:15:00"
     to_dt   = f"{today} 15:30:00"
-    print(f"[bk] using trading date: {today} (today={now.strftime('%Y-%m-%d %a')})")
+    print(f"[bk] trading date={today} now={now.strftime('%Y-%m-%d %H:%M %a')}")
 
-    # Wait for screener data (gives us today's volume for ratio calc)
+    # Wait for screener data
     wait = 0
     while not cache.get("data") and wait < 120:
         print(f"[bk] waiting for screener data... ({wait}s)")
         time.sleep(5); wait += 5
     if not cache.get("data"):
-        print(f"[bk] screener data not available — aborting")
+        print(f"[bk] no screener data — aborting")
         _bk_cache["status"] = "idle"; return
 
     vol_map = {x["symbol"]: (x.get("todayVol", 0), x.get("avgVol7d", 0))
                for x in cache.get("data", [])}
 
-    print(f"[bk] breakout scan — range end={RANGE_END}, {len(SYMBOLS)} symbols")
+    print(f"[bk] scanning {len(SYMBOLS)} symbols, RANGE_END={RANGE_END}")
     results = []
+    ok_count = 0
+    empty_count = 0
+    no_range_count = 0
+    no_break_count = 0
 
     for sym_info in SYMBOLS:
         sym = sym_info["symbol"]
@@ -1028,95 +1033,107 @@ def _compute_breakout(tok):
                       "fromDate": from_dt, "toDate": to_dt},
                 headers=headers, timeout=10)
             if r.status_code == 429:
-                print(f"[bk] {sym} 429 — sleeping 3s"); time.sleep(3); continue
-            if r.status_code != 200: continue
+                print(f"[bk] 429 on {sym} — sleeping 5s"); time.sleep(5); continue
+            if r.status_code != 200:
+                continue
 
             d          = r.json()
             timestamps = d.get("timestamp", [])
-            opens      = d.get("open",   [])
             highs      = d.get("high",   [])
             lows       = d.get("low",    [])
             closes     = d.get("close",  [])
             volumes    = d.get("volume", [])
-            if len(timestamps) < 5: continue
+
+            if not timestamps:
+                empty_count += 1
+                if empty_count <= 3:
+                    print(f"[bk] {sym} empty response — keys={list(d.keys())}")
+                continue
 
             # ── Step 1: Build 9:15–9:45 opening range ─────────────────────
-            range_candles_high = []
-            range_candles_low  = []
-            range_vol          = 0
-            last_range_close   = 0.0  # close of the last candle AT 9:45
+            # Include candles from 09:15 up to and including 09:45
+            range_highs  = []
+            range_lows   = []
+            range_ref    = 0.0   # close of last candle in range (9:45 close)
 
             for i, ts in enumerate(timestamps):
                 t = datetime.fromtimestamp(ts, IST).strftime("%H:%M")
                 if "09:15" <= t <= RANGE_END:
-                    range_candles_high.append(highs[i])
-                    range_candles_low.append(lows[i])
-                    range_vol += volumes[i]
-                    last_range_close = closes[i]  # keeps updating → final = 9:45 close
+                    range_highs.append(highs[i])
+                    range_lows.append(lows[i])
+                    range_ref = closes[i]   # last one = 9:45 close
 
-            if len(range_candles_high) < 3: continue  # need at least 3 candles in range
+            if len(range_highs) < 2:
+                no_range_count += 1
+                if no_range_count <= 3:
+                    # Debug: show what times we actually got
+                    all_times = [datetime.fromtimestamp(ts, IST).strftime("%H:%M")
+                                 for ts in timestamps[:10]]
+                    print(f"[bk] {sym} not enough range candles ({len(range_highs)}) — first times: {all_times}")
+                continue
 
-            range_high = round(max(range_candles_high), 2)
-            range_low  = round(min(range_candles_low),  2)
-            range_ref  = round(last_range_close, 2)  # 9:45 close = reference price
-
+            range_high = round(max(range_highs), 2)
+            range_low  = round(min(range_lows),  2)
+            range_ref  = round(range_ref, 2)
             if range_ref <= 0: continue
 
-            # ── Step 2: Find first candle AFTER 9:45 that breaks the range ─
+            # ── Step 2: Find first candle AFTER range that breaks high or low ──
+            # A breakout = any candle whose HIGH > range_high (bull)
+            #           or any candle whose LOW  < range_low  (bear)
+            # Using high/low (not close) catches the break the moment it happens
             signal_time  = None
             signal_price = 0.0
             direction    = None
-            move_pct     = 0.0   # % move from 9:45 close at moment of breakout
-            current_pct  = 0.0   # % move from 9:45 close right now (ltp)
-            ltp          = 0.0
+            move_pct     = 0.0
+            ltp          = 0.0   # last close seen (= final close of the day)
 
             for i, ts in enumerate(timestamps):
                 t = datetime.fromtimestamp(ts, IST).strftime("%H:%M")
-                if t <= RANGE_END: continue   # skip range candles
-
-                ltp = closes[i]  # always update so we have current price
-
-                if direction is None:   # only mark FIRST breakout
-                    if closes[i] > range_high:
+                if t <= RANGE_END: continue        # skip opening range candles
+                ltp = closes[i]                    # track current price
+                if direction is None:
+                    if highs[i] > range_high:      # bull: high exceeds range high
                         direction    = "bull"
                         signal_time  = t
-                        signal_price = round(closes[i], 2)
-                        move_pct     = round((closes[i] - range_ref) / range_ref * 100, 2)
-                    elif closes[i] < range_low:
+                        signal_price = round(highs[i], 2)
+                        move_pct     = round((highs[i] - range_ref) / range_ref * 100, 2)
+                    elif lows[i] < range_low:       # bear: low breaks range low
                         direction    = "bear"
                         signal_time  = t
-                        signal_price = round(closes[i], 2)
-                        move_pct     = round((closes[i] - range_ref) / range_ref * 100, 2)
+                        signal_price = round(lows[i], 2)
+                        move_pct     = round((lows[i] - range_ref) / range_ref * 100, 2)
 
-            if not direction or ltp == 0: continue
+            if not direction:
+                no_break_count += 1; continue
+            if ltp == 0: continue
 
-            # Current % from 9:45 reference (may be larger than move_pct as move extends)
             current_pct = round((ltp - range_ref) / range_ref * 100, 2)
-
-            # Volume: today vs 7-day avg
             today_vol, avg_vol = vol_map.get(sym, (0, 0))
-            vol_ratio     = round(today_vol / avg_vol, 2) if avg_vol else 0.0
+            vol_ratio    = round(today_vol / avg_vol, 2) if avg_vol else 0.0
             vol_confirmed = vol_ratio >= 1.5
+            ok_count += 1
 
             results.append({
-                "symbol":       sym,
-                "ltp":          round(ltp, 2),
-                "rangeHigh":    range_high,
-                "rangeLow":     range_low,
-                "rangeRef":     range_ref,       # 9:45 close = reference price
-                "direction":    direction,
-                "signal_time":  signal_time,     # time of first breakout candle
-                "signal_price": signal_price,    # close of breakout candle
-                "move_pct":     move_pct,        # % from 9:45 at moment of break
-                "current_pct":  current_pct,     # % from 9:45 right now
-                "vol_ratio":    vol_ratio,
+                "symbol":        sym,
+                "ltp":           round(ltp, 2),
+                "rangeHigh":     range_high,
+                "rangeLow":      range_low,
+                "rangeRef":      range_ref,
+                "direction":     direction,
+                "signal_time":   signal_time,
+                "signal_price":  signal_price,
+                "move_pct":      move_pct,
+                "current_pct":   current_pct,
+                "vol_ratio":     vol_ratio,
                 "vol_confirmed": vol_confirmed,
-                "today_vol":    today_vol,
+                "today_vol":     today_vol,
             })
             time.sleep(0.25)
 
         except Exception as e:
-            print(f"[bk] {sym}: {e}"); continue
+            print(f"[bk] {sym} error: {e}"); continue
+
+    print(f"[bk] done: ok={ok_count} empty={empty_count} no_range={no_range_count} no_break={no_break_count}")
 
     results.sort(key=lambda x: abs(x["current_pct"]), reverse=True)
     _bk_cache.update({
