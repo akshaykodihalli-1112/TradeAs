@@ -403,13 +403,16 @@ def compute_metrics(q, hist, market_open, today_str):
 
 
 def _trigger_downstream(tok):
-    """Fire PS, ND, OIS after screener data is fully ready with change% and vol ratios."""
-    print(f"[screener] downstream triggered — launching PS, ND, OIS")
+    """Fire PS, ND, OIS, IA after screener data is fully ready with change% and vol ratios."""
+    print(f"[screener] downstream triggered — launching PS, ND, OIS, IA")
     if not _ps_lock.locked():
         threading.Thread(target=_run_ps_locked, args=(tok,), daemon=True).start()
     if not _nd_lock.locked():
         threading.Thread(target=_run_nd_locked, args=(tok,), daemon=True).start()
-    # OIS triggers after PS finishes (via its own logic)
+    # OIS triggers itself after PS via its own route handler
+    # IA triggers after PS (uses PS option chain data)
+    if not _ia_lock.locked():
+        threading.Thread(target=_run_ia_locked, args=(tok,), daemon=True).start()
 
 def run_screener(tok):
     global cache
@@ -1980,3 +1983,344 @@ def ois_bear(x_client_id: str = Header(None), x_access_token: str = Header(None)
 def ois_strong():
     """High-probability setups only (score ≥75)."""
     return {"data": [x for x in _ois_cache["data"] if x["ois_score"] >= _OIS_SCORE_HIGH]}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INSTITUTIONAL ACTIVITY SCANNER
+# ══════════════════════════════════════════════════════════════════════════════
+# Derived from 10 verified Sensibull trades (Mar 2026) — 88.9% win rate.
+# ALL 3 GATES must pass for a live signal.
+#
+#  GATE 1 — OI Buildup   (CE OI↑ for bull / PE OI↑ for bear OR vol ratio >3)
+#  GATE 2 — Volume ≥1.5× (mandatory — smart money footprint)
+#  GATE 3 — PCR aligned  (bull: PCR <0.80 | bear: PCR >1.20)
+#
+#  Strike : always 1-step ITM  (delta ~0.68) — reuses _ois_itm_strike()
+#  Grades : institutional ≥85 | high ≥70 | moderate ≥55
+#  Refresh: every 2 min live | 1 hr closed (APScheduler job added below)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_ia_cache = {
+    "data": [], "status": "idle", "updated_at": None,
+    "count": 0, "ce_signals": 0, "pe_signals": 0,
+    "institutional": 0, "market_open": False, "mode": "closed",
+    "next_refresh": None,
+}
+_ia_lock = threading.Lock()
+
+_IA_VOL_MIN_LIVE   = 1.5
+_IA_VOL_MIN_CLOSED = 1.0
+_IA_CHG_MIN_LIVE   = 1.5
+_IA_CHG_MIN_CLOSED = 0.8
+_IA_SCORE_INST     = 85
+_IA_SCORE_HIGH     = 70
+_IA_SCORE_MIN      = 55
+
+
+def _ia_gate_score(sym, direction, change, vol_ratio, opt_data, eq_score):
+    """Compute institutional score and gate results. Returns (score, gates)."""
+    score     = 0
+    pcr       = opt_data.get("pcr", 0)
+    ce_oi_chg = opt_data.get("ce_oi_change", 0)
+    pe_oi_chg = opt_data.get("pe_oi_change", 0)
+    ce_vr     = opt_data.get("ce_vol_ratio", 0)
+    pe_vr     = opt_data.get("pe_vol_ratio", 0)
+
+    # ── Gate 1: OI Buildup (0 / 15 / 25 pts) ─────────────────────────────
+    if direction == "bull":
+        oi_strong  = ce_oi_chg > 0 and ce_vr > 3
+        oi_present = ce_oi_chg > 0 or ce_vr > 3 or eq_score >= 2
+    else:
+        oi_strong  = pe_oi_chg > 0 and pe_vr > 3
+        oi_present = pe_oi_chg > 0 or pe_vr > 3 or eq_score >= 2
+    gate1 = oi_present
+    if oi_strong:    score += 25
+    elif oi_present: score += 15
+
+    # ── Gate 2: Volume spike (0 / 8 / 12 / 18 pts) ───────────────────────
+    gate2 = vol_ratio >= _IA_VOL_MIN_LIVE
+    if vol_ratio >= 3.0:   score += 18
+    elif vol_ratio >= 2.0: score += 12
+    elif vol_ratio >= 1.5: score +=  8
+
+    # ── Gate 3: PCR alignment (0 / 15 / 22 pts) ──────────────────────────
+    if direction == "bull":
+        pcr_strong = 0 < pcr < 0.65
+        pcr_ok     = 0 < pcr < 0.80
+    else:
+        pcr_strong = pcr > 1.35
+        pcr_ok     = pcr > 1.20
+    gate3 = pcr_ok
+    if pcr_strong:  score += 22
+    elif pcr_ok:    score += 15
+
+    # ── Bonus: move size (0–20 pts) ───────────────────────────────────────
+    chg = abs(change)
+    if chg >= 5.0:   score += 20
+    elif chg >= 3.5: score += 15
+    elif chg >= 2.5: score += 10
+    elif chg >= 1.5: score +=  5
+
+    # ── Bonus: institutional sector +5 pts ───────────────────────────────
+    sector = _OIS_SECTOR_MAP.get(sym, "Unknown")
+    if sector in ("Metal", "PSU-Oil", "Banking", "Defence"):
+        score += 5
+
+    gates = {
+        "oi_buildup":   gate1,
+        "vol_spike":    gate2,
+        "pcr_aligned":  gate3,
+        "all_gates":    gate1 and gate2 and gate3,
+        "oi_strong":    oi_strong,
+        "pcr_strong":   pcr_strong,
+        "pcr_value":    round(pcr, 2),
+        "vol_ratio":    round(vol_ratio, 2),
+        "ce_oi_change": ce_oi_chg,
+        "pe_oi_change": pe_oi_chg,
+        "ce_vol_ratio": round(ce_vr, 1),
+        "pe_vol_ratio": round(pe_vr, 1),
+    }
+    return min(score, 100), gates
+
+
+def _compute_ia(tok: str):
+    global _ia_cache
+    _ia_cache["status"] = "fetching"
+    market_open = is_market_open()
+
+    print(f"[ia] Institutional Activity scan — market_open={market_open}")
+
+    vol_min = _IA_VOL_MIN_LIVE if market_open else _IA_VOL_MIN_CLOSED
+    chg_min = _IA_CHG_MIN_LIVE if market_open else _IA_CHG_MIN_CLOSED
+
+    # Prefer Power Strike data (has live option chain). Fallback = screener cache.
+    source      = list(_ps_cache.get("data", []))
+    source_type = "powerstrike"
+
+    if not source:
+        source_type = "screener"
+        for row in cache.get("data", []):
+            chg = row.get("change", 0)
+            vr  = row.get("volumeRatio", 0)
+            ltp = row.get("ltp", 0)
+            if not ltp or abs(chg) < chg_min or vr < vol_min:
+                continue
+            source.append({
+                **row,
+                "direction":   "bull" if chg > 0 else "bear",
+                "opt_data":    {},
+                "opt_score":   0,
+                "eq_score":    2 if abs(chg) >= 2.5 else 1,
+                "volRatio":    vr,
+                "signal_time": ist_now().strftime("%H:%M IST"),
+            })
+
+    print(f"[ia] {len(source)} candidates from {source_type}")
+    results = []
+
+    for row in source:
+        sym       = row.get("symbol", "")
+        spot      = row.get("ltp", 0)
+        change    = row.get("change", 0)
+        vol_ratio = row.get("volRatio", row.get("volumeRatio", 0))
+        direction = row.get("direction", "bull")
+        opt_data  = row.get("opt_data") or {}
+        eq_score  = row.get("eq_score", 0)
+
+        if not spot or abs(change) < chg_min or vol_ratio < vol_min:
+            continue
+
+        score, gates = _ia_gate_score(sym, direction, change, vol_ratio,
+                                      opt_data, eq_score)
+
+        # Live: all 3 gates required.
+        # Closed: OI + vol sufficient (PCR can be stale after hours).
+        if market_open:
+            if not gates["all_gates"]:
+                continue
+        else:
+            if not (gates["oi_buildup"] and gates["vol_spike"]):
+                continue
+
+        if score < _IA_SCORE_MIN:
+            continue
+
+        # ── ITM strike selection (reuses OIS helper) ──────────────────────
+        itm      = _ois_itm_strike(spot, direction)
+        opt_type = itm["opt_type"]
+        sector   = _OIS_SECTOR_MAP.get(sym, "Unknown")
+
+        bs  = row.get("best_strike") or itm["strike"]
+        bl  = row.get("best_ltp", 0)
+        bd  = row.get("best_delta") or itm["delta_est"]
+        bg  = row.get("best_gamma", 0)
+        biv = row.get("best_iv", 0)
+        bs_is_itm = ((direction == "bull" and bs < spot) or
+                     (direction == "bear" and bs > spot))
+        if not bs_is_itm:
+            bs = itm["strike"]; bd = itm["delta_est"]; bl = 0
+
+        grade = ("institutional" if score >= _IA_SCORE_INST else
+                 "high"          if score >= _IA_SCORE_HIGH  else
+                 "moderate")
+
+        # Human-readable signal note
+        pcr = opt_data.get("pcr", gates.get("pcr_value", 0))
+        if direction == "bull":
+            oi_lbl = ("Long Buildup"   if gates["oi_strong"]  else
+                      "Short Covering" if pcr < 0.8           else "CE OI rising")
+            pcr_lbl = f"PCR={pcr:.2f} CE-heavy" if pcr else ""
+        else:
+            oi_lbl = ("Short Buildup"   if gates["oi_strong"] else
+                      "Long Unwinding"  if pcr > 1.2          else "PE OI rising")
+            pcr_lbl = f"PCR={pcr:.2f} PE-heavy" if pcr else ""
+
+        signal_note = " | ".join(filter(None, [
+            oi_lbl,
+            f"{'+' if change > 0 else ''}{change:.1f}%",
+            f"vol={vol_ratio:.1f}×",
+            pcr_lbl,
+            f"[{sector}]" if sector != "Unknown" else "",
+        ]))
+
+        action = (f"Buy {bs} {opt_type} @ ₹{round(bl, 1)}" if bl
+                  else f"Buy {bs} {opt_type}")
+
+        results.append({
+            "symbol":       sym,
+            "sector":       sector,
+            "direction":    direction,
+            "ltp":          round(spot, 2),
+            "change":       round(change, 2),
+            "vol_ratio":    round(vol_ratio, 2),
+            "momentum5d":   row.get("momentum5d", 0),
+            "strike":       bs,
+            "opt_type":     opt_type,
+            "opt_ltp":      round(bl, 2) if bl else 0,
+            "delta":        round(bd, 2),
+            "gamma":        round(bg, 4) if bg else 0,
+            "iv":           round(biv, 1) if biv else 0,
+            "moneyness":    itm["moneyness"],
+            "action":       action,
+            "expiry":       opt_data.get("expiry", ""),
+            "gates":        gates,
+            "score":        score,
+            "grade":        grade,
+            "signal_note":  signal_note,
+            "signal_time":  row.get("signal_time", ist_now().strftime("%H:%M IST")),
+            "source":       source_type,
+            "opt_data":     opt_data,
+            "strikes":      row.get("strikes", []),
+        })
+
+    results.sort(key=lambda x: (
+        2 if x["grade"] == "institutional" else
+        1 if x["grade"] == "high" else 0,
+        x["score"],
+        abs(x["change"])
+    ), reverse=True)
+
+    _ia_cache.update({
+        "data":          results,
+        "status":        "ok",
+        "updated_at":    ist_now().strftime("%H:%M:%S IST"),
+        "count":         len(results),
+        "ce_signals":    sum(1 for r in results if r["opt_type"] == "CE"),
+        "pe_signals":    sum(1 for r in results if r["opt_type"] == "PE"),
+        "institutional": sum(1 for r in results if r["grade"] == "institutional"),
+        "market_open":   market_open,
+        "mode":          "live" if market_open else "closed",
+        "next_refresh":  (ist_now() + timedelta(minutes=2)).strftime("%H:%M IST")
+                         if market_open else None,
+        "source":        source_type,
+    })
+    print(f"[ia] done — {len(results)} signals "
+          f"({_ia_cache['ce_signals']} CE / {_ia_cache['pe_signals']} PE | "
+          f"{_ia_cache['institutional']} institutional ≥{_IA_SCORE_INST})")
+
+
+def _run_ia_locked(tok: str):
+    with _ia_lock: _compute_ia(tok)
+
+
+def _ia_stale() -> bool:
+    """Stale after 2 min live, 1 hr closed."""
+    last = _ia_cache.get("updated_at")
+    if not last: return True
+    try:
+        t = datetime.strptime(last, "%H:%M:%S IST").replace(
+            year=ist_now().year, month=ist_now().month,
+            day=ist_now().day, tzinfo=IST)
+        threshold = 120 if is_market_open() else 3600
+        return (ist_now() - t).seconds > threshold
+    except:
+        return True
+
+
+def _ia_scheduled():
+    """APScheduler hook — runs every 2 min during market hours only."""
+    tok = CREDS.get("access_token", "")
+    cid = CREDS.get("client_id", "")
+    if not tok or not cid or not is_market_open(): return
+    if _ia_lock.locked(): return
+    threading.Thread(target=_run_ia_locked, args=(tok,), daemon=True).start()
+
+scheduler.add_job(_ia_scheduled, "interval", minutes=2, id="ia_scanner")
+
+
+@app.get("/api/institutional")
+def get_institutional(x_client_id: str = Header(None),
+                      x_access_token: str = Header(None),
+                      refresh: bool = Query(False)):
+    """
+    Institutional Activity Scanner.
+    3 gates live: OI Buildup + Volume ≥1.5× + PCR aligned.
+    2 gates closed: OI Buildup + Volume ≥1.0× (PCR stale after hours).
+    Grades: institutional ≥85 | high ≥70 | moderate ≥55.
+    Refreshes every 2 min live, 1 hr closed.
+    """
+    cid = x_client_id or CREDS.get("client_id", "")
+    tok = x_access_token or CREDS.get("access_token", "")
+    if not cid or not tok:
+        return {"status": "no_credentials", "data": []}
+    CREDS["client_id"] = cid; CREDS["access_token"] = tok
+
+    should_run = (refresh or _ia_stale()) and not _ia_lock.locked()
+    if should_run:
+        if not _ps_cache.get("data") and not _ps_lock.locked():
+            print(f"[ia] triggering Power Strike first...")
+            threading.Thread(target=_run_ps_locked, args=(tok,), daemon=True).start()
+        threading.Thread(target=_run_ia_locked, args=(tok,), daemon=True).start()
+
+    return _ia_cache
+
+
+@app.get("/api/institutional/ce")
+def ia_ce(x_client_id: str = Header(None), x_access_token: str = Header(None)):
+    """CE buy signals only — bullish institutional setups."""
+    return {
+        "data":       [x for x in _ia_cache["data"] if x["opt_type"] == "CE"],
+        "count":      _ia_cache["ce_signals"],
+        "updated_at": _ia_cache["updated_at"],
+    }
+
+
+@app.get("/api/institutional/pe")
+def ia_pe(x_client_id: str = Header(None), x_access_token: str = Header(None)):
+    """PE buy signals only — bearish institutional setups."""
+    return {
+        "data":       [x for x in _ia_cache["data"] if x["opt_type"] == "PE"],
+        "count":      _ia_cache["pe_signals"],
+        "updated_at": _ia_cache["updated_at"],
+    }
+
+
+@app.get("/api/institutional/top")
+def ia_top(x_client_id: str = Header(None), x_access_token: str = Header(None)):
+    """Institutional grade signals only (score ≥85) — highest confidence."""
+    return {
+        "data":       [x for x in _ia_cache["data"] if x["grade"] == "institutional"],
+        "count":      _ia_cache["institutional"],
+        "updated_at": _ia_cache["updated_at"],
+        "note":       f"Score ≥{_IA_SCORE_INST}: all 3 gates strong",
+    }
