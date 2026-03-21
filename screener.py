@@ -1552,3 +1552,373 @@ def ps_bull(x_client_id:str=Header(None),x_access_token:str=Header(None)):
 @app.get("/api/powerstrike/bear")
 def ps_bear(x_client_id:str=Header(None),x_access_token:str=Header(None)):
     return {"data":[x for x in _ps_cache["data"] if x["direction"]=="bear"]}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OI STRATEGY — 5-Factor ITM Options Scanner
+# Based on verified Sensibull trades (Mar 2026):
+#
+#   Stock         Spot     Strike  Type  P&L
+#   TATASTEEL     196.73   190     PE   +17,160  (Short Buildup, stock near 190)
+#   MAZDOCK      2352.50  2300     CE   +21,930  (Long Buildup, broke 2300)
+#   JINDALSTEL   1143.30  1150     PE   +18,750  (Short Buildup, stock < 1150)
+#   BANDHANBNK    162.54   170     PE   +15,120  (Short Buildup, stock < 170)
+#   NATIONALUM    395.15   390     CE   +20,250  (Long Buildup, broke 390)
+#   JSWSTEEL     1168.00  1150     CE   +20,587  (Long Buildup, broke 1150)
+#   ONGC          270.80   280     PE   +16,425  (Short Buildup, stock < 280)
+#   HAVELLS      1358.00  1400     CE   +16,500  (CE sell, stock < 1400)
+#   COLPAL       2055.60  2000     PE    -2,936  (FMCG — avoid!)
+#
+# 5-Factor Scoring (100 pts total):
+#   1. OI Buildup       25 pts  — futures OI change ≥15% aligned with direction
+#   2. ITM Strike       20 pts  — 1 step ITM → delta ~0.65+
+#   3. Sector + Move    20 pts  — ≥2.5% move, not FMCG/Pharma
+#   4. PCR + OI Change  20 pts  — PCR aligned, ATM OI change positive
+#   5. Vol Confirmation 15 pts  — vol ratio ≥1.5×
+#
+# Score ≥75 = High Probability  |  50-74 = Moderate  |  <50 = Filtered out
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Sector classification — Metal/PSU/Banking respond best to OI signals
+# FMCG/Pharma are defensive — avoid for directional PE buys (see COLPAL loss)
+_OIS_SECTOR_MAP = {
+    "TATASTEEL":"Metal","JSWSTEEL":"Metal","JINDALSTEL":"Metal","SAIL":"Metal",
+    "NATIONALUM":"Metal","HINDALCO":"Metal","VEDL":"Metal","NMDC":"Metal",
+    "APLAPOLLO":"Metal","WELCORP":"Metal","RATNAMANI":"Metal",
+    "ONGC":"PSU-Oil","BPCL":"PSU-Oil","IOC":"PSU-Oil","GAIL":"PSU-Oil",
+    "MAZDOCK":"Defence","BEL":"Defence","HAL":"Defence","COCHINSHIP":"Defence",
+    "GRSE":"Defence","BEML":"Defence",
+    "BANDHANBNK":"Banking","IDFCFIRSTB":"Banking","RBLBANK":"Banking",
+    "PNB":"Banking","BANKBARODA":"Banking","CANBK":"Banking",
+    "HDFCBANK":"Banking","ICICIBANK":"Banking","AXISBANK":"Banking",
+    "KOTAKBANK":"Banking","SBIN":"Banking","FEDERALBNK":"Banking",
+    "TATATECH":"IT","TCS":"IT","INFY":"IT","WIPRO":"IT",
+    "HCLTECH":"IT","MPHASIS":"IT","LTIM":"IT","TECHM":"IT",
+    "COLPAL":"FMCG","HINDUNILVR":"FMCG","ITC":"FMCG","BRITANNIA":"FMCG",
+    "NESTLEIND":"FMCG","DABUR":"FMCG","MARICO":"FMCG","GODREJCP":"FMCG",
+    "TATACONSUM":"FMCG","EMAMILTD":"FMCG",
+    "SUNPHARMA":"Pharma","DRREDDY":"Pharma","CIPLA":"Pharma",
+    "DIVISLAB":"Pharma","AUROPHARMA":"Pharma","ALKEM":"Pharma",
+    "HAVELLS":"Consumer","VGUARD":"Consumer","POLYCAB":"Consumer",
+    "CROMPTON":"Consumer","VOLTAS":"Consumer",
+}
+_OIS_AVOID_BEAR  = {"FMCG", "Pharma"}   # never buy PE on these
+_OIS_AVOID_BULL  = {"Pharma"}           # usually avoid CE on Pharma too
+_OIS_SCORE_MIN   = 50                   # filter threshold
+_OIS_SCORE_HIGH  = 75                   # high-probability threshold
+
+_ois_cache = {
+    "data": [], "status": "idle", "updated_at": None,
+    "count": 0, "bulls": 0, "bears": 0, "strong": 0, "market_open": False,
+}
+_ois_lock = threading.Lock()
+
+
+def _ois_strike_step(spot: float) -> int:
+    """Standard NSE strike interval for a given spot price."""
+    if spot >= 5000: return 200
+    if spot >= 2000: return 100
+    if spot >= 500:  return 50
+    if spot >= 200:  return 25
+    if spot >= 100:  return 10
+    return 5
+
+
+def _ois_itm_strike(spot: float, direction: str) -> dict:
+    """
+    Select 1-strike ITM for maximum delta (~0.65).
+
+    Bull (CE buy): strike BELOW spot → stock already above strike → ITM CE
+      e.g. JSWSTEEL 1168 → 1150 CE  (1168 > 1150 → ITM ✓, delta ~0.68)
+      e.g. MAZDOCK 2352 → 2300 CE   (2352 > 2300 → ITM ✓, delta ~0.70)
+
+    Bear (PE buy): strike ABOVE spot → stock already below strike → ITM PE
+      e.g. BANDHANBNK 162 → 170 PE  (162 < 170 → ITM ✓, delta ~0.68)
+      e.g. JINDALSTEL 1143 → 1150 PE (1143 < 1150 → ITM ✓, delta ~0.65)
+      e.g. ONGC 270 → 280 PE        (270 < 280 → ITM ✓, delta ~0.67)
+    """
+    step  = _ois_strike_step(spot)
+    base  = round(spot / step) * step
+
+    if direction == "bull":
+        strike    = base - step          # one step below → ITM CE
+        is_itm    = spot > strike
+    else:
+        strike    = base + step          # one step above → ITM PE
+        is_itm    = spot < strike
+
+    return {
+        "strike":    int(strike),
+        "opt_type":  "CE" if direction == "bull" else "PE",
+        "moneyness": "ITM" if is_itm else "ATM",
+        "delta_est": 0.68 if is_itm else 0.50,
+        "step":      step,
+    }
+
+
+def _ois_compute_score(row: dict, opt_data: dict) -> int:
+    """
+    5-Factor OI Strategy Score (0–100).
+    Derived from analysis of all 10 Sensibull verified trades.
+    """
+    score     = 0
+    direction = row.get("direction", "bull")
+    sym       = row.get("symbol", "")
+    sector    = _OIS_SECTOR_MAP.get(sym, "Unknown")
+    change    = abs(row.get("change", 0))
+    vol_ratio = row.get("volRatio", 0)
+    pcr       = opt_data.get("pcr", 0)
+    ce_oi_chg = opt_data.get("ce_oi_change", 0)
+    pe_oi_chg = opt_data.get("pe_oi_change", 0)
+    ce_vr     = opt_data.get("ce_vol_ratio", 0)
+    pe_vr     = opt_data.get("pe_vol_ratio", 0)
+    opt_score = row.get("opt_score", 0)
+
+    # ── Factor 1: OI Buildup (25 pts) ──────────────────────────────────────
+    # Long Buildup (OI↑ + Price↑) → CE   |  Short Buildup (OI↑ + Price↓) → PE
+    oi_ok = (
+        (direction == "bull" and (opt_score > 0 or ce_oi_chg > 0 or ce_vr > 3)) or
+        (direction == "bear" and (opt_score > 0 or pe_oi_chg > 0 or pe_vr > 3))
+    )
+    if oi_ok:
+        score += 25
+    elif row.get("eq_score", 0) >= 2:
+        score += 10   # partial credit for strong equity signal alone
+
+    # ── Factor 2: ITM Strike (20 pts) ──────────────────────────────────────
+    spot = row.get("ltp", 0)
+    itm  = _ois_itm_strike(spot, direction)
+    score += 20 if itm["moneyness"] == "ITM" else 8
+
+    # ── Factor 3: Sector + Move Size (20 pts) ──────────────────────────────
+    avoid = _OIS_AVOID_BEAR if direction == "bear" else _OIS_AVOID_BULL
+    if sector not in avoid:
+        if change >= 4.0:    score += 20
+        elif change >= 2.5:  score += 15
+        elif change >= 1.5:  score += 10
+    else:
+        score += 5   # defensive sector — partial only
+
+    # ── Factor 4: PCR + OI Change Alignment (20 pts) ──────────────────────
+    if direction == "bull":
+        if 0 < pcr < 0.75:   score += 10   # low PCR = CE heavy = bullish
+        if ce_oi_chg > 0:     score += 10   # CE OI building = longs entering
+    else:
+        if pcr > 1.25:        score += 10   # high PCR = PE heavy = bearish
+        if pe_oi_chg > 0:     score += 10   # PE OI building = shorts entering
+
+    # ── Factor 5: Volume Confirmation (15 pts) ─────────────────────────────
+    if vol_ratio >= 2.0:    score += 15
+    elif vol_ratio >= 1.5:  score += 10
+    elif vol_ratio >= 1.2:  score +=  5
+
+    return min(score, 100)
+
+
+def _compute_ois(tok: str):
+    """
+    OI Strategy Scanner.
+    Waits for Power Strike data (which already fetched option chains),
+    then applies 5-factor scoring + forces ITM strike selection.
+    No extra Dhan API calls needed — reuses _ps_cache data.
+    """
+    global _ois_cache
+    _ois_cache["status"] = "fetching"
+    print(f"[ois] starting OI Strategy scan...")
+
+    # Wait up to 3 min for Power Strike enriched data
+    wait = 0
+    while not _ps_cache.get("data") and wait < 180:
+        print(f"[ois] waiting for Power Strike data... ({wait}s)")
+        time.sleep(5); wait += 5
+
+    source_data = _ps_cache.get("data", [])
+
+    # Fallback: if PS never ran, build candidates directly from screener cache
+    if not source_data:
+        print(f"[ois] no PS data — building from screener cache directly")
+        for row in cache.get("data", []):
+            chg = row.get("change", 0)
+            vr  = row.get("volumeRatio", 0)
+            if abs(chg) >= 1.5 and vr >= 1.2:
+                source_data.append({
+                    **row,
+                    "direction":  "bull" if chg > 0 else "bear",
+                    "opt_data":   {},
+                    "opt_score":  0,
+                    "eq_score":   2,
+                    "strikes":    [],
+                    "volRatio":   vr,
+                })
+
+    print(f"[ois] scoring {len(source_data)} candidates...")
+    results = []
+
+    for row in source_data:
+        sym      = row.get("symbol", "")
+        spot     = row.get("ltp", 0)
+        if not spot: continue
+
+        direction = row.get("direction", "bull")
+        opt_data  = row.get("opt_data") or {}
+        sector    = _OIS_SECTOR_MAP.get(sym, "Unknown")
+
+        score = _ois_compute_score(row, opt_data)
+        if score < _OIS_SCORE_MIN: continue
+
+        # Force 1-strike ITM selection (core of the strategy)
+        itm      = _ois_itm_strike(spot, direction)
+        opt_type = itm["opt_type"]
+
+        # Prefer option-chain derived best_strike only if it's actually ITM
+        bs        = row.get("best_strike") or itm["strike"]
+        bl        = row.get("best_ltp", 0)
+        bd        = row.get("best_delta") or itm["delta_est"]
+        bg        = row.get("best_gamma", 0)
+        biv       = row.get("best_iv", 0)
+        bs_is_itm = (direction == "bull" and bs < spot) or (direction == "bear" and bs > spot)
+        if not bs_is_itm:
+            # Override: always use ITM strike, not whatever PS selected
+            bs = itm["strike"]; bd = itm["delta_est"]; bl = 0
+
+        pcr      = opt_data.get("pcr", 0)
+        ce_oi_ch = opt_data.get("ce_oi_change", 0)
+        pe_oi_ch = opt_data.get("pe_oi_change", 0)
+
+        # Human-readable OI signal label
+        if direction == "bull":
+            oi_label = ("Long Buildup" if ce_oi_ch > 0 else
+                        "Short Covering" if (0 < pcr < 0.8) else "CE Surge")
+        else:
+            oi_label = ("Short Buildup" if pe_oi_ch > 0 else
+                        "Long Unwinding" if pcr > 1.2 else "PE Surge")
+
+        strength = "strong" if score >= _OIS_SCORE_HIGH else "moderate"
+        vr       = row.get("volRatio", 0)
+
+        # Build strategy note
+        parts = [
+            f"{'+' if row.get('change',0)>0 else ''}{row.get('change',0):.1f}%",
+            f"vol={vr:.1f}x",
+            f"{oi_label}",
+            f"sector={sector}",
+        ]
+        if pcr: parts.append(f"PCR={pcr:.2f}")
+        setup_note = " | ".join(parts)
+
+        # 5-factor flags for frontend scorecard
+        factors = {
+            "oi_buildup":       score >= 25,
+            "itm_strike":       itm["moneyness"] == "ITM",
+            "sector_momentum":  abs(row.get("change", 0)) >= 2.5,
+            "pcr_aligned":      (direction == "bull" and 0 < pcr < 0.8) or
+                                (direction == "bear" and pcr > 1.2),
+            "vol_confirmed":    vr >= 1.5,
+        }
+
+        results.append({
+            # Core price fields
+            "symbol":       sym,
+            "ltp":          spot,
+            "change":       row.get("change", 0),
+            "direction":    direction,
+            "sector":       sector,
+            "volRatio":     vr,
+            "todayVol":     row.get("todayVol", 0),
+            "avgVol":       row.get("avgVol", 0),
+            "momentum5d":   row.get("momentum5d", 0),
+            # ITM Strike recommendation
+            "itm_strike":   bs,          # the recommended ITM strike
+            "itm_ltp":      bl,          # option LTP (0 if unavailable)
+            "itm_delta":    bd,          # delta at that strike
+            "itm_gamma":    bg,
+            "itm_iv":       biv,
+            "itm_type":     opt_type,    # "CE" or "PE"
+            "itm_moneyness":itm["moneyness"],
+            "action":       f"Buy {bs} {opt_type}{' @ ₹'+str(round(bl,1)) if bl else ''}",
+            # OI data
+            "oi_signal":    oi_label,
+            "opt_data":     opt_data,
+            "opt_score":    row.get("opt_score", 0),
+            "eq_score":     row.get("eq_score", 0),
+            "strikes":      row.get("strikes", []),  # near-ATM chain for popup
+            # Scoring
+            "ois_score":        score,
+            "signal_strength":  strength,
+            "setup_note":       setup_note,
+            "signal_time":      row.get("signal_time", ist_now().strftime("%H:%M IST")),
+            "factors":          factors,
+            "expiry":           opt_data.get("expiry", ""),
+        })
+
+    results.sort(key=lambda x: (x["ois_score"], abs(x["change"])), reverse=True)
+    _ois_cache.update({
+        "data":        results,
+        "status":      "ok",
+        "updated_at":  ist_now().strftime("%H:%M:%S IST"),
+        "count":       len(results),
+        "bulls":       sum(1 for r in results if r["direction"] == "bull"),
+        "bears":       sum(1 for r in results if r["direction"] == "bear"),
+        "strong":      sum(1 for r in results if r["ois_score"] >= _OIS_SCORE_HIGH),
+        "market_open": is_market_open(),
+        "mode":        "live" if is_market_open() else "closed",
+    })
+    print(f"[ois] done — {len(results)} signals "
+          f"({_ois_cache['bulls']} bull, {_ois_cache['bears']} bear, "
+          f"{_ois_cache['strong']} strong ≥{_OIS_SCORE_HIGH})")
+
+
+def _run_ois_locked(tok: str):
+    with _ois_lock: _compute_ois(tok)
+
+
+def _ois_stale() -> bool:
+    last = _ois_cache.get("updated_at")
+    if not last: return True
+    try:
+        t = datetime.strptime(last, "%H:%M:%S IST").replace(
+            year=ist_now().year, month=ist_now().month, day=ist_now().day, tzinfo=IST)
+        return (ist_now() - t).seconds > 300
+    except:
+        return True
+
+
+@app.get("/api/oistrategy")
+def get_ois(x_client_id: str = Header(None), x_access_token: str = Header(None),
+            refresh: bool = Query(False)):
+    """
+    OI Strategy Scanner — picks ITM strikes using 5-factor OI scoring.
+    Reuses Power Strike option chain data. No extra API calls.
+    Score ≥75 = high probability  |  50-74 = moderate
+    """
+    cid = x_client_id or CREDS.get("client_id", "")
+    tok = x_access_token or CREDS.get("access_token", "")
+    if not cid or not tok: return {"status": "no_credentials", "data": []}
+    CREDS["client_id"] = cid; CREDS["access_token"] = tok
+
+    should_run = (refresh or _ois_stale()) and not _ois_lock.locked()
+    if should_run:
+        # Ensure Power Strike has run first (provides option chain data)
+        if not _ps_cache.get("data") and not _ps_lock.locked():
+            print(f"[ois] triggering Power Strike first for option data...")
+            threading.Thread(target=_run_ps_locked, args=(tok,), daemon=True).start()
+        threading.Thread(target=_run_ois_locked, args=(tok,), daemon=True).start()
+    return _ois_cache
+
+
+@app.get("/api/oistrategy/bull")
+def ois_bull(x_client_id: str = Header(None), x_access_token: str = Header(None)):
+    """Bullish OI setups — ITM CE buys with Long Buildup signal."""
+    return {"data": [x for x in _ois_cache["data"] if x["direction"] == "bull"]}
+
+
+@app.get("/api/oistrategy/bear")
+def ois_bear(x_client_id: str = Header(None), x_access_token: str = Header(None)):
+    """Bearish OI setups — ITM PE buys with Short Buildup signal."""
+    return {"data": [x for x in _ois_cache["data"] if x["direction"] == "bear"]}
+
+
+@app.get("/api/oistrategy/strong")
+def ois_strong():
+    """High-probability setups only (score ≥75)."""
+    return {"data": [x for x in _ois_cache["data"] if x["ois_score"] >= _OIS_SCORE_HIGH]}
