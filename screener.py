@@ -1052,22 +1052,41 @@ def _compute_breakout(tok):
             if not timestamps:
                 empty_count += 1; continue
 
+            # ── Debug: log first symbol's timestamp format once ──────────
+            if ok_count == 0 and no_range == 0 and no_break == 0 and empty_count == 0:
+                print(f"[bk] ts sample: type={type(timestamps[0]).__name__} val={timestamps[0]}")
+
+            # ── Helper: parse timestamp → "HH:MM" regardless of format ──
+            def _t(ts_val):
+                try:
+                    # Dhan intraday returns epoch integers
+                    if isinstance(ts_val, (int, float)):
+                        return datetime.fromtimestamp(ts_val, IST).strftime("%H:%M")
+                    # Some responses return "YYYY-MM-DD HH:MM:SS" strings
+                    s = str(ts_val)
+                    if " " in s:
+                        return s.split(" ")[1][:5]   # "HH:MM"
+                    if "T" in s:
+                        return s.split("T")[1][:5]
+                    return s[:5]
+                except:
+                    return ""
+
             # ── Step 1: Build opening range 9:15–9:45 ────────────────────
-            # Merge all 1-min candles from 9:15 to 9:45 (inclusive) into
-            # a single range.  range_high = max of all highs,
-            #                  range_low  = min of all lows.
+            # Merge all 1-min candles from 9:15 to 9:45 (inclusive).
+            # range_high = MAX of all highs, range_low = MIN of all lows.
             range_highs = []
             range_lows  = []
             range_ref   = None   # close of the 9:45 candle
 
             for i, ts in enumerate(timestamps):
-                t = datetime.fromtimestamp(ts, IST).strftime("%H:%M")
+                t = _t(ts)
                 if RANGE_START <= t <= RANGE_END:
                     range_highs.append(highs[i])
                     range_lows.append(lows[i])
                     range_ref = closes[i]   # last assignment = 9:45 close
 
-            if len(range_highs) < 2:        # need at least a few candles
+            if len(range_highs) < 2:
                 no_range += 1; continue
             if range_ref is None or range_ref <= 0:
                 no_range += 1; continue
@@ -1082,7 +1101,7 @@ def _compute_breakout(tok):
             #          close > range_high → bull
             #          close < range_low  → bear
             #
-            # CLOSED → walk candles AFTER 9:45, find FIRST close-based break
+            # CLOSED → walk candles AFTER 9:45, find FIRST close that breaks range
 
             signal_time  = None
             signal_price = 0.0
@@ -1091,7 +1110,7 @@ def _compute_breakout(tok):
             ltp          = range_ref   # updated to last close seen
 
             for i, ts in enumerate(timestamps):
-                t = datetime.fromtimestamp(ts, IST).strftime("%H:%M")
+                t = _t(ts)
                 if t <= RANGE_END: continue          # skip range candles
 
                 ltp = closes[i]                       # track latest price
@@ -1158,7 +1177,7 @@ def _compute_breakout(tok):
             time.sleep(0.25)
 
         except Exception as e:
-            print(f"[bk] {sym}: {e}"); continue
+            print(f"[bk] {sym} ERR: {type(e).__name__}: {e}"); no_break += 1; continue
 
     print(f"[bk] done: ok={ok_count} no_range={no_range} no_break={no_break} empty={empty_count}")
 
