@@ -459,20 +459,29 @@ def run_screener(tok):
                 if hist:
                     closes  = hist.get("close",  [])
                     volumes = hist.get("volume", [])
-                    # Dhan historical never includes today's bar after close
-                    # closes[-1] = yesterday's close, ltp = today's close
-                    prev_close = closes[-1] if closes else 0
-                    ref_closes = closes + [ltp]  # append today for momentum calc
+
+                    # Dhan DOES include today's bar in historical after market close.
+                    # Confirmed from logs: last3=[270.0, 264.15, 259.25] and ltp=259.25
+                    # So closes[-1] == ltp (today) and closes[-2] == yesterday.
+                    # Strategy: if closes[-1] matches ltp closely, today is included.
+                    if closes and abs(closes[-1] - ltp) / max(ltp, 0.01) < 0.001:
+                        # Today IS in historical — use closes[-2] as prev_close
+                        prev_close = closes[-2] if len(closes) >= 2 else 0
+                        ref_closes = closes  # today already appended by Dhan
+                    else:
+                        # Today NOT in historical — closes[-1] is yesterday
+                        prev_close = closes[-1] if closes else 0
+                        ref_closes = closes + [ltp]  # append today manually
 
                     chg_pct = round((ltp - prev_close) / prev_close * 100, 2) if prev_close else 0.0
 
-                    # Momentum 5D
+                    # Momentum 5D — use last 6 values of ref_closes
                     mom5d = 0.0
                     if len(ref_closes) >= 6:
                         c5 = ref_closes[-6]
                         if c5: mom5d = round((ltp - c5) / c5 * 100, 2)
 
-                    # Volume ratio
+                    # Volume ratio — avg of 7 days before today
                     vol_ratio = 0.0; avg_vol7d = 0
                     if len(volumes) >= 8:
                         avg_vol7d = int(sum(volumes[-8:-1]) / 7)
@@ -481,7 +490,7 @@ def run_screener(tok):
                     prev_close = 0.0; chg_pct = 0.0; mom5d = 0.0
                     vol_ratio = 0.0; avg_vol7d = 0
 
-                print(f"[close] {sym['symbol']} ltp={ltp} last3={closes[-3:]} prev={prev_close} chg={chg_pct}%") if sym["symbol"] in ("ANGELONE","SAIL","MANAPPURAM","RELIANCE") else None
+                print(f"[close] {sym['symbol']} ltp={ltp} prev={prev_close} chg={chg_pct}% ref_len={len(ref_closes) if hist else 0}") if sym["symbol"] in ("ANGELONE","SAIL","MANAPPURAM","RELIANCE") else None
 
                 results.append({
                     "symbol":      sym["symbol"], "exchange": "NSE",
