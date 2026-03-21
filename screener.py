@@ -972,6 +972,24 @@ _bk_lock  = threading.Lock()
 
 RANGE_END = "09:45"   # Opening range: 9:15 to 9:45
 
+def _last_trading_day() -> str:
+    """Return the most recent trading day (Mon–Fri) in YYYY-MM-DD format.
+    If today is a weekday and market has opened (past 9:15), use today.
+    Otherwise step back to the last weekday."""
+    d = ist_now()
+    # If market is open right now — use today
+    if is_market_open():
+        return d.strftime("%Y-%m-%d")
+    # If today is a weekday AND we are past 9:15 (market has already traded today)
+    if d.weekday() < 5 and (d.hour > 9 or (d.hour == 9 and d.minute >= 15)):
+        return d.strftime("%Y-%m-%d")
+    # Otherwise go back to the last weekday
+    d -= timedelta(days=1)
+    while d.weekday() >= 5:   # skip Sat(5) and Sun(6)
+        d -= timedelta(days=1)
+    return d.strftime("%Y-%m-%d")
+
+
 def _compute_breakout(tok):
     global _bk_cache
     if not SYMBOLS or not tok: return
@@ -979,9 +997,10 @@ def _compute_breakout(tok):
     cid     = CREDS.get("client_id", "")
     headers = {"access-token": tok, "client-id": cid, "Content-Type": "application/json"}
     now     = ist_now()
-    today   = now.strftime("%Y-%m-%d")
+    today   = _last_trading_day()          # ← last trading day, not always today
     from_dt = f"{today} 09:15:00"
     to_dt   = f"{today} 15:30:00"
+    print(f"[bk] using trading date: {today} (today={now.strftime('%Y-%m-%d %a')})")
 
     # Wait for screener data (gives us today's volume for ratio calc)
     wait = 0
@@ -1101,15 +1120,16 @@ def _compute_breakout(tok):
 
     results.sort(key=lambda x: abs(x["current_pct"]), reverse=True)
     _bk_cache.update({
-        "data":        results,
-        "updated_at":  ist_now().strftime("%H:%M:%S IST"),
-        "status":      "ok",
-        "count":       len(results),
-        "bulls":       sum(1 for r in results if r["direction"] == "bull"),
-        "bears":       sum(1 for r in results if r["direction"] == "bear"),
-        "vol_confirmed": sum(1 for r in results if r["vol_confirmed"]),
-        "market_open": is_market_open(),
-        "range_end":   RANGE_END,
+        "data":         results,
+        "updated_at":   ist_now().strftime("%H:%M:%S IST"),
+        "status":       "ok",
+        "count":        len(results),
+        "bulls":        sum(1 for r in results if r["direction"] == "bull"),
+        "bears":        sum(1 for r in results if r["direction"] == "bear"),
+        "vol_confirmed":sum(1 for r in results if r["vol_confirmed"]),
+        "market_open":  is_market_open(),
+        "range_end":    RANGE_END,
+        "trading_date": today,   # track which day this data is for
     })
     print(f"[bk] done — {len(results)} breakouts ({_bk_cache['bulls']} bull, {_bk_cache['bears']} bear)")
 
@@ -1117,12 +1137,21 @@ def _run_bk_locked(tok):
     with _bk_lock: _compute_breakout(tok)
 
 def _bk_stale():
+    # Stale if: no data, or data is from a different trading day, or older than 5 min
+    if not _bk_cache.get("data") and not _bk_cache.get("updated_at"):
+        return True
+    # Check if the trading date used for current data matches what we'd use now
+    cached_date = _bk_cache.get("trading_date", "")
+    if cached_date and cached_date != _last_trading_day():
+        return True   # new trading day — must re-scan
     last = _bk_cache.get("updated_at")
     if not last: return True
     try:
         t = datetime.strptime(last, "%H:%M:%S IST").replace(
             year=ist_now().year, month=ist_now().month, day=ist_now().day, tzinfo=IST)
-        return (ist_now() - t).seconds > 300  # 5 min stale
+        # Live: stale after 5 min. Closed: stale after 1 hour (data won't change)
+        threshold = 300 if is_market_open() else 3600
+        return (ist_now() - t).seconds > threshold
     except: return True
 
 @app.get("/api/breakout")
