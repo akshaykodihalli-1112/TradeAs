@@ -1011,16 +1011,13 @@ def _compute_breakout(tok):
     print(f"[bk] date={today} mode={'LIVE' if market_open else 'CLOSED'} "
           f"range={RANGE_START}-{RANGE_END} confirm={CONFIRM_TIME+' close' if market_open else 'all-day close'}")
 
-    # Wait up to 2 min for screener data (vol ratios)
-    wait = 0
-    while not cache.get("data") and wait < 120:
-        print(f"[bk] waiting for screener data... ({wait}s)")
-        time.sleep(5); wait += 5
-
+    # Use vol data from screener if already available — but DON'T wait for it.
+    # Breakout scanner fetches its own intraday data independently.
+    # vol_map will be empty if screener hasn't finished yet — that's fine,
+    # vol_confirmed will just show False until next refresh.
     vol_map = {x["symbol"]: (x.get("todayVol", 0), x.get("avgVol7d", 0))
                for x in cache.get("data", [])}
-
-    print(f"[bk] scanning {len(SYMBOLS)} symbols...")
+    print(f"[bk] vol_map size={len(vol_map)} | scanning {len(SYMBOLS)} symbols...")
     results      = []
     ok_count     = 0
     no_range     = 0
@@ -1052,9 +1049,9 @@ def _compute_breakout(tok):
             if not timestamps:
                 empty_count += 1; continue
 
-            # ── Debug: log first symbol's timestamp format once ──────────
-            if ok_count == 0 and no_range == 0 and no_break == 0 and empty_count == 0:
-                print(f"[bk] ts sample: type={type(timestamps[0]).__name__} val={timestamps[0]}")
+            # ── Debug: log timestamp format on first successful response ─
+            if ok_count + no_range + no_break + empty_count == 0:
+                print(f"[bk] ts_format: type={type(timestamps[0]).__name__} sample={str(timestamps[0])[:25]}")
 
             # ── Helper: parse timestamp → "HH:MM" regardless of format ──
             def _t(ts_val):
