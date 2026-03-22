@@ -1029,6 +1029,8 @@ def _compute_breakout(tok):
     no_range    = 0
     no_break    = 0
     empty_count = 0
+    err_count   = 0
+    _ts_logged  = False
 
     for sym_info in SYMBOLS:
         sym = sym_info["symbol"]
@@ -1042,7 +1044,11 @@ def _compute_breakout(tok):
                 headers=headers, timeout=10)
             if r.status_code == 429:
                 print(f"[bk] {sym} 429 — sleeping 5s"); time.sleep(5); continue
-            if r.status_code != 200: continue
+            if r.status_code != 200:
+                err_count += 1
+                if err_count <= 2:
+                    print(f"[bk] {sym} HTTP {r.status_code}: {r.text[:120]}")
+                continue
 
             d          = r.json()
             timestamps = d.get("timestamp", [])
@@ -1051,11 +1057,15 @@ def _compute_breakout(tok):
             closes     = d.get("close",  [])
 
             if not timestamps:
-                empty_count += 1; continue
+                empty_count += 1
+                if empty_count <= 2:
+                    print(f"[bk] {sym} empty — keys={list(d.keys())}")
+                continue
 
-            # Log timestamp format once
-            if ok_count + no_range + no_break + empty_count == 1:
-                print(f"[bk] ts_fmt: type={type(timestamps[0]).__name__} sample={str(timestamps[0])[:22]}")
+            # Log timestamp format on very first response received
+            if not _ts_logged:
+                print(f"[bk] ts_fmt: type={type(timestamps[0]).__name__} sample={str(timestamps[0])[:25]}")
+                _ts_logged = True
 
             # ── Step 1: Build 9:15–9:45 opening range ────────────────────────
             range_highs = []; range_lows = []; range_ref = None
@@ -1140,7 +1150,7 @@ def _compute_breakout(tok):
         except Exception as e:
             print(f"[bk] {sym} ERR {type(e).__name__}: {e}"); no_break += 1; continue
 
-    print(f"[bk] done: ok={ok_count} no_range={no_range} no_break={no_break} empty={empty_count}")
+    print(f"[bk] done: ok={ok_count} no_range={no_range} no_break={no_break} empty={empty_count} http_err={err_count}")
     results.sort(key=lambda x: abs(x["current_pct"]), reverse=True)
     _bk_cache.update({
         "data":          results,
@@ -2017,7 +2027,7 @@ _IA_SCORE_HIGH     = 70
 _IA_SCORE_MIN      = 55
 
 
-def _ia_gate_score(sym, direction, change, vol_ratio, opt_data, eq_score):
+def _ia_gate_score(sym, direction, change, vol_ratio, opt_data, eq_score, market_open=True):
     """Compute institutional score and gate results. Returns (score, gates)."""
     score     = 0
     pcr       = opt_data.get("pcr", 0)
@@ -2027,21 +2037,32 @@ def _ia_gate_score(sym, direction, change, vol_ratio, opt_data, eq_score):
     pe_vr     = opt_data.get("pe_vol_ratio", 0)
 
     # ── Gate 1: OI Buildup (0 / 15 / 25 pts) ─────────────────────────────
+    # Live: need real OI data. Closed: eq_score alone is sufficient
+    # (option chain data unavailable after hours — use equity signal as proxy)
     if direction == "bull":
         oi_strong  = ce_oi_chg > 0 and ce_vr > 3
-        oi_present = ce_oi_chg > 0 or ce_vr > 3 or eq_score >= 2
+        if market_open:
+            oi_present = ce_oi_chg > 0 or ce_vr > 3
+        else:
+            oi_present = ce_oi_chg > 0 or ce_vr > 3 or eq_score >= 1
     else:
         oi_strong  = pe_oi_chg > 0 and pe_vr > 3
-        oi_present = pe_oi_chg > 0 or pe_vr > 3 or eq_score >= 2
+        if market_open:
+            oi_present = pe_oi_chg > 0 or pe_vr > 3
+        else:
+            oi_present = pe_oi_chg > 0 or pe_vr > 3 or eq_score >= 1
     gate1 = oi_present
     if oi_strong:    score += 25
     elif oi_present: score += 15
 
-    # ── Gate 2: Volume spike (0 / 8 / 12 / 18 pts) ───────────────────────
-    gate2 = vol_ratio >= _IA_VOL_MIN_LIVE
+    # ── Gate 2: Volume spike ──────────────────────────────────────────────
+    # Live threshold 1.5×, closed threshold 1.0×
+    vol_threshold = _IA_VOL_MIN_LIVE if market_open else _IA_VOL_MIN_CLOSED
+    gate2 = vol_ratio >= vol_threshold
     if vol_ratio >= 3.0:   score += 18
     elif vol_ratio >= 2.0: score += 12
     elif vol_ratio >= 1.5: score +=  8
+    elif vol_ratio >= 1.0: score +=  4   # partial credit for closed market
 
     # ── Gate 3: PCR alignment (0 / 15 / 22 pts) ──────────────────────────
     if direction == "bull":
@@ -2174,11 +2195,11 @@ def _compute_ia(tok: str):
         opt_data  = row.get("opt_data") or {}
         eq_score  = row.get("eq_score", 0)
 
-        if not spot or abs(change) < chg_min or vol_ratio < vol_min:
+        if not spot or abs(change) < chg_min or vol_ratio < (_IA_VOL_MIN_LIVE if market_open else _IA_VOL_MIN_CLOSED):
             continue
 
         score, gates = _ia_gate_score(sym, direction, change, vol_ratio,
-                                      opt_data, eq_score)
+                                      opt_data, eq_score, market_open)
 
         # Live: all 3 gates required.
         # Closed: OI + vol sufficient (PCR can be stale after hours).
