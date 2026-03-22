@@ -2083,6 +2083,9 @@ def _ia_gate_score(sym, direction, change, vol_ratio, opt_data, eq_score):
     return min(score, 100), gates
 
 
+_ia_first_seen = {}   # sym → "HH:MM IST" — preserved across scans so time never resets
+
+
 def _compute_ia(tok: str):
     global _ia_cache
     _ia_cache["status"] = "fetching"
@@ -2105,6 +2108,9 @@ def _compute_ia(tok: str):
             ltp = row.get("ltp", 0)
             if not ltp or abs(chg) < chg_min or vr < vol_min:
                 continue
+            sym_key = f"{row.get('symbol','')}_{('bull' if chg > 0 else 'bear')}"
+            if sym_key not in _ia_first_seen:
+                _ia_first_seen[sym_key] = ist_now().strftime("%H:%M IST")
             source.append({
                 **row,
                 "direction":   "bull" if chg > 0 else "bear",
@@ -2112,7 +2118,7 @@ def _compute_ia(tok: str):
                 "opt_score":   0,
                 "eq_score":    2 if abs(chg) >= 2.5 else 1,
                 "volRatio":    vr,
-                "signal_time": ist_now().strftime("%H:%M IST"),
+                "signal_time": _ia_first_seen[sym_key],
             })
 
     print(f"[ia] {len(source)} candidates from {source_type}")
@@ -2186,6 +2192,17 @@ def _compute_ia(tok: str):
         action = (f"Buy {bs} {opt_type} @ ₹{round(bl, 1)}" if bl
                   else f"Buy {bs} {opt_type}")
 
+        # Preserve the FIRST time this signal was detected — never overwrite
+        sym_key    = f"{sym}_{direction}"
+        existing   = row.get("signal_time", "")
+        if existing and "IST" in str(existing):
+            first_time = existing          # PS cache has a real signal time
+        elif sym_key in _ia_first_seen:
+            first_time = _ia_first_seen[sym_key]   # seen before — keep original
+        else:
+            first_time = ist_now().strftime("%H:%M IST")   # brand new signal
+        _ia_first_seen[sym_key] = first_time   # lock it in for future scans
+
         results.append({
             "symbol":       sym,
             "sector":       sector,
@@ -2207,7 +2224,7 @@ def _compute_ia(tok: str):
             "score":        score,
             "grade":        grade,
             "signal_note":  signal_note,
-            "signal_time":  row.get("signal_time", ist_now().strftime("%H:%M IST")),
+            "signal_time":  first_time,
             "source":       source_type,
             "opt_data":     opt_data,
             "strikes":      row.get("strikes", []),
