@@ -2083,7 +2083,49 @@ def _ia_gate_score(sym, direction, change, vol_ratio, opt_data, eq_score):
     return min(score, 100), gates
 
 
-_ia_first_seen = {}   # sym → "HH:MM IST" — preserved across scans so time never resets
+_ia_first_seen = {}          # sym_dir → "HH:MM IST" — in-memory
+_IA_FIRST_SEEN_PATH = "/tmp/ia_first_seen.json"   # persists across restarts
+
+def _ia_load_first_seen():
+    """Load first-seen times from disk on startup."""
+    global _ia_first_seen
+    try:
+        with open(_IA_FIRST_SEEN_PATH) as f:
+            data = json.load(f)
+        # Only keep entries from today — discard yesterday's signals
+        today = ist_now().strftime("%Y-%m-%d")
+        _ia_first_seen = {k: v for k, v in data.items()
+                          if v.get("date") == today}
+        print(f"[ia] loaded {len(_ia_first_seen)} first-seen times from disk")
+    except:
+        _ia_first_seen = {}
+
+def _ia_save_first_seen():
+    """Persist first-seen times to disk."""
+    try:
+        with open(_IA_FIRST_SEEN_PATH, "w") as f:
+            json.dump(_ia_first_seen, f)
+    except:
+        pass
+
+def _ia_get_first_time(sym_key: str) -> str:
+    """
+    Return the first time this signal was ever detected.
+    If never seen before → stamp NOW and persist to disk immediately.
+    If seen before → return original time, never overwrite.
+    """
+    if sym_key in _ia_first_seen:
+        return _ia_first_seen[sym_key]["time"]
+    # Brand new signal — stamp it
+    now_str  = ist_now().strftime("%H:%M IST")
+    date_str = ist_now().strftime("%Y-%m-%d")
+    _ia_first_seen[sym_key] = {"time": now_str, "date": date_str}
+    _ia_save_first_seen()   # persist immediately so restart doesn't lose it
+    print(f"[ia] NEW signal: {sym_key} first seen at {now_str}")
+    return now_str
+
+# Load on startup
+_ia_load_first_seen()
 
 
 def _compute_ia(tok: str):
@@ -2108,9 +2150,8 @@ def _compute_ia(tok: str):
             ltp = row.get("ltp", 0)
             if not ltp or abs(chg) < chg_min or vr < vol_min:
                 continue
-            sym_key = f"{row.get('symbol','')}_{('bull' if chg > 0 else 'bear')}"
-            if sym_key not in _ia_first_seen:
-                _ia_first_seen[sym_key] = ist_now().strftime("%H:%M IST")
+            sym_key    = f"{row.get('symbol','')}_{('bull' if chg > 0 else 'bear')}"
+            first_time = _ia_get_first_time(sym_key)   # stamp or retrieve
             source.append({
                 **row,
                 "direction":   "bull" if chg > 0 else "bear",
@@ -2118,7 +2159,7 @@ def _compute_ia(tok: str):
                 "opt_score":   0,
                 "eq_score":    2 if abs(chg) >= 2.5 else 1,
                 "volRatio":    vr,
-                "signal_time": _ia_first_seen[sym_key],
+                "signal_time": first_time,
             })
 
     print(f"[ia] {len(source)} candidates from {source_type}")
@@ -2192,16 +2233,9 @@ def _compute_ia(tok: str):
         action = (f"Buy {bs} {opt_type} @ ₹{round(bl, 1)}" if bl
                   else f"Buy {bs} {opt_type}")
 
-        # Preserve the FIRST time this signal was detected — never overwrite
+        # Get first-seen time — disk-backed, survives restarts, never overwrites
         sym_key    = f"{sym}_{direction}"
-        existing   = row.get("signal_time", "")
-        if existing and "IST" in str(existing):
-            first_time = existing          # PS cache has a real signal time
-        elif sym_key in _ia_first_seen:
-            first_time = _ia_first_seen[sym_key]   # seen before — keep original
-        else:
-            first_time = ist_now().strftime("%H:%M IST")   # brand new signal
-        _ia_first_seen[sym_key] = first_time   # lock it in for future scans
+        first_time = _ia_get_first_time(sym_key)
 
         results.append({
             "symbol":       sym,
