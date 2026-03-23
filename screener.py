@@ -1821,7 +1821,7 @@ def _ois_compute_score(row: dict, opt_data: dict) -> int:
 # Strike and time are frozen at first detection — never change even if stock moves further.
 
 _ois_first_seen      = {}
-_OIS_FIRST_SEEN_PATH = "/tmp/ois_first_seen.json"
+_OIS_FIRST_SEEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ois_first_seen.json")
 
 def _ois_load_first_seen():
     global _ois_first_seen
@@ -1830,6 +1830,10 @@ def _ois_load_first_seen():
             data = json.load(f)
         today = ist_now().strftime("%Y-%m-%d")
         _ois_first_seen = {k: v for k, v in data.items() if v.get("date") == today}
+        # Back-fill display string for older entries
+        for entry in _ois_first_seen.values():
+            if "display" not in entry and "time" in entry:
+                entry["display"] = entry["time"]
         print(f"[ois] loaded {len(_ois_first_seen)} first-seen entries from disk")
     except:
         _ois_first_seen = {}
@@ -1867,8 +1871,8 @@ _ois_load_first_seen()
 def _compute_ois(tok: str):
     """
     OI Strategy Scanner.
-    Uses Power Strike data if available (has option chains).
-    Falls back to screener cache immediately — no waiting.
+    Live: waits for PS to finish (has option chain data with strike vol ratios).
+    Closed: uses screener cache directly.
     """
     global _ois_cache
     _ois_cache["status"] = "fetching"
@@ -1878,16 +1882,25 @@ def _compute_ois(tok: str):
     source_data = []
 
     if market_open:
-        # Use PS cache if it has data — no waiting
+        # Wait for PS to finish — OIS needs strike vol data from option chains
+        wait = 0
+        while _ps_lock.locked() and wait < 600:
+            if wait == 0: print(f"[ois] waiting for PS option chains...")
+            time.sleep(10); wait += 10
         source_data = _ps_cache.get("data", [])
         if not source_data:
-            print(f"[ois] no PS data yet — using screener cache")
+            print(f"[ois] PS has no data — skipping")
+            _ois_cache["status"] = "idle"; return
+    else:
+        # Closed market — use PS data if available (has option chains), else screener
+        source_data = _ps_cache.get("data", [])
+        if source_data:
+            print(f"[ois] closed — using PS data ({len(source_data)} candidates)")
 
-    # Closed market OR live fallback — build from screener cache directly
-    # Lower thresholds: settled daily data, not intraday spikes
+    # Screener fallback — closed market with no PS data
     if not source_data:
-        chg_min = 0.5 if not market_open else 1.0   # was 1.5 live
-        vol_min  = 0.5 if not market_open else 0.8   # was 1.2 live
+        chg_min = 0.5 if not market_open else 1.0
+        vol_min  = 0.5 if not market_open else 0.8
         for row in cache.get("data", []):
             chg = row.get("change", 0)
             vr  = row.get("volumeRatio", 0)
@@ -1896,7 +1909,6 @@ def _compute_ois(tok: str):
             ltp = row.get("ltp", 0)
             if not ltp: continue
             if abs(chg) < chg_min: continue
-            # Compute real vol ratio if not yet enriched
             if vr == 0 and av > 0: vr = round(tv / av, 2)
             if vr < vol_min and not (market_open and vr == 0 and tv > 0): continue
             source_data.append({
@@ -2194,7 +2206,7 @@ def _ia_gate_score(sym, direction, change, vol_ratio, opt_data, eq_score, market
 
 
 _ia_first_seen = {}          # sym_dir → "HH:MM IST" — in-memory
-_IA_FIRST_SEEN_PATH = "/tmp/ia_first_seen.json"   # persists across restarts
+_IA_FIRST_SEEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ia_first_seen.json")
 
 def _ia_load_first_seen():
     """Load first-seen times from disk on startup."""
