@@ -1761,16 +1761,14 @@ def _ois_itm_strike(spot: float, direction: str) -> dict:
 
 def _ois_compute_score(row: dict, opt_data: dict) -> int:
     """
-    5-Factor OI Strategy Score (0–100).
-    Derived from analysis of all 10 Sensibull verified trades.
+    OI Strategy Score (0–100).
+    No PCR — strike vol ratio is the real institutional signal.
     """
     score     = 0
     direction = row.get("direction", "bull")
     sym       = row.get("symbol", "")
-    sector    = _OIS_SECTOR_MAP.get(sym, "Unknown")
     change    = abs(row.get("change", 0))
     vol_ratio = row.get("volRatio", 0)
-    pcr       = opt_data.get("pcr", 0)
     ce_oi_chg = opt_data.get("ce_oi_change", 0)
     pe_oi_chg = opt_data.get("pe_oi_change", 0)
     ce_vr     = opt_data.get("ce_vol_ratio", 0)
@@ -1778,41 +1776,92 @@ def _ois_compute_score(row: dict, opt_data: dict) -> int:
     opt_score = row.get("opt_score", 0)
 
     # ── Factor 1: OI Buildup (25 pts) ──────────────────────────────────────
-    # Long Buildup (OI↑ + Price↑) → CE   |  Short Buildup (OI↑ + Price↓) → PE
-    oi_ok = (
-        (direction == "bull" and (opt_score > 0 or ce_oi_chg > 0 or ce_vr > 3)) or
-        (direction == "bear" and (opt_score > 0 or pe_oi_chg > 0 or pe_vr > 3))
-    )
-    if oi_ok:
-        score += 25
-    elif row.get("eq_score", 0) >= 2:
-        score += 10   # partial credit for strong equity signal alone
+    if direction == "bull":
+        oi_strong  = ce_oi_chg > 0 and ce_vr > 3
+        oi_present = ce_oi_chg > 0 or ce_vr > 3 or opt_score > 0
+    else:
+        oi_strong  = pe_oi_chg > 0 and pe_vr > 3
+        oi_present = pe_oi_chg > 0 or pe_vr > 3 or opt_score > 0
+    if oi_strong:    score += 25
+    elif oi_present: score += 15
+    elif row.get("eq_score", 0) >= 2: score += 8
 
     # ── Factor 2: ITM Strike (20 pts) ──────────────────────────────────────
     spot = row.get("ltp", 0)
     itm  = _ois_itm_strike(spot, direction)
     score += 20 if itm["moneyness"] == "ITM" else 8
 
-    # ── Factor 3: Sector + Move Size (20 pts) ──────────────────────────────
-    # Factor 3: all sectors included
+    # ── Factor 3: Move Size (20 pts) ───────────────────────────────────────
     if change >= 4.0:    score += 20
     elif change >= 2.5:  score += 15
     elif change >= 1.5:  score += 10
+    elif change >= 1.0:  score +=  5
 
-    # ── Factor 4: PCR + OI Change Alignment (20 pts) ──────────────────────
-    if direction == "bull":
-        if 0 < pcr < 0.75:   score += 10   # low PCR = CE heavy = bullish
-        if ce_oi_chg > 0:     score += 10   # CE OI building = longs entering
-    else:
-        if pcr > 1.25:        score += 10   # high PCR = PE heavy = bearish
-        if pe_oi_chg > 0:     score += 10   # PE OI building = shorts entering
+    # ── Factor 4: Strike Vol Spike replaces PCR (20 pts) ───────────────────
+    # ATM CE vol ratio for bull, PE vol ratio for bear — institutional footprint
+    strike_vr = ce_vr if direction == "bull" else pe_vr
+    if strike_vr >= 10:   score += 20
+    elif strike_vr >= 7:  score += 15
+    elif strike_vr >= 5:  score += 12
+    elif strike_vr >= 3:  score +=  8
+    # OI change confirms direction
+    if direction == "bull" and ce_oi_chg > 0: score += 5
+    if direction == "bear" and pe_oi_chg > 0: score += 5
 
     # ── Factor 5: Volume Confirmation (15 pts) ─────────────────────────────
     if vol_ratio >= 2.0:    score += 15
     elif vol_ratio >= 1.5:  score += 10
-    elif vol_ratio >= 1.2:  score +=  5
+    elif vol_ratio >= 1.0:  score +=  5
 
     return min(score, 100)
+
+
+# ── OIS First-Seen Cache ───────────────────────────────────────────────────
+# Stores: {sym_dir: {"display": "23 Mar, 10:00 IST", "strike": 242, "ltp": 5.4, "date": "2026-03-23"}}
+# Strike and time are frozen at first detection — never change even if stock moves further.
+
+_ois_first_seen      = {}
+_OIS_FIRST_SEEN_PATH = "/tmp/ois_first_seen.json"
+
+def _ois_load_first_seen():
+    global _ois_first_seen
+    try:
+        with open(_OIS_FIRST_SEEN_PATH) as f:
+            data = json.load(f)
+        today = ist_now().strftime("%Y-%m-%d")
+        _ois_first_seen = {k: v for k, v in data.items() if v.get("date") == today}
+        print(f"[ois] loaded {len(_ois_first_seen)} first-seen entries from disk")
+    except:
+        _ois_first_seen = {}
+
+def _ois_save_first_seen():
+    try:
+        with open(_OIS_FIRST_SEEN_PATH, "w") as f:
+            json.dump(_ois_first_seen, f)
+    except:
+        pass
+
+def _ois_get_first_entry(sym_key: str, strike: float, ltp: float) -> dict:
+    """
+    Return the first-seen entry for this signal.
+    If new: stamp time + freeze strike + ltp. If seen before: return original.
+    """
+    if sym_key in _ois_first_seen:
+        return _ois_first_seen[sym_key]
+    now     = ist_now()
+    display = now.strftime("%H:%M IST")
+    entry   = {
+        "display": display,
+        "date":    now.strftime("%Y-%m-%d"),
+        "strike":  strike,
+        "ltp":     ltp,
+    }
+    _ois_first_seen[sym_key] = entry
+    _ois_save_first_seen()
+    print(f"[ois] NEW: {sym_key} first hit at {display} | strike={strike} ltp={ltp}")
+    return entry
+
+_ois_load_first_seen()
 
 
 def _compute_ois(tok: str):
@@ -1893,36 +1942,48 @@ def _compute_ois(tok: str):
         pcr      = opt_data.get("pcr", 0)
         ce_oi_ch = opt_data.get("ce_oi_change", 0)
         pe_oi_ch = opt_data.get("pe_oi_change", 0)
+        ce_vr    = opt_data.get("ce_vol_ratio", 0)
+        pe_vr    = opt_data.get("pe_vol_ratio", 0)
+        strike_vr = ce_vr if direction == "bull" else pe_vr
 
         # Human-readable OI signal label
         if direction == "bull":
-            oi_label = ("Long Buildup" if ce_oi_ch > 0 else
-                        "Short Covering" if (0 < pcr < 0.8) else "CE Surge")
+            oi_label = ("Long Buildup"   if ce_oi_ch > 0 and ce_vr > 3 else
+                        "CE Vol Surge"   if ce_vr > 3 else
+                        "Long Buildup"   if ce_oi_ch > 0 else "CE Signal")
         else:
-            oi_label = ("Short Buildup" if pe_oi_ch > 0 else
-                        "Long Unwinding" if pcr > 1.2 else "PE Surge")
+            oi_label = ("Short Buildup"  if pe_oi_ch > 0 and pe_vr > 3 else
+                        "PE Vol Surge"   if pe_vr > 3 else
+                        "Short Buildup"  if pe_oi_ch > 0 else "PE Signal")
 
         strength = "strong" if score >= _OIS_SCORE_HIGH else "moderate"
         vr       = row.get("volRatio", 0)
 
-        # Build strategy note
+        # ── Freeze strike + timestamp at first detection ───────────────────
+        sym_key   = f"{sym}_{direction}"
+        opt_lbl   = "CE" if direction == "bull" else "PE"
+        frozen    = _ois_get_first_entry(sym_key, bs, bl)
+        # Always show the FIRST strike recommended — never update even if stock moves
+        signal_time   = frozen["display"]
+        frozen_strike = frozen["strike"]
+        frozen_ltp    = frozen["ltp"]
+
+        # Build strategy note — no PCR
         parts = [
             f"{'+' if row.get('change',0)>0 else ''}{row.get('change',0):.1f}%",
-            f"vol={vr:.1f}x",
+            f"vol={vr:.1f}×",
             f"{oi_label}",
-            f"sector={sector}",
+            f"{opt_lbl} strike_vol={strike_vr:.1f}×" if strike_vr > 0 else "",
         ]
-        if pcr: parts.append(f"PCR={pcr:.2f}")
-        setup_note = " | ".join(parts)
+        setup_note = " | ".join(filter(None, parts))
 
-        # 5-factor flags for frontend scorecard
+        # 5-factor flags for frontend scorecard — PCR replaced by strike vol
         factors = {
-            "oi_buildup":       score >= 25,
+            "oi_buildup":       (ce_oi_ch > 0 if direction == "bull" else pe_oi_ch > 0),
             "itm_strike":       itm["moneyness"] == "ITM",
-            "sector_momentum":  abs(row.get("change", 0)) >= 2.5,
-            "pcr_aligned":      (direction == "bull" and 0 < pcr < 0.8) or
-                                (direction == "bear" and pcr > 1.2),
-            "vol_confirmed":    vr >= 1.5,
+            "sector_momentum":  abs(row.get("change", 0)) >= 1.5,
+            "strike_vol":       strike_vr >= 3,
+            "vol_confirmed":    vr >= 1.0,
         }
 
         results.append({
@@ -1936,26 +1997,26 @@ def _compute_ois(tok: str):
             "todayVol":     row.get("todayVol", 0),
             "avgVol":       row.get("avgVol", 0),
             "momentum5d":   row.get("momentum5d", 0),
-            # ITM Strike recommendation
-            "itm_strike":   bs,          # the recommended ITM strike
-            "itm_ltp":      bl,          # option LTP (0 if unavailable)
-            "itm_delta":    bd,          # delta at that strike
+            # ITM Strike — FROZEN at first detection, never changes
+            "itm_strike":   frozen_strike,
+            "itm_ltp":      frozen_ltp,
+            "itm_delta":    bd,
             "itm_gamma":    bg,
             "itm_iv":       biv,
-            "itm_type":     opt_type,    # "CE" or "PE"
+            "itm_type":     opt_type,
             "itm_moneyness":itm["moneyness"],
-            "action":       f"Buy {bs} {opt_type}{' @ ₹'+str(round(bl,1)) if bl else ''}",
+            "action":       f"Buy {frozen_strike} {opt_type}{' @ ₹'+str(round(frozen_ltp,1)) if frozen_ltp else ''}",
             # OI data
             "oi_signal":    oi_label,
             "opt_data":     opt_data,
             "opt_score":    row.get("opt_score", 0),
             "eq_score":     row.get("eq_score", 0),
-            "strikes":      row.get("strikes", []),  # near-ATM chain for popup
+            "strikes":      row.get("strikes", []),
             # Scoring
             "ois_score":        score,
             "signal_strength":  strength,
             "setup_note":       setup_note,
-            "signal_time":      row.get("signal_time", ist_now().strftime("%H:%M IST")),
+            "signal_time":      signal_time,   # FROZEN at first detection
             "factors":          factors,
             "expiry":           opt_data.get("expiry", ""),
         })
@@ -2175,7 +2236,7 @@ def _ia_get_first_time(sym_key: str) -> str:
 
     # Brand new signal — stamp it with full date+time
     now      = ist_now()
-    display  = now.strftime("%d %b, %H:%M IST").lstrip("0")  # e.g. "20 Mar, 10:23 IST"
+    display  = now.strftime("%H:%M IST")
     date_str = now.strftime("%Y-%m-%d")
 
     _ia_first_seen[sym_key] = {
