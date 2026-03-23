@@ -2197,10 +2197,13 @@ def _compute_ia(tok: str):
         source_type = "screener"
         for row in cache.get("data", []):
             chg = row.get("change", 0)
-            vr  = row.get("volumeRatio", 0)
-            ltp = row.get("ltp", 0)
-            if not ltp or abs(chg) < chg_min or vr < vol_min:
-                continue
+            vr       = row.get("volumeRatio", 0)
+            tv       = row.get("todayVol", 0)
+            ltp      = row.get("ltp", 0)
+            if not ltp or abs(chg) < chg_min: continue
+            # Early day bypass: volumeRatio=0 (historical not enriched) but stock is trading
+            early_day = market_open and vr == 0 and tv > 0
+            if not early_day and vr < vol_min: continue
             sym_key    = f"{row.get('symbol','')}_{('bull' if chg > 0 else 'bear')}"
             first_time = _ia_get_first_time(sym_key)   # stamp or retrieve
             source.append({
@@ -2214,6 +2217,7 @@ def _compute_ia(tok: str):
             })
 
     print(f"[ia] {len(source)} candidates from {source_type}")
+    _ia_debug = []  # track rejections for first 5
     results = []
 
     for row in source:
@@ -2225,20 +2229,34 @@ def _compute_ia(tok: str):
         opt_data  = row.get("opt_data") or {}
         eq_score  = row.get("eq_score", 0)
 
-        if not spot or abs(change) < chg_min or vol_ratio < (_IA_VOL_MIN_LIVE if market_open else _IA_VOL_MIN_CLOSED):
+        if not spot or abs(change) < chg_min: continue
+        # Early day bypass: volumeRatio=0 but stock is trading
+        early_day = market_open and vol_ratio == 0 and row.get("todayVol", 0) > 0
+        if not early_day and vol_ratio < (_IA_VOL_MIN_LIVE if market_open else _IA_VOL_MIN_CLOSED):
             continue
 
         score, gates = _ia_gate_score(sym, direction, change, vol_ratio,
                                       opt_data, eq_score, market_open)
 
-        # Live: all 3 gates required.
-        # Closed: OI + vol sufficient (PCR can be stale after hours).
+        # Early day: vol not yet computed — Gate 2 passes automatically
+        if early_day:
+            gates["vol_spike"] = True
+            gates["all_gates"] = gates["oi_buildup"] and gates["pcr_aligned"]
+
+        # Debug first 3 candidates
+        if len(_ia_debug) < 3:
+            _ia_debug.append(f"{sym}({direction}) chg={change:.1f}% pcr={gates['pcr_value']} "
+                             f"oi={gates['oi_buildup']} vol={gates['vol_spike']} pcr_gate={gates['pcr_aligned']} "
+                             f"score={score} early={early_day}")
+
+        # Live: require OI + PCR (vol gate relaxed early day).
+        # Also relax PCR gate if move is very strong (≥4%) — price action confirms direction.
+        strong_move = abs(change) >= 4.0
         if market_open:
-            if not gates["all_gates"]:
-                continue
+            if not gates["oi_buildup"]: continue
+            if not gates["pcr_aligned"] and not strong_move: continue
         else:
-            if not (gates["oi_buildup"] and gates["vol_spike"]):
-                continue
+            if not (gates["oi_buildup"] and gates["vol_spike"]): continue
 
         if score < _IA_SCORE_MIN:
             continue
@@ -2314,6 +2332,9 @@ def _compute_ia(tok: str):
             "opt_data":     opt_data,
             "strikes":      row.get("strikes", []),
         })
+
+    if _ia_debug:
+        print(f"[ia] gate debug: {' | '.join(_ia_debug)}")
 
     results.sort(key=lambda x: (
         2 if x["grade"] == "institutional" else
