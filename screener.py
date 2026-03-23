@@ -2264,36 +2264,232 @@ def _ia_get_first_time(sym_key: str) -> str:
 _ia_load_first_seen()
 
 
+def _ia_fetch_fresh_option_chain(tok, cid, sym_info, spot, direction, nearest_expiry, headers):
+    """
+    Fetch a FRESH option chain for one stock right now.
+    Returns opt_data dict + best strikes list — same format as _fetch_option_score.
+    Called every 2 min by IA scanner to get up-to-date strike vol data.
+    """
+    eq_id = sym_info["security_id"]
+    try:
+        time.sleep(3)    # Dhan rate limit: 1 req / 3s
+        r = requests.post(
+            f"{DHAN_BASE}/v2/optionchain",
+            json={"UnderlyingScrip": int(eq_id), "UnderlyingSeg": "NSE_EQ",
+                  "Expiry": nearest_expiry},
+            headers=headers, timeout=15
+        )
+        if r.status_code == 429:
+            print(f"[ia-chain] {sym_info['symbol']} 429 — sleeping 6s"); time.sleep(6)
+            return {}, []
+        if r.status_code != 200:
+            return {}, []
+
+        resp = r.json()
+        if resp.get("status") != "success": return {}, []
+        oc = resp.get("data", {}).get("oc", {})
+        if not oc: return {}, []
+
+        total_ce_oi = total_pe_oi = 0
+        atm_ce_oi = atm_pe_oi = atm_ce_vol = atm_pe_vol = 0
+        atm_ce_prev_oi = atm_pe_prev_oi = 0
+        atm_strike = 0; min_diff = float("inf")
+        strike_rows = []
+
+        for strike_str, sd in oc.items():
+            sp  = float(strike_str)
+            ce  = sd.get("ce", {}); pe = sd.get("pe", {})
+            ce_oi       = int(ce.get("oi", 0))
+            pe_oi       = int(pe.get("oi", 0))
+            ce_vol      = int(ce.get("volume", 0))
+            pe_vol      = int(pe.get("volume", 0))
+            ce_ltp      = float(ce.get("last_price", 0))
+            pe_ltp      = float(pe.get("last_price", 0))
+            ce_iv       = float(ce.get("implied_volatility", 0))
+            pe_iv       = float(pe.get("implied_volatility", 0))
+            ce_delta    = float(ce.get("greeks", {}).get("delta", 0))
+            pe_delta    = float(pe.get("greeks", {}).get("delta", 0))
+            ce_gamma    = float(ce.get("greeks", {}).get("gamma", 0))
+            pe_gamma    = float(pe.get("greeks", {}).get("gamma", 0))
+            ce_prev_oi  = int(ce.get("previous_oi", 0))
+            pe_prev_oi  = int(pe.get("previous_oi", 0))
+
+            total_ce_oi += ce_oi; total_pe_oi += pe_oi
+
+            moneyness = "ATM"
+            if direction == "bull":
+                if sp < spot * 0.995:  moneyness = "ITM"
+                elif sp > spot * 1.005: moneyness = "OTM"
+            else:
+                if sp > spot * 1.005:  moneyness = "ITM"
+                elif sp < spot * 0.995: moneyness = "OTM"
+
+            strike_rows.append({
+                "strike": sp, "moneyness": moneyness,
+                "ce_ltp": ce_ltp, "pe_ltp": pe_ltp,
+                "ce_oi": ce_oi, "pe_oi": pe_oi,
+                "ce_vol": ce_vol, "pe_vol": pe_vol,
+                "ce_delta": round(ce_delta, 3), "pe_delta": round(pe_delta, 3),
+                "ce_gamma": round(ce_gamma, 4), "pe_gamma": round(pe_gamma, 4),
+                "ce_iv": round(ce_iv, 1), "pe_iv": round(pe_iv, 1),
+                "ce_oi_change": ce_oi - ce_prev_oi,
+                "pe_oi_change": pe_oi - pe_prev_oi,
+            })
+
+            diff = abs(sp - spot)
+            if diff < min_diff:
+                min_diff = diff; atm_strike = sp
+                atm_ce_oi = ce_oi; atm_pe_oi = pe_oi
+                atm_ce_vol = ce_vol; atm_pe_vol = pe_vol
+                atm_ce_prev_oi = ce_prev_oi; atm_pe_prev_oi = pe_prev_oi
+
+        pcr          = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi else 0
+        ce_vol_ratio = round(atm_ce_vol / (atm_ce_oi / 100), 2) if atm_ce_oi else 0
+        pe_vol_ratio = round(atm_pe_vol / (atm_pe_oi / 100), 2) if atm_pe_oi else 0
+        ce_oi_change = atm_ce_oi - atm_ce_prev_oi
+        pe_oi_change = atm_pe_oi - atm_pe_prev_oi
+
+        # Pick best ITM strike from live chain
+        strike_rows.sort(key=lambda x: abs(x["strike"] - spot))
+        best_strikes = strike_rows[:5]
+        best_strikes.sort(key=lambda x: x["strike"])
+
+        best_strike = None
+        best_opt_score = -999
+        for s in best_strikes:
+            if direction == "bull":
+                sc = s["ce_delta"] + s["ce_gamma"] * 10
+                if sc > best_opt_score and s["ce_ltp"] > 0:
+                    best_opt_score = sc; best_strike = s
+            else:
+                sc = abs(s["pe_delta"]) + s["pe_gamma"] * 10
+                if sc > best_opt_score and s["pe_ltp"] > 0:
+                    best_opt_score = sc; best_strike = s
+
+        opt_data = {
+            "pcr": pcr, "atm_strike": atm_strike,
+            "ce_oi": total_ce_oi, "pe_oi": total_pe_oi,
+            "atm_ce_oi": atm_ce_oi, "atm_pe_oi": atm_pe_oi,
+            "atm_ce_vol": atm_ce_vol, "atm_pe_vol": atm_pe_vol,
+            "ce_vol_ratio": ce_vol_ratio, "pe_vol_ratio": pe_vol_ratio,
+            "ce_oi_change": ce_oi_change, "pe_oi_change": pe_oi_change,
+            "best_strike": best_strike,
+            "expiry": nearest_expiry,
+        }
+        return opt_data, best_strikes
+
+    except Exception as e:
+        print(f"[ia-chain] {sym_info['symbol']} error: {e}")
+        return {}, []
+
+
 def _compute_ia(tok: str):
+    """
+    Institutional Activity scanner.
+
+    LIVE market flow (every 2 min):
+      1. Wait for PowerStrike to have at least 1 run (it identifies directional candidates).
+      2. For each PS candidate, fetch a FRESH option chain right now.
+      3. Check: strike vol surge (CE for bull, PE for bear) ≥ 3× + price move ≥ 1.5%.
+      4. Suggest the ITM strike + option price.
+      5. Stamp First Hit when ALL conditions first met — persist to disk, never overwrite.
+
+    CLOSED market:
+      Use saved PS cache (has option data from last live run).
+      First Hit times from today's live session are shown as-is.
+      If no PS data, fall back to screener (weaker — no strike vol data).
+    """
     global _ia_cache
     _ia_cache["status"] = "fetching"
     market_open = is_market_open()
+    cid = CREDS.get("client_id", "")
+    headers = {"access-token": tok, "client-id": cid, "Content-Type": "application/json"}
 
     print(f"[ia] Institutional Activity scan — market_open={market_open}")
 
-    vol_min = _IA_VOL_MIN_LIVE if market_open else _IA_VOL_MIN_CLOSED
     chg_min = _IA_CHG_MIN_LIVE if market_open else _IA_CHG_MIN_CLOSED
 
-    # ── Live market: MUST use PS data (has PCR, OI, strikes) ─────────────────
-    # If PS is still running, wait for it — never fall back to screener in live mode
+    # ── Build candidate list ──────────────────────────────────────────────────
     if market_open:
+        # Wait for PowerStrike to have data — it identifies which stocks are moving
         wait = 0
-        while _ps_lock.locked() and wait < 600:  # wait up to 10 min for PS
-            if wait == 0:
-                print(f"[ia] PS still fetching option chains — waiting...")
+        while _ps_lock.locked() and wait < 600:
+            if wait == 0: print(f"[ia] PS still running — waiting for candidates...")
             time.sleep(10); wait += 10
-        source = list(_ps_cache.get("data", []))
-        if not source:
-            print(f"[ia] PS has no data yet — skipping this run")
-            _ia_cache["status"] = "idle"; return
-        source_type = "powerstrike"
-        print(f"[ia] {len(source)} candidates from powerstrike")
 
-    # ── Closed market: use screener cache (PS option data stale/unavailable) ──
+        ps_data = list(_ps_cache.get("data", []))
+        if not ps_data:
+            print(f"[ia] PS has no candidates yet — skipping this IA run")
+            _ia_cache["status"] = "idle"; return
+
+        # ── LIVE: Re-fetch FRESH option chains for each PS candidate ──────────
+        # This is the key — we don't reuse stale PS option data from 5 min ago
+        sym_map       = {s["symbol"]: s for s in SYMBOLS}
+        nearest_expiry = None
+
+        # Get expiry once using the first candidate
+        for c in ps_data[:3]:
+            si = sym_map.get(c["symbol"])
+            if not si: continue
+            try:
+                r = requests.post(
+                    f"{DHAN_BASE}/v2/optionchain/expirylist",
+                    json={"UnderlyingScrip": int(si["security_id"]), "UnderlyingSeg": "NSE_EQ"},
+                    headers=headers, timeout=10
+                )
+                time.sleep(3)
+                if r.status_code == 200:
+                    dates = r.json().get("data", [])
+                    if dates:
+                        nearest_expiry = dates[0]
+                        print(f"[ia] expiry: {nearest_expiry}")
+                        break
+            except: continue
+
+        if not nearest_expiry:
+            print(f"[ia] could not get expiry — using PS cached option data")
+            # Fall back to PS cached data but still process it
+            source = ps_data
+            source_type = "powerstrike_cached"
+            # skip the fresh chain fetch below
+            nearest_expiry = None
+        else:
+            # Fetch fresh chain for each candidate
+            source = []
+            for c in ps_data:
+                si = sym_map.get(c["symbol"])
+                if not si:
+                    source.append(c)  # keep with existing data
+                    continue
+                fresh_opt, fresh_strikes = _ia_fetch_fresh_option_chain(
+                    tok, cid, si, c["ltp"], c["direction"], nearest_expiry, headers
+                )
+                if fresh_opt:
+                    # Merge fresh option data with PS candidate row
+                    updated = dict(c)
+                    updated["opt_data"] = fresh_opt
+                    updated["strikes"]  = fresh_strikes
+                    # Update best strike from fresh chain
+                    bs = fresh_opt.get("best_strike")
+                    if bs:
+                        opt_type = "CE" if c["direction"] == "bull" else "PE"
+                        updated["best_strike"] = bs["strike"]
+                        updated["best_ltp"]    = bs["ce_ltp"] if c["direction"] == "bull" else bs["pe_ltp"]
+                        updated["best_delta"]  = bs["ce_delta"] if c["direction"] == "bull" else bs["pe_delta"]
+                        updated["best_gamma"]  = bs["ce_gamma"] if c["direction"] == "bull" else bs["pe_gamma"]
+                        updated["best_iv"]     = bs["ce_iv"] if c["direction"] == "bull" else bs["pe_iv"]
+                    source.append(updated)
+                else:
+                    source.append(c)  # keep with existing data
+            source_type = "live_fresh"
+            print(f"[ia] fetched fresh option chains for {len(source)} stocks")
+
     else:
+        # ── CLOSED: use PS cache (has option data from last live run) ─────────
         source      = list(_ps_cache.get("data", []))
-        source_type = "powerstrike"
+        source_type = "powerstrike_cached"
         if not source:
+            # Screener fallback (no option chain data)
             source_type = "screener"
             for row in cache.get("data", []):
                 chg = row.get("change", 0)
@@ -2303,22 +2499,21 @@ def _compute_ia(tok: str):
                 ltp = row.get("ltp", 0)
                 if not ltp or abs(chg) < chg_min: continue
                 if vr == 0 and av > 0: vr = round(tv / av, 2)
-                if vr < vol_min: continue
-                sym_key    = f"{row.get('symbol','')}_{('bull' if chg > 0 else 'bear')}"
-                first_time = _ia_get_first_time(sym_key)
+                if vr < _IA_VOL_MIN_CLOSED: continue
                 source.append({
                     **row,
-                    "direction":   "bull" if chg > 0 else "bear",
-                    "opt_data":    {},
-                    "opt_score":   0,
-                    "eq_score":    2 if abs(chg) >= 2.5 else 1,
-                    "volRatio":    vr,
-                    "todayVol":    tv,
-                    "signal_time": first_time,
+                    "direction": "bull" if chg > 0 else "bear",
+                    "opt_data":  {},
+                    "opt_score": 0,
+                    "eq_score":  2 if abs(chg) >= 2.5 else 1,
+                    "volRatio":  vr,
+                    "todayVol":  tv,
                 })
-        print(f"[ia] {len(source)} candidates from {source_type}")
-    _ia_debug = []  # track rejections for first 5
-    results = []
+        print(f"[ia] {len(source)} candidates from {source_type} (closed market)")
+
+    # ── Score each candidate ──────────────────────────────────────────────────
+    _ia_debug = []
+    results   = []
 
     for row in source:
         sym       = row.get("symbol", "")
@@ -2330,22 +2525,23 @@ def _compute_ia(tok: str):
         eq_score  = row.get("eq_score", 0)
 
         if not spot or abs(change) < chg_min: continue
-        if vol_ratio < (_IA_VOL_MIN_LIVE if market_open else _IA_VOL_MIN_CLOSED): continue
 
         score, gates = _ia_gate_score(sym, direction, change, vol_ratio,
                                       opt_data, eq_score, market_open)
 
-        # Debug first 3 candidates
-        if len(_ia_debug) < 3:
-            _ia_debug.append(f"{sym}({direction}) chg={change:.1f}% "
-                             f"strike_vr={gates['strike_vr']} oi_confirm={gates['oi_confirm']} "
-                             f"gate1={gates['strike_vol']} gate2={gates['price_confirm']} score={score}")
+        if len(_ia_debug) < 5:
+            _ia_debug.append(
+                f"{sym}({direction}) chg={change:.1f}% "
+                f"ce_vr={gates['ce_vol_ratio']} pe_vr={gates['pe_vol_ratio']} "
+                f"strike_vr={gates['strike_vr']} gate1={gates['strike_vol']} "
+                f"gate2={gates['price_confirm']} score={score}"
+            )
 
-        # Both gates required in live and closed market
+        # Both gates MUST pass — no partial signals
         if not gates["all_gates"]: continue
         if score < _IA_SCORE_MIN: continue
 
-        # ── ITM strike selection (reuses OIS helper) ──────────────────────
+        # ── ITM strike selection ──────────────────────────────────────────
         itm      = _ois_itm_strike(spot, direction)
         opt_type = itm["opt_type"]
         sector   = _OIS_SECTOR_MAP.get(sym, "Unknown")
@@ -2364,15 +2560,11 @@ def _compute_ia(tok: str):
                  "high"          if score >= _IA_SCORE_HIGH  else
                  "moderate")
 
-        # Human-readable signal note — strike vol is the key signal
         strike_vr = gates["strike_vr"]
         opt_lbl   = "CE" if direction == "bull" else "PE"
-        if direction == "bull":
-            vol_lbl = ("Inst CE Surge" if strike_vr >= 7 else "CE Vol Spike")
-        else:
-            vol_lbl = ("Inst PE Surge" if strike_vr >= 7 else "PE Vol Spike")
-
-        oi_lbl = "OI Buildup" if gates["oi_confirm"] else ""
+        vol_lbl   = (f"Inst {opt_lbl} Surge" if strike_vr >= 7 else f"{opt_lbl} Vol Spike")
+        oi_lbl    = "Long Buildup" if (direction == "bull" and gates["oi_confirm"]) else \
+                    "Short Buildup" if (direction == "bear" and gates["oi_confirm"]) else ""
 
         signal_note = " | ".join(filter(None, [
             vol_lbl,
@@ -2385,7 +2577,8 @@ def _compute_ia(tok: str):
         action = (f"Buy {bs} {opt_type} @ ₹{round(bl, 1)}" if bl
                   else f"Buy {bs} {opt_type}")
 
-        # Get first-seen time — disk-backed, survives restarts, never overwrites
+        # ── FIRST HIT — disk-backed, survives redeploys, never overwritten ──
+        # Key = sym + direction (not tied to specific strike price)
         sym_key    = f"{sym}_{direction}"
         first_time = _ia_get_first_time(sym_key)
 
@@ -2410,7 +2603,7 @@ def _compute_ia(tok: str):
             "score":        score,
             "grade":        grade,
             "signal_note":  signal_note,
-            "signal_time":  first_time,
+            "signal_time":  first_time,    # FROZEN — never changes after first hit
             "source":       source_type,
             "opt_data":     opt_data,
             "strikes":      row.get("strikes", []),
