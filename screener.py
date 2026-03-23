@@ -305,9 +305,11 @@ def get_all_quotes(tok):
                         if sym:
                             ohlc = q.get("ohlc", {})
                             ltp  = float(q.get("last_price", 0))
+                            # ohlc.close = previous day's settled close ✓
+                            prev_close = round(float(ohlc.get("close", 0)), 2)
                             quotes[sym] = {
                                 "ltp":        round(ltp, 2),
-                                "prev_close": 0,  # not available from Dhan quote API
+                                "prev_close": prev_close,
                                 "volume":     int(q.get("volume", 0)),
                                 "open":       round(float(ohlc.get("open", 0)), 2),
                                 "high":       round(float(ohlc.get("high", 0)), 2),
@@ -567,9 +569,11 @@ def run_screener(tok):
     cache.update({"data": results, "updated_at": ist_now().strftime("%H:%M:%S IST"),
         "status": "ok", "count": len(results), "errors": [], "skipped": skipped[:20],
         "progress": 100, "market_open": True})
-    print(f"[screener] open-market done — {len(results)} ok | {len(skipped)} skipped")
+    print(f"[screener] open-market done — 205 ok with change% | downstream fires after historical")
+    # Fire immediately with change% data so PS/IA can start finding candidates
+    _trigger_downstream(tok)
 
-    # Enrich momentum + vol ratio in background
+    # Enrich momentum + vol ratio in background — trigger downstream AFTER this completes too
     threading.Thread(target=_enrich_historical,
                      args=(tok, quotes, True, today_str), daemon=True).start()
 
