@@ -305,11 +305,9 @@ def get_all_quotes(tok):
                         if sym:
                             ohlc = q.get("ohlc", {})
                             ltp  = float(q.get("last_price", 0))
-                            # ohlc.close = previous day's settled close ✓
-                            prev_close = round(float(ohlc.get("close", 0)), 2)
                             quotes[sym] = {
                                 "ltp":        round(ltp, 2),
-                                "prev_close": prev_close,
+                                "prev_close": 0,  # not available from Dhan quote API
                                 "volume":     int(q.get("volume", 0)),
                                 "open":       round(float(ohlc.get("open", 0)), 2),
                                 "high":       round(float(ohlc.get("high", 0)), 2),
@@ -405,26 +403,16 @@ def compute_metrics(q, hist, market_open, today_str):
 
 
 def _trigger_downstream(tok):
-    """Fire PS first, then OIS+IA after PS finishes (they need PS option chain data)."""
-    print(f"[screener] downstream triggered — launching PS→OIS+IA, ND in parallel")
-
-    def _ps_then_rest():
-        # PS first — fetches option chains for all candidates
-        _run_ps_locked(tok)
-        # OIS and IA immediately after PS — now have PCR, OI data
-        if not _ois_lock.locked():
-            threading.Thread(target=_run_ois_locked, args=(tok,), daemon=True).start()
-        if not _ia_lock.locked():
-            threading.Thread(target=_run_ia_locked, args=(tok,), daemon=True).start()
-
+    """Fire PS, ND, OIS, IA after screener data is fully ready with change% and vol ratios."""
+    print(f"[screener] downstream triggered — launching PS, ND, OIS, IA")
     if not _ps_lock.locked():
-        threading.Thread(target=_ps_then_rest, daemon=True).start()
-    else:
-        # PS already running — OIS/IA will get data when PS finishes via next scheduler cycle
-        print(f"[screener] PS already running — OIS/IA will fire after PS completes")
-
+        threading.Thread(target=_run_ps_locked, args=(tok,), daemon=True).start()
     if not _nd_lock.locked():
         threading.Thread(target=_run_nd_locked, args=(tok,), daemon=True).start()
+    # OIS triggers itself after PS via its own route handler
+    # IA triggers after PS (uses PS option chain data)
+    if not _ia_lock.locked():
+        threading.Thread(target=_run_ia_locked, args=(tok,), daemon=True).start()
 
 def run_screener(tok):
     global cache
@@ -570,11 +558,9 @@ def run_screener(tok):
     cache.update({"data": results, "updated_at": ist_now().strftime("%H:%M:%S IST"),
         "status": "ok", "count": len(results), "errors": [], "skipped": skipped[:20],
         "progress": 100, "market_open": True})
-    print(f"[screener] open-market done — 205 ok with change% | downstream fires after historical")
-    # Fire immediately with change% data so PS/IA can start finding candidates
-    _trigger_downstream(tok)
+    print(f"[screener] open-market done — {len(results)} ok | {len(skipped)} skipped")
 
-    # Enrich momentum + vol ratio in background — trigger downstream AFTER this completes too
+    # Enrich momentum + vol ratio in background
     threading.Thread(target=_enrich_historical,
                      args=(tok, quotes, True, today_str), daemon=True).start()
 
@@ -1043,8 +1029,6 @@ def _compute_breakout(tok):
     no_range    = 0
     no_break    = 0
     empty_count = 0
-    err_count   = 0
-    _ts_logged  = False
 
     for sym_info in SYMBOLS:
         sym = sym_info["symbol"]
@@ -1058,11 +1042,7 @@ def _compute_breakout(tok):
                 headers=headers, timeout=10)
             if r.status_code == 429:
                 print(f"[bk] {sym} 429 — sleeping 5s"); time.sleep(5); continue
-            if r.status_code != 200:
-                err_count += 1
-                if err_count <= 2:
-                    print(f"[bk] {sym} HTTP {r.status_code}: {r.text[:120]}")
-                continue
+            if r.status_code != 200: continue
 
             d          = r.json()
             timestamps = d.get("timestamp", [])
@@ -1071,15 +1051,11 @@ def _compute_breakout(tok):
             closes     = d.get("close",  [])
 
             if not timestamps:
-                empty_count += 1
-                if empty_count <= 2:
-                    print(f"[bk] {sym} empty — keys={list(d.keys())}")
-                continue
+                empty_count += 1; continue
 
-            # Log timestamp format on very first response received
-            if not _ts_logged:
-                print(f"[bk] ts_fmt: type={type(timestamps[0]).__name__} sample={str(timestamps[0])[:25]}")
-                _ts_logged = True
+            # Log timestamp format once
+            if ok_count + no_range + no_break + empty_count == 1:
+                print(f"[bk] ts_fmt: type={type(timestamps[0]).__name__} sample={str(timestamps[0])[:22]}")
 
             # ── Step 1: Build 9:15–9:45 opening range ────────────────────────
             range_highs = []; range_lows = []; range_ref = None
@@ -1164,7 +1140,7 @@ def _compute_breakout(tok):
         except Exception as e:
             print(f"[bk] {sym} ERR {type(e).__name__}: {e}"); no_break += 1; continue
 
-    print(f"[bk] done: ok={ok_count} no_range={no_range} no_break={no_break} empty={empty_count} http_err={err_count}")
+    print(f"[bk] done: ok={ok_count} no_range={no_range} no_break={no_break} empty={empty_count}")
     results.sort(key=lambda x: abs(x["current_pct"]), reverse=True)
     _bk_cache.update({
         "data":          results,
@@ -1385,12 +1361,9 @@ def _compute_power_strike(tok):
         if not ltp: continue
         # Relaxed thresholds when market closed — use settled daily data
         chg_min = 1.0 if not market_open else 2.5
-        # vol_ratio=0 early in day (historical not enriched yet) — use todayVol>0 as bypass
         vol_min  = 1.0 if not market_open else 1.5
         if abs(change) < chg_min: continue
-        # Allow through if: vol_ratio meets threshold OR (early day, vol_ratio=0 but todayVol>0)
-        early_day = market_open and vol_ratio == 0 and today_vol > 0
-        if not early_day and vol_ratio < vol_min: continue
+        if vol_ratio < vol_min:   continue
 
         direction = "bull" if change > 0 else "bear"
         momentum_confirms = (direction == "bull" and mom5d > -5) or \
@@ -1411,17 +1384,6 @@ def _compute_power_strike(tok):
         atm_strike  = atm_base if ltp < atm_base else atm_base + strike_step if direction == "bull" else atm_base - strike_step
         est_delta   = 0.60 if (ltp > atm_strike if direction=="bull" else ltp < atm_strike) else 0.45
 
-        # Compute real vol_ratio — volumeRatio may be 0 early in day (historical not yet enriched)
-        # Fall back to todayVol/avgVol7d from screener row
-        if vol_ratio == 0 and avg_vol > 0:
-            vol_ratio = round(today_vol / avg_vol, 2)
-        elif vol_ratio == 0 and avg_vol == 0:
-            # No avg yet — estimate from previous cache run if available
-            prev = next((r for r in cache.get("data", []) if r["symbol"] == sym), {})
-            avg_prev = prev.get("avgVol7d", 0)
-            if avg_prev > 0:
-                vol_ratio = round(today_vol / avg_prev, 2)
-
         if market_open:
             setup_note = f"Live: {'+' if change>0 else ''}{change:.2f}% on {vol_ratio:.1f}× vol"
         else:
@@ -1437,8 +1399,8 @@ def _compute_power_strike(tok):
             "mode": mode, "setup_note": setup_note, "strategy": "Power Strike",
             "action": f"Buy {atm_strike} {'CE' if direction=='bull' else 'PE'}" if atm_strike else "—",
             "opt_data": {}, "opt_score": 0,
-            "signal_time": ist_now().strftime("%H:%M IST"),
-            "strikes": [],
+            "signal_time": ist_now().strftime("%H:%M IST"),  # timestamp when detected
+            "strikes": [],  # will be populated after option chain fetch
         })
 
     print(f"[ps] equity filter: {len(candidates)} candidates — now fetching option chains...")
@@ -1461,12 +1423,7 @@ def _compute_power_strike(tok):
                         nearest_expiry = dates[0]
                         print(f"[ps] expiry: {nearest_expiry}")
                         break
-                    else:
-                        print(f"[ps] expiry {c['symbol']}: 200 but empty data — {r.text[:120]}")
-                else:
-                    print(f"[ps] expiry {c['symbol']}: HTTP {r.status_code} — {r.text[:120]}")
-            except Exception as e:
-                print(f"[ps] expiry {c['symbol']} error: {e}"); continue
+            except: continue
 
     # ── Step 3: Fetch option chain only for candidates ─────────────────────────
     if nearest_expiry:
@@ -1812,8 +1769,9 @@ def _ois_compute_score(row: dict, opt_data: dict) -> int:
 def _compute_ois(tok: str):
     """
     OI Strategy Scanner.
-    Uses Power Strike data if available (has option chains).
-    Falls back to screener cache immediately — no waiting.
+    Waits for Power Strike data (which already fetched option chains),
+    then applies 5-factor scoring + forces ITM strike selection.
+    No extra Dhan API calls needed — reuses _ps_cache data.
     """
     global _ois_cache
     _ois_cache["status"] = "fetching"
@@ -1823,10 +1781,14 @@ def _compute_ois(tok: str):
     source_data = []
 
     if market_open:
-        # Use PS cache if it has data — no waiting
+        # Live market: wait for Power Strike which has option chain data
+        wait = 0
+        while not _ps_cache.get("data") and wait < 180:
+            print(f"[ois] waiting for Power Strike data... ({wait}s)")
+            time.sleep(5); wait += 5
         source_data = _ps_cache.get("data", [])
         if not source_data:
-            print(f"[ois] no PS data yet — using screener cache")
+            print(f"[ois] no PS data live — using screener cache")
 
     # Closed market OR live fallback — build from screener cache directly
     # Lower thresholds: settled daily data, not intraday spikes
@@ -1836,14 +1798,10 @@ def _compute_ois(tok: str):
         for row in cache.get("data", []):
             chg = row.get("change", 0)
             vr  = row.get("volumeRatio", 0)
-            tv  = row.get("todayVol", 0)
-            av  = row.get("avgVol7d", 0)
             ltp = row.get("ltp", 0)
             if not ltp: continue
             if abs(chg) < chg_min: continue
-            # Compute real vol ratio if not yet enriched
-            if vr == 0 and av > 0: vr = round(tv / av, 2)
-            if vr < vol_min and not (market_open and vr == 0 and tv > 0): continue
+            if vr < vol_min: continue
             source_data.append({
                 **row,
                 "direction":  "bull" if chg > 0 else "bear",
@@ -2001,12 +1959,11 @@ def get_ois(x_client_id: str = Header(None), x_access_token: str = Header(None),
 
     should_run = (refresh or _ois_stale()) and not _ois_lock.locked()
     if should_run:
-        def _ps_then_ois():
-            if not _ps_cache.get("data"):
-                print(f"[ois] triggering Power Strike first for option data...")
-                _run_ps_locked(tok)
-            _run_ois_locked(tok)
-        threading.Thread(target=_ps_then_ois, daemon=True).start()
+        # Ensure Power Strike has run first (provides option chain data)
+        if not _ps_cache.get("data") and not _ps_lock.locked():
+            print(f"[ois] triggering Power Strike first for option data...")
+            threading.Thread(target=_run_ps_locked, args=(tok,), daemon=True).start()
+        threading.Thread(target=_run_ois_locked, args=(tok,), daemon=True).start()
     return _ois_cache
 
 
@@ -2060,7 +2017,7 @@ _IA_SCORE_HIGH     = 70
 _IA_SCORE_MIN      = 55
 
 
-def _ia_gate_score(sym, direction, change, vol_ratio, opt_data, eq_score, market_open=True):
+def _ia_gate_score(sym, direction, change, vol_ratio, opt_data, eq_score):
     """Compute institutional score and gate results. Returns (score, gates)."""
     score     = 0
     pcr       = opt_data.get("pcr", 0)
@@ -2070,32 +2027,21 @@ def _ia_gate_score(sym, direction, change, vol_ratio, opt_data, eq_score, market
     pe_vr     = opt_data.get("pe_vol_ratio", 0)
 
     # ── Gate 1: OI Buildup (0 / 15 / 25 pts) ─────────────────────────────
-    # Live: need real OI data. Closed: eq_score alone is sufficient
-    # (option chain data unavailable after hours — use equity signal as proxy)
     if direction == "bull":
         oi_strong  = ce_oi_chg > 0 and ce_vr > 3
-        if market_open:
-            oi_present = ce_oi_chg > 0 or ce_vr > 3
-        else:
-            oi_present = ce_oi_chg > 0 or ce_vr > 3 or eq_score >= 1
+        oi_present = ce_oi_chg > 0 or ce_vr > 3 or eq_score >= 2
     else:
         oi_strong  = pe_oi_chg > 0 and pe_vr > 3
-        if market_open:
-            oi_present = pe_oi_chg > 0 or pe_vr > 3
-        else:
-            oi_present = pe_oi_chg > 0 or pe_vr > 3 or eq_score >= 1
+        oi_present = pe_oi_chg > 0 or pe_vr > 3 or eq_score >= 2
     gate1 = oi_present
     if oi_strong:    score += 25
     elif oi_present: score += 15
 
-    # ── Gate 2: Volume spike ──────────────────────────────────────────────
-    # Live threshold 1.5×, closed threshold 1.0×
-    vol_threshold = _IA_VOL_MIN_LIVE if market_open else _IA_VOL_MIN_CLOSED
-    gate2 = vol_ratio >= vol_threshold
+    # ── Gate 2: Volume spike (0 / 8 / 12 / 18 pts) ───────────────────────
+    gate2 = vol_ratio >= _IA_VOL_MIN_LIVE
     if vol_ratio >= 3.0:   score += 18
     elif vol_ratio >= 2.0: score += 12
     elif vol_ratio >= 1.5: score +=  8
-    elif vol_ratio >= 1.0: score +=  4   # partial credit for closed market
 
     # ── Gate 3: PCR alignment (0 / 15 / 22 pts) ──────────────────────────
     if direction == "bull":
@@ -2137,63 +2083,7 @@ def _ia_gate_score(sym, direction, change, vol_ratio, opt_data, eq_score, market
     return min(score, 100), gates
 
 
-_ia_first_seen = {}          # sym_dir → "HH:MM IST" — in-memory
-_IA_FIRST_SEEN_PATH = "/tmp/ia_first_seen.json"   # persists across restarts
-
-def _ia_load_first_seen():
-    """Load first-seen times from disk on startup."""
-    global _ia_first_seen
-    try:
-        with open(_IA_FIRST_SEEN_PATH) as f:
-            data = json.load(f)
-        # Keep only today's entries — each new trading day starts fresh
-        today = ist_now().strftime("%Y-%m-%d")
-        _ia_first_seen = {k: v for k, v in data.items()
-                          if v.get("date") == today}
-        # Back-fill display string for older entries that lack it
-        for key, entry in _ia_first_seen.items():
-            if "display" not in entry and "time" in entry:
-                entry["display"] = f"{entry['time']} IST"
-        print(f"[ia] loaded {len(_ia_first_seen)} first-seen times from disk (today={today})")
-    except:
-        _ia_first_seen = {}
-
-def _ia_save_first_seen():
-    """Persist first-seen times to disk."""
-    try:
-        with open(_IA_FIRST_SEEN_PATH, "w") as f:
-            json.dump(_ia_first_seen, f)
-    except:
-        pass
-
-def _ia_get_first_time(sym_key: str) -> str:
-    """
-    Return the first time this signal was ever detected.
-    Format: "20 Mar, 10:23 IST"
-    If never seen before → stamp NOW and persist to disk immediately.
-    If seen before → return original stamp, never overwrite.
-    """
-    if sym_key in _ia_first_seen:
-        entry = _ia_first_seen[sym_key]
-        # Return full display string if stored, else build from parts
-        return entry.get("display") or f"{entry.get('time', '—')} IST"
-
-    # Brand new signal — stamp it with full date+time
-    now      = ist_now()
-    display  = now.strftime("%d %b, %H:%M IST").lstrip("0")  # e.g. "20 Mar, 10:23 IST"
-    date_str = now.strftime("%Y-%m-%d")
-
-    _ia_first_seen[sym_key] = {
-        "display": display,
-        "date":    date_str,
-        "time":    now.strftime("%H:%M"),  # kept for legacy compat
-    }
-    _ia_save_first_seen()
-    print(f"[ia] NEW signal: {sym_key} first seen at {display}")
-    return display
-
-# Load on startup
-_ia_load_first_seen()
+_ia_first_seen = {}   # sym → "HH:MM IST" — preserved across scans so time never resets
 
 
 def _compute_ia(tok: str):
@@ -2214,31 +2104,24 @@ def _compute_ia(tok: str):
         source_type = "screener"
         for row in cache.get("data", []):
             chg = row.get("change", 0)
-            vr       = row.get("volumeRatio", 0)
-            tv       = row.get("todayVol", 0)
-            av       = row.get("avgVol7d", 0)
-            ltp      = row.get("ltp", 0)
-            if not ltp or abs(chg) < chg_min: continue
-            # Compute real vol ratio if not yet enriched
-            if vr == 0 and av > 0: vr = round(tv / av, 2)
-            # Early day bypass: no avg yet but stock is trading
-            early_day = market_open and vr == 0 and tv > 0
-            if not early_day and vr < vol_min: continue
-            sym_key    = f"{row.get('symbol','')}_{('bull' if chg > 0 else 'bear')}"
-            first_time = _ia_get_first_time(sym_key)
+            vr  = row.get("volumeRatio", 0)
+            ltp = row.get("ltp", 0)
+            if not ltp or abs(chg) < chg_min or vr < vol_min:
+                continue
+            sym_key = f"{row.get('symbol','')}_{('bull' if chg > 0 else 'bear')}"
+            if sym_key not in _ia_first_seen:
+                _ia_first_seen[sym_key] = ist_now().strftime("%H:%M IST")
             source.append({
                 **row,
                 "direction":   "bull" if chg > 0 else "bear",
                 "opt_data":    {},
                 "opt_score":   0,
                 "eq_score":    2 if abs(chg) >= 2.5 else 1,
-                "volRatio":    vr,   # computed above — not raw 0
-                "todayVol":    tv,
-                "signal_time": first_time,
+                "volRatio":    vr,
+                "signal_time": _ia_first_seen[sym_key],
             })
 
     print(f"[ia] {len(source)} candidates from {source_type}")
-    _ia_debug = []  # track rejections for first 5
     results = []
 
     for row in source:
@@ -2250,34 +2133,20 @@ def _compute_ia(tok: str):
         opt_data  = row.get("opt_data") or {}
         eq_score  = row.get("eq_score", 0)
 
-        if not spot or abs(change) < chg_min: continue
-        # Early day bypass: volumeRatio=0 but stock is trading
-        early_day = market_open and vol_ratio == 0 and row.get("todayVol", 0) > 0
-        if not early_day and vol_ratio < (_IA_VOL_MIN_LIVE if market_open else _IA_VOL_MIN_CLOSED):
+        if not spot or abs(change) < chg_min or vol_ratio < vol_min:
             continue
 
         score, gates = _ia_gate_score(sym, direction, change, vol_ratio,
-                                      opt_data, eq_score, market_open)
+                                      opt_data, eq_score)
 
-        # Early day: vol not yet computed — Gate 2 passes automatically
-        if early_day:
-            gates["vol_spike"] = True
-            gates["all_gates"] = gates["oi_buildup"] and gates["pcr_aligned"]
-
-        # Debug first 3 candidates
-        if len(_ia_debug) < 3:
-            _ia_debug.append(f"{sym}({direction}) chg={change:.1f}% pcr={gates['pcr_value']} "
-                             f"oi={gates['oi_buildup']} vol={gates['vol_spike']} pcr_gate={gates['pcr_aligned']} "
-                             f"score={score} early={early_day}")
-
-        # Live: require OI + PCR (vol gate relaxed early day).
-        # Also relax PCR gate if move is very strong (≥4%) — price action confirms direction.
-        strong_move = abs(change) >= 4.0
+        # Live: all 3 gates required.
+        # Closed: OI + vol sufficient (PCR can be stale after hours).
         if market_open:
-            if not gates["oi_buildup"]: continue
-            if not gates["pcr_aligned"] and not strong_move: continue
+            if not gates["all_gates"]:
+                continue
         else:
-            if not (gates["oi_buildup"] and gates["vol_spike"]): continue
+            if not (gates["oi_buildup"] and gates["vol_spike"]):
+                continue
 
         if score < _IA_SCORE_MIN:
             continue
@@ -2323,9 +2192,16 @@ def _compute_ia(tok: str):
         action = (f"Buy {bs} {opt_type} @ ₹{round(bl, 1)}" if bl
                   else f"Buy {bs} {opt_type}")
 
-        # Get first-seen time — disk-backed, survives restarts, never overwrites
+        # Preserve the FIRST time this signal was detected — never overwrite
         sym_key    = f"{sym}_{direction}"
-        first_time = _ia_get_first_time(sym_key)
+        existing   = row.get("signal_time", "")
+        if existing and "IST" in str(existing):
+            first_time = existing          # PS cache has a real signal time
+        elif sym_key in _ia_first_seen:
+            first_time = _ia_first_seen[sym_key]   # seen before — keep original
+        else:
+            first_time = ist_now().strftime("%H:%M IST")   # brand new signal
+        _ia_first_seen[sym_key] = first_time   # lock it in for future scans
 
         results.append({
             "symbol":       sym,
@@ -2353,9 +2229,6 @@ def _compute_ia(tok: str):
             "opt_data":     opt_data,
             "strikes":      row.get("strikes", []),
         })
-
-    if _ia_debug:
-        print(f"[ia] gate debug: {' | '.join(_ia_debug)}")
 
     results.sort(key=lambda x: (
         2 if x["grade"] == "institutional" else
@@ -2431,12 +2304,10 @@ def get_institutional(x_client_id: str = Header(None),
 
     should_run = (refresh or _ia_stale()) and not _ia_lock.locked()
     if should_run:
-        def _ps_then_ia():
-            if not _ps_cache.get("data"):
-                print(f"[ia] triggering Power Strike first...")
-                _run_ps_locked(tok)
-            _run_ia_locked(tok)
-        threading.Thread(target=_ps_then_ia, daemon=True).start()
+        if not _ps_cache.get("data") and not _ps_lock.locked():
+            print(f"[ia] triggering Power Strike first...")
+            threading.Thread(target=_run_ps_locked, args=(tok,), daemon=True).start()
+        threading.Thread(target=_run_ia_locked, args=(tok,), daemon=True).start()
 
     return _ia_cache
 
