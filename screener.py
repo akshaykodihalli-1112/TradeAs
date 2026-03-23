@@ -1373,6 +1373,7 @@ def _compute_power_strike(tok):
     # ── Step 1: Equity filter ─────────────────────────────────────────────────
     candidates = []
     sym_map = {s["symbol"]: s for s in SYMBOLS}
+    _chg_ok = 0; _vol_ok = 0; _total = len(cache.get("data", []))
 
     for row in cache.get("data", []):
         sym       = row["symbol"]
@@ -1383,27 +1384,28 @@ def _compute_power_strike(tok):
         today_vol = row.get("todayVol", 0)
         avg_vol   = row.get("avgVol7d", 0)
         if not ltp: continue
-        # Relaxed thresholds when market closed — use settled daily data
-        chg_min = 1.0 if not market_open else 2.5
-        # vol_ratio=0 early in day (historical not enriched yet) — use todayVol>0 as bypass
-        vol_min  = 1.0 if not market_open else 1.5
+        # Live thresholds — relaxed to catch more institutional moves
+        chg_min = 1.5 if market_open else 1.0   # was 2.5, too strict
+        vol_min = 1.0 if market_open else 0.8   # was 1.5, too strict on broad selloff days
         if abs(change) < chg_min: continue
-        # Allow through if: vol_ratio meets threshold OR (early day, vol_ratio=0 but todayVol>0)
+        _chg_ok += 1
+        # Allow through if vol_ratio=0 but stock is actively trading (historical not enriched)
         early_day = market_open and vol_ratio == 0 and today_vol > 0
         if not early_day and vol_ratio < vol_min: continue
+        _vol_ok += 1
 
         direction = "bull" if change > 0 else "bear"
         momentum_confirms = (direction == "bull" and mom5d > -5) or \
                             (direction == "bear" and mom5d < 5)
 
         eq_score = 0
-        if abs(change) >= 1.0:  eq_score += 1   # any move
-        if abs(change) >= 2.5:  eq_score += 1   # decent
-        if abs(change) >= 4.0:  eq_score += 1   # strong
-        if vol_ratio >= 1.5:    eq_score += 1
-        if vol_ratio >= 2.5:    eq_score += 1
+        if abs(change) >= 1.5:  eq_score += 1
+        if abs(change) >= 2.5:  eq_score += 1
+        if abs(change) >= 4.0:  eq_score += 1
+        if vol_ratio >= 1.0:    eq_score += 1
+        if vol_ratio >= 2.0:    eq_score += 1
         if momentum_confirms:   eq_score += 1
-        min_eq = 2 if market_open else 1
+        min_eq = 1 if market_open else 1   # just need 1 qualifying condition
         if eq_score < min_eq: continue
 
         strike_step = 50 if ltp >= 500 else 25 if ltp >= 100 else 10
@@ -1441,7 +1443,7 @@ def _compute_power_strike(tok):
             "strikes": [],
         })
 
-    print(f"[ps] equity filter: {len(candidates)} candidates — now fetching option chains...")
+    print(f"[ps] equity filter: {len(candidates)} candidates (total={_total} chg_ok={_chg_ok} vol_ok={_vol_ok}) — fetching option chains...")
     _ps_cache["status"] = f"fetching options for {len(candidates)} stocks..."
 
     # ── Step 2: Get nearest expiry once ───────────────────────────────────────
@@ -1537,13 +1539,17 @@ def _compute_next_day(tok):
         avg_vol   = row.get("avgVol7d", 0)
         if not ltp: continue
 
-        # Next Day filters — relaxed when market closed
+        # Compute vol ratio if not enriched yet
+        if vol_ratio == 0 and avg_vol > 0:
+            vol_ratio = round(today_vol / avg_vol, 2)
+
         _mo = is_market_open()
-        chg_min_nd = 1.0 if not _mo else 2.0
-        vol_min_nd  = 1.0 if not _mo else 1.5
+        chg_min_nd = 1.0 if not _mo else 1.5   # was 2.0, lowered
+        vol_min_nd = 0.8 if not _mo else 1.0   # was 1.5, lowered
         if abs(change) < chg_min_nd: continue
-        if vol_ratio < vol_min_nd:   continue
-        if abs(change) > 8.0: continue
+        # Allow early day (vol=0 but trading)
+        if vol_ratio < vol_min_nd and not (_mo and vol_ratio == 0 and today_vol > 0): continue
+        if abs(change) > 10.0: continue
 
         direction = "bull" if change > 0 else "bear"
 
@@ -1831,8 +1837,8 @@ def _compute_ois(tok: str):
     # Closed market OR live fallback — build from screener cache directly
     # Lower thresholds: settled daily data, not intraday spikes
     if not source_data:
-        chg_min = 0.5 if not market_open else 1.5
-        vol_min  = 0.5 if not market_open else 1.2
+        chg_min = 0.5 if not market_open else 1.0   # was 1.5 live
+        vol_min  = 0.5 if not market_open else 0.8   # was 1.2 live
         for row in cache.get("data", []):
             chg = row.get("change", 0)
             vr  = row.get("volumeRatio", 0)
