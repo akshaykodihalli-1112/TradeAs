@@ -405,25 +405,26 @@ def compute_metrics(q, hist, market_open, today_str):
 
 
 def _trigger_downstream(tok):
-    """Fire PS, ND, OIS, IA after screener data is fully ready."""
-    print(f"[screener] downstream triggered — launching PS, ND, OIS, IA")
+    """Fire PS first, then OIS+IA after PS finishes (they need PS option chain data)."""
+    print(f"[screener] downstream triggered — launching PS→OIS+IA, ND in parallel")
 
-    def _ps_then_ois():
-        # Run PS first, then OIS immediately after so OIS gets PS option data
+    def _ps_then_rest():
+        # PS first — fetches option chains for all candidates
         _run_ps_locked(tok)
+        # OIS and IA immediately after PS — now have PCR, OI data
         if not _ois_lock.locked():
-            _run_ois_locked(tok)
+            threading.Thread(target=_run_ois_locked, args=(tok,), daemon=True).start()
+        if not _ia_lock.locked():
+            threading.Thread(target=_run_ia_locked, args=(tok,), daemon=True).start()
 
     if not _ps_lock.locked():
-        threading.Thread(target=_ps_then_ois, daemon=True).start()
-    elif not _ois_lock.locked():
-        # PS already running — just run OIS with whatever is in cache
-        threading.Thread(target=_run_ois_locked, args=(tok,), daemon=True).start()
+        threading.Thread(target=_ps_then_rest, daemon=True).start()
+    else:
+        # PS already running — OIS/IA will get data when PS finishes via next scheduler cycle
+        print(f"[screener] PS already running — OIS/IA will fire after PS completes")
 
     if not _nd_lock.locked():
         threading.Thread(target=_run_nd_locked, args=(tok,), daemon=True).start()
-    if not _ia_lock.locked():
-        threading.Thread(target=_run_ia_locked, args=(tok,), daemon=True).start()
 
 def run_screener(tok):
     global cache
@@ -1410,6 +1411,17 @@ def _compute_power_strike(tok):
         atm_strike  = atm_base if ltp < atm_base else atm_base + strike_step if direction == "bull" else atm_base - strike_step
         est_delta   = 0.60 if (ltp > atm_strike if direction=="bull" else ltp < atm_strike) else 0.45
 
+        # Compute real vol_ratio — volumeRatio may be 0 early in day (historical not yet enriched)
+        # Fall back to todayVol/avgVol7d from screener row
+        if vol_ratio == 0 and avg_vol > 0:
+            vol_ratio = round(today_vol / avg_vol, 2)
+        elif vol_ratio == 0 and avg_vol == 0:
+            # No avg yet — estimate from previous cache run if available
+            prev = next((r for r in cache.get("data", []) if r["symbol"] == sym), {})
+            avg_prev = prev.get("avgVol7d", 0)
+            if avg_prev > 0:
+                vol_ratio = round(today_vol / avg_prev, 2)
+
         if market_open:
             setup_note = f"Live: {'+' if change>0 else ''}{change:.2f}% on {vol_ratio:.1f}× vol"
         else:
@@ -1425,8 +1437,8 @@ def _compute_power_strike(tok):
             "mode": mode, "setup_note": setup_note, "strategy": "Power Strike",
             "action": f"Buy {atm_strike} {'CE' if direction=='bull' else 'PE'}" if atm_strike else "—",
             "opt_data": {}, "opt_score": 0,
-            "signal_time": ist_now().strftime("%H:%M IST"),  # timestamp when detected
-            "strikes": [],  # will be populated after option chain fetch
+            "signal_time": ist_now().strftime("%H:%M IST"),
+            "strikes": [],
         })
 
     print(f"[ps] equity filter: {len(candidates)} candidates — now fetching option chains...")
@@ -1824,10 +1836,14 @@ def _compute_ois(tok: str):
         for row in cache.get("data", []):
             chg = row.get("change", 0)
             vr  = row.get("volumeRatio", 0)
+            tv  = row.get("todayVol", 0)
+            av  = row.get("avgVol7d", 0)
             ltp = row.get("ltp", 0)
             if not ltp: continue
             if abs(chg) < chg_min: continue
-            if vr < vol_min: continue
+            # Compute real vol ratio if not yet enriched
+            if vr == 0 and av > 0: vr = round(tv / av, 2)
+            if vr < vol_min and not (market_open and vr == 0 and tv > 0): continue
             source_data.append({
                 **row,
                 "direction":  "bull" if chg > 0 else "bear",
@@ -1985,11 +2001,12 @@ def get_ois(x_client_id: str = Header(None), x_access_token: str = Header(None),
 
     should_run = (refresh or _ois_stale()) and not _ois_lock.locked()
     if should_run:
-        # Ensure Power Strike has run first (provides option chain data)
-        if not _ps_cache.get("data") and not _ps_lock.locked():
-            print(f"[ois] triggering Power Strike first for option data...")
-            threading.Thread(target=_run_ps_locked, args=(tok,), daemon=True).start()
-        threading.Thread(target=_run_ois_locked, args=(tok,), daemon=True).start()
+        def _ps_then_ois():
+            if not _ps_cache.get("data"):
+                print(f"[ois] triggering Power Strike first for option data...")
+                _run_ps_locked(tok)
+            _run_ois_locked(tok)
+        threading.Thread(target=_ps_then_ois, daemon=True).start()
     return _ois_cache
 
 
@@ -2199,20 +2216,24 @@ def _compute_ia(tok: str):
             chg = row.get("change", 0)
             vr       = row.get("volumeRatio", 0)
             tv       = row.get("todayVol", 0)
+            av       = row.get("avgVol7d", 0)
             ltp      = row.get("ltp", 0)
             if not ltp or abs(chg) < chg_min: continue
-            # Early day bypass: volumeRatio=0 (historical not enriched) but stock is trading
+            # Compute real vol ratio if not yet enriched
+            if vr == 0 and av > 0: vr = round(tv / av, 2)
+            # Early day bypass: no avg yet but stock is trading
             early_day = market_open and vr == 0 and tv > 0
             if not early_day and vr < vol_min: continue
             sym_key    = f"{row.get('symbol','')}_{('bull' if chg > 0 else 'bear')}"
-            first_time = _ia_get_first_time(sym_key)   # stamp or retrieve
+            first_time = _ia_get_first_time(sym_key)
             source.append({
                 **row,
                 "direction":   "bull" if chg > 0 else "bear",
                 "opt_data":    {},
                 "opt_score":   0,
                 "eq_score":    2 if abs(chg) >= 2.5 else 1,
-                "volRatio":    vr,
+                "volRatio":    vr,   # computed above — not raw 0
+                "todayVol":    tv,
                 "signal_time": first_time,
             })
 
@@ -2410,10 +2431,12 @@ def get_institutional(x_client_id: str = Header(None),
 
     should_run = (refresh or _ia_stale()) and not _ia_lock.locked()
     if should_run:
-        if not _ps_cache.get("data") and not _ps_lock.locked():
-            print(f"[ia] triggering Power Strike first...")
-            threading.Thread(target=_run_ps_locked, args=(tok,), daemon=True).start()
-        threading.Thread(target=_run_ia_locked, args=(tok,), daemon=True).start()
+        def _ps_then_ia():
+            if not _ps_cache.get("data"):
+                print(f"[ia] triggering Power Strike first...")
+                _run_ps_locked(tok)
+            _run_ia_locked(tok)
+        threading.Thread(target=_ps_then_ia, daemon=True).start()
 
     return _ia_cache
 
