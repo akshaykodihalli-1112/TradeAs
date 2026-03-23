@@ -403,14 +403,23 @@ def compute_metrics(q, hist, market_open, today_str):
 
 
 def _trigger_downstream(tok):
-    """Fire PS, ND, OIS, IA after screener data is fully ready with change% and vol ratios."""
+    """Fire PS, ND, OIS, IA after screener data is fully ready."""
     print(f"[screener] downstream triggered — launching PS, ND, OIS, IA")
+
+    def _ps_then_ois():
+        # Run PS first, then OIS immediately after so OIS gets PS option data
+        _run_ps_locked(tok)
+        if not _ois_lock.locked():
+            _run_ois_locked(tok)
+
     if not _ps_lock.locked():
-        threading.Thread(target=_run_ps_locked, args=(tok,), daemon=True).start()
+        threading.Thread(target=_ps_then_ois, daemon=True).start()
+    elif not _ois_lock.locked():
+        # PS already running — just run OIS with whatever is in cache
+        threading.Thread(target=_run_ois_locked, args=(tok,), daemon=True).start()
+
     if not _nd_lock.locked():
         threading.Thread(target=_run_nd_locked, args=(tok,), daemon=True).start()
-    # OIS triggers itself after PS via its own route handler
-    # IA triggers after PS (uses PS option chain data)
     if not _ia_lock.locked():
         threading.Thread(target=_run_ia_locked, args=(tok,), daemon=True).start()
 
@@ -1779,9 +1788,8 @@ def _ois_compute_score(row: dict, opt_data: dict) -> int:
 def _compute_ois(tok: str):
     """
     OI Strategy Scanner.
-    Waits for Power Strike data (which already fetched option chains),
-    then applies 5-factor scoring + forces ITM strike selection.
-    No extra Dhan API calls needed — reuses _ps_cache data.
+    Uses Power Strike data if available (has option chains).
+    Falls back to screener cache immediately — no waiting.
     """
     global _ois_cache
     _ois_cache["status"] = "fetching"
@@ -1791,14 +1799,10 @@ def _compute_ois(tok: str):
     source_data = []
 
     if market_open:
-        # Live market: wait for Power Strike which has option chain data
-        wait = 0
-        while not _ps_cache.get("data") and wait < 180:
-            print(f"[ois] waiting for Power Strike data... ({wait}s)")
-            time.sleep(5); wait += 5
+        # Use PS cache if it has data — no waiting
         source_data = _ps_cache.get("data", [])
         if not source_data:
-            print(f"[ois] no PS data live — using screener cache")
+            print(f"[ois] no PS data yet — using screener cache")
 
     # Closed market OR live fallback — build from screener cache directly
     # Lower thresholds: settled daily data, not intraday spikes
@@ -2113,11 +2117,15 @@ def _ia_load_first_seen():
     try:
         with open(_IA_FIRST_SEEN_PATH) as f:
             data = json.load(f)
-        # Only keep entries from today — discard yesterday's signals
+        # Keep only today's entries — each new trading day starts fresh
         today = ist_now().strftime("%Y-%m-%d")
         _ia_first_seen = {k: v for k, v in data.items()
                           if v.get("date") == today}
-        print(f"[ia] loaded {len(_ia_first_seen)} first-seen times from disk")
+        # Back-fill display string for older entries that lack it
+        for key, entry in _ia_first_seen.items():
+            if "display" not in entry and "time" in entry:
+                entry["display"] = f"{entry['time']} IST"
+        print(f"[ia] loaded {len(_ia_first_seen)} first-seen times from disk (today={today})")
     except:
         _ia_first_seen = {}
 
@@ -2132,18 +2140,28 @@ def _ia_save_first_seen():
 def _ia_get_first_time(sym_key: str) -> str:
     """
     Return the first time this signal was ever detected.
+    Format: "20 Mar, 10:23 IST"
     If never seen before → stamp NOW and persist to disk immediately.
-    If seen before → return original time, never overwrite.
+    If seen before → return original stamp, never overwrite.
     """
     if sym_key in _ia_first_seen:
-        return _ia_first_seen[sym_key]["time"]
-    # Brand new signal — stamp it
-    now_str  = ist_now().strftime("%H:%M IST")
-    date_str = ist_now().strftime("%Y-%m-%d")
-    _ia_first_seen[sym_key] = {"time": now_str, "date": date_str}
-    _ia_save_first_seen()   # persist immediately so restart doesn't lose it
-    print(f"[ia] NEW signal: {sym_key} first seen at {now_str}")
-    return now_str
+        entry = _ia_first_seen[sym_key]
+        # Return full display string if stored, else build from parts
+        return entry.get("display") or f"{entry.get('time', '—')} IST"
+
+    # Brand new signal — stamp it with full date+time
+    now      = ist_now()
+    display  = now.strftime("%d %b, %H:%M IST").lstrip("0")  # e.g. "20 Mar, 10:23 IST"
+    date_str = now.strftime("%Y-%m-%d")
+
+    _ia_first_seen[sym_key] = {
+        "display": display,
+        "date":    date_str,
+        "time":    now.strftime("%H:%M"),  # kept for legacy compat
+    }
+    _ia_save_first_seen()
+    print(f"[ia] NEW signal: {sym_key} first seen at {display}")
+    return display
 
 # Load on startup
 _ia_load_first_seen()
