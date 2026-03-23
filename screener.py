@@ -2113,15 +2113,11 @@ def _ia_load_first_seen():
     try:
         with open(_IA_FIRST_SEEN_PATH) as f:
             data = json.load(f)
-        # Keep only today's entries — each new trading day starts fresh
+        # Only keep entries from today — discard yesterday's signals
         today = ist_now().strftime("%Y-%m-%d")
         _ia_first_seen = {k: v for k, v in data.items()
                           if v.get("date") == today}
-        # Back-fill display string for older entries that lack it
-        for key, entry in _ia_first_seen.items():
-            if "display" not in entry and "time" in entry:
-                entry["display"] = f"{entry['time']} IST"
-        print(f"[ia] loaded {len(_ia_first_seen)} first-seen times from disk (today={today})")
+        print(f"[ia] loaded {len(_ia_first_seen)} first-seen times from disk")
     except:
         _ia_first_seen = {}
 
@@ -2136,28 +2132,18 @@ def _ia_save_first_seen():
 def _ia_get_first_time(sym_key: str) -> str:
     """
     Return the first time this signal was ever detected.
-    Format: "20 Mar, 10:23 IST"
     If never seen before → stamp NOW and persist to disk immediately.
-    If seen before → return original stamp, never overwrite.
+    If seen before → return original time, never overwrite.
     """
     if sym_key in _ia_first_seen:
-        entry = _ia_first_seen[sym_key]
-        # Return full display string if stored, else build from parts
-        return entry.get("display") or f"{entry.get('time', '—')} IST"
-
-    # Brand new signal — stamp it with full date+time
-    now      = ist_now()
-    display  = now.strftime("%-d %b, %H:%M IST")   # e.g. "20 Mar, 10:23 IST"
-    date_str = now.strftime("%Y-%m-%d")
-
-    _ia_first_seen[sym_key] = {
-        "display": display,
-        "date":    date_str,
-        "time":    now.strftime("%H:%M"),  # kept for legacy compat
-    }
-    _ia_save_first_seen()
-    print(f"[ia] NEW signal: {sym_key} first seen at {display}")
-    return display
+        return _ia_first_seen[sym_key]["time"]
+    # Brand new signal — stamp it
+    now_str  = ist_now().strftime("%H:%M IST")
+    date_str = ist_now().strftime("%Y-%m-%d")
+    _ia_first_seen[sym_key] = {"time": now_str, "date": date_str}
+    _ia_save_first_seen()   # persist immediately so restart doesn't lose it
+    print(f"[ia] NEW signal: {sym_key} first seen at {now_str}")
+    return now_str
 
 # Load on startup
 _ia_load_first_seen()
