@@ -1384,9 +1384,12 @@ def _compute_power_strike(tok):
         if not ltp: continue
         # Relaxed thresholds when market closed — use settled daily data
         chg_min = 1.0 if not market_open else 2.5
+        # vol_ratio=0 early in day (historical not enriched yet) — use todayVol>0 as bypass
         vol_min  = 1.0 if not market_open else 1.5
         if abs(change) < chg_min: continue
-        if vol_ratio < vol_min:   continue
+        # Allow through if: vol_ratio meets threshold OR (early day, vol_ratio=0 but todayVol>0)
+        early_day = market_open and vol_ratio == 0 and today_vol > 0
+        if not early_day and vol_ratio < vol_min: continue
 
         direction = "bull" if change > 0 else "bear"
         momentum_confirms = (direction == "bull" and mom5d > -5) or \
@@ -1446,7 +1449,12 @@ def _compute_power_strike(tok):
                         nearest_expiry = dates[0]
                         print(f"[ps] expiry: {nearest_expiry}")
                         break
-            except: continue
+                    else:
+                        print(f"[ps] expiry {c['symbol']}: 200 but empty data — {r.text[:120]}")
+                else:
+                    print(f"[ps] expiry {c['symbol']}: HTTP {r.status_code} — {r.text[:120]}")
+            except Exception as e:
+                print(f"[ps] expiry {c['symbol']} error: {e}"); continue
 
     # ── Step 3: Fetch option chain only for candidates ─────────────────────────
     if nearest_expiry:
