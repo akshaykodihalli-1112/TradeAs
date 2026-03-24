@@ -547,21 +547,24 @@ def run_screener(tok):
     cache["progress"] = 60
 
     results, skipped = [], []
+    prev_map = {r["symbol"]: r for r in cache.get("data", [])}
     for sym in SYMBOLS:
         try:
             q = quotes.get(sym["symbol"])
             if not q: skipped.append(f"{sym['symbol']}:no_quote"); continue
-            pc  = q.get("prev_close", 0)
-            ltp = q["ltp"]
-            chg = round((ltp - pc) / pc * 100, 2) if pc else 0.0
-            # Reuse momentum/vol from previous run if available
-            prev = next((r for r in cache.get("data", []) if r["symbol"] == sym["symbol"]), {})
+            pc        = q.get("prev_close", 0)
+            ltp       = q["ltp"]
+            chg       = round((ltp - pc) / pc * 100, 2) if pc else 0.0
+            prev      = prev_map.get(sym["symbol"], {})
+            avg_vol7d = prev.get("avgVol7d", 0)
+            today_vol = q["volume"]
+            vol_ratio = round(today_vol / avg_vol7d, 2) if avg_vol7d > 0 else prev.get("volumeRatio", 0.0)
             results.append({
                 "symbol":      sym["symbol"], "exchange": "NSE",
                 "ltp":         ltp,           "prev_close": pc,
                 "change":      chg,           "momentum5d": prev.get("momentum5d", 0.0),
-                "volumeRatio": prev.get("volumeRatio", 0.0), "todayVol": q["volume"],
-                "avgVol7d":    prev.get("avgVol7d", 0),
+                "volumeRatio": vol_ratio,     "todayVol": today_vol,
+                "avgVol7d":    avg_vol7d,
             })
         except Exception as e:
             skipped.append(f"{sym['symbol']}:{e}")
@@ -1385,12 +1388,18 @@ def _compute_power_strike(tok):
         avg_vol   = row.get("avgVol7d", 0)
         if not ltp: continue
         # Live thresholds — relaxed to catch more institutional moves
-        chg_min = 1.5 if market_open else 1.0   # was 2.5, too strict
-        vol_min = 1.0 if market_open else 0.8   # was 1.5, too strict on broad selloff days
+        chg_min = 1.5 if market_open else 1.0
+        vol_min = 1.0 if market_open else 0.8
         if abs(change) < chg_min: continue
         _chg_ok += 1
-        # Allow through if vol_ratio=0 but stock is actively trading (historical not enriched)
-        early_day = market_open and vol_ratio == 0 and today_vol > 0
+
+        # ── Vol ratio — volumeRatio may be 0 if historical not yet enriched ──
+        # Always try to compute from todayVol/avgVol7d if volumeRatio=0
+        if vol_ratio == 0 and avg_vol > 0:
+            vol_ratio = round(today_vol / avg_vol, 2)
+        # If still 0 — historical not loaded yet, but stock IS trading actively
+        # Allow through so we don't miss the early-morning institutional moves
+        early_day = market_open and vol_ratio == 0 and today_vol > 10000
         if not early_day and vol_ratio < vol_min: continue
         _vol_ok += 1
 
@@ -1413,17 +1422,7 @@ def _compute_power_strike(tok):
         atm_strike  = atm_base if ltp < atm_base else atm_base + strike_step if direction == "bull" else atm_base - strike_step
         est_delta   = 0.60 if (ltp > atm_strike if direction=="bull" else ltp < atm_strike) else 0.45
 
-        # Compute real vol_ratio — volumeRatio may be 0 early in day (historical not yet enriched)
-        # Fall back to todayVol/avgVol7d from screener row
-        if vol_ratio == 0 and avg_vol > 0:
-            vol_ratio = round(today_vol / avg_vol, 2)
-        elif vol_ratio == 0 and avg_vol == 0:
-            # No avg yet — estimate from previous cache run if available
-            prev = next((r for r in cache.get("data", []) if r["symbol"] == sym), {})
-            avg_prev = prev.get("avgVol7d", 0)
-            if avg_prev > 0:
-                vol_ratio = round(today_vol / avg_prev, 2)
-
+        # vol_ratio already computed/fixed above — use as-is
         if market_open:
             setup_note = f"Live: {'+' if change>0 else ''}{change:.2f}% on {vol_ratio:.1f}× vol"
         else:
