@@ -1808,9 +1808,17 @@ def _ois_compute_score(row: dict, opt_data: dict) -> int:
     if direction == "bear" and pe_oi_chg > 0: score += 5
 
     # ── Factor 5: Volume Confirmation (15 pts) ─────────────────────────────
-    if vol_ratio >= 2.0:    score += 15
-    elif vol_ratio >= 1.5:  score += 10
-    elif vol_ratio >= 1.0:  score +=  5
+    # High vol = institutional footprint — matches Dhan's R.Fac signal
+    if vol_ratio >= 3.0:    score += 15   # R.Fac style surge ≥3× — strong institutional
+    elif vol_ratio >= 2.0:  score += 12
+    elif vol_ratio >= 1.5:  score += 8
+    elif vol_ratio >= 1.0:  score += 4
+
+    # ── Vol Surge Bonus (up to +10 pts) — rewards Dhan R.Fac style moves ───
+    # A stock with 3× vol AND a big move is almost always institutional
+    # This ensures PIIND (5.11% + 2.96×) ranks above a 2.5% + 1.5× stock
+    if vol_ratio >= 2.5 and change >= 3.0:  score += 10
+    elif vol_ratio >= 2.0 and change >= 2.0: score += 5
 
     return min(score, 100)
 
@@ -1820,6 +1828,7 @@ def _ois_compute_score(row: dict, opt_data: dict) -> int:
 # Strike and time are frozen at first detection — never change even if stock moves further.
 
 _ois_first_seen      = {}
+_ois_prev_syms       = set()   # sym_direction keys from the PREVIOUS scan — used to detect new entries
 _OIS_FIRST_SEEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ois_first_seen.json")
 
 def _ois_load_first_seen():
@@ -1865,6 +1874,8 @@ def _ois_get_first_entry(sym_key: str, strike: float, ltp: float) -> dict:
     return entry
 
 _ois_load_first_seen()
+# Pre-populate prev_syms from disk so redeploys don't re-stamp today's signals
+_ois_prev_syms.update(_ois_first_seen.keys())
 
 
 def _compute_ois(tok: str):
@@ -1971,10 +1982,25 @@ def _compute_ois(tok: str):
         vr       = row.get("volRatio", 0)
 
         # ── Freeze strike + timestamp at first detection ───────────────────
+        # Rule: stamp First Hit ONLY when stock appears in OIS for the first time.
+        # "First time" = not in _ois_prev_syms (previous scan's result set).
+        # This prevents all stocks getting the same timestamp on the first boot scan.
+        # Once stamped, the timestamp is frozen to disk and never changes.
         sym_key   = f"{sym}_{direction}"
         opt_lbl   = "CE" if direction == "bull" else "PE"
-        frozen    = _ois_get_first_entry(sym_key, bs, bl)
-        # Always show the FIRST strike recommended — never update even if stock moves
+
+        is_new_signal = sym_key not in _ois_prev_syms  # wasn't in last OIS scan
+
+        if is_new_signal and sym_key not in _ois_first_seen:
+            # Genuinely new signal this scan → stamp NOW
+            frozen = _ois_get_first_entry(sym_key, bs, bl)
+        elif sym_key in _ois_first_seen:
+            # Already known → return frozen entry (no disk write)
+            frozen = _ois_first_seen[sym_key]
+        else:
+            # Carried over from prev scan but somehow missing from disk — re-stamp
+            frozen = _ois_get_first_entry(sym_key, bs, bl)
+
         signal_time   = frozen["display"]
         frozen_strike = frozen["strike"]
         frozen_ltp    = frozen["ltp"]
@@ -2032,7 +2058,18 @@ def _compute_ois(tok: str):
             "expiry":           opt_data.get("expiry", ""),
         })
 
-    results.sort(key=lambda x: (x["ois_score"], abs(x["change"])), reverse=True)
+    # Sort: score first, then vol_ratio (R.Fac style — high vol surge ranks higher),
+    # then change% — so PIIND (5.11% + 2.96×) beats a 2.5% + 1.0× stock at same score
+    results.sort(key=lambda x: (
+        x["ois_score"],
+        x.get("volRatio", 0),
+        abs(x["change"])
+    ), reverse=True)
+
+    # Update prev_syms — next scan uses this to detect genuinely new signals
+    _ois_prev_syms.clear()
+    _ois_prev_syms.update(f"{r['symbol']}_{r['direction']}" for r in results)
+
     _ois_cache.update({
         "data":        results,
         "status":      "ok",
@@ -2080,9 +2117,14 @@ def get_ois(x_client_id: str = Header(None), x_access_token: str = Header(None),
     should_run = (refresh or _ois_stale()) and not _ois_lock.locked()
     if should_run:
         def _ps_then_ois():
-            if not _ps_cache.get("data"):
+            if not _ps_cache.get("data") and not _ps_lock.locked():
                 print(f"[ois] triggering Power Strike first for option data...")
                 _run_ps_locked(tok)
+            elif _ps_lock.locked():
+                # Wait for existing PS run to finish
+                print(f"[ois] PS already running — waiting...")
+                while _ps_lock.locked():
+                    time.sleep(5)
             _run_ois_locked(tok)
         threading.Thread(target=_ps_then_ois, daemon=True).start()
     return _ois_cache
@@ -2205,6 +2247,7 @@ def _ia_gate_score(sym, direction, change, vol_ratio, opt_data, eq_score, market
 
 
 _ia_first_seen = {}          # sym_dir → "HH:MM IST" — in-memory
+_ia_prev_syms  = set()       # sym_direction keys from the PREVIOUS IA scan
 _IA_FIRST_SEEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ia_first_seen.json")
 
 def _ia_load_first_seen():
@@ -2233,34 +2276,34 @@ def _ia_save_first_seen():
     except:
         pass
 
-def _ia_get_first_time(sym_key: str) -> str:
+def _ia_get_first_time(sym_key: str, is_new: bool = True) -> str:
     """
     Return the first time this signal was ever detected.
-    Format: "20 Mar, 10:23 IST"
-    If never seen before → stamp NOW and persist to disk immediately.
-    If seen before → return original stamp, never overwrite.
+    is_new=True  → stock just appeared in IA for first time this scan → stamp NOW.
+    is_new=False → stock was in previous scan too → return existing stamp.
+    Once stamped, FROZEN forever for that trading day.
     """
     if sym_key in _ia_first_seen:
         entry = _ia_first_seen[sym_key]
-        # Return full display string if stored, else build from parts
         return entry.get("display") or f"{entry.get('time', '—')} IST"
 
-    # Brand new signal — stamp it with full date+time
     now      = ist_now()
     display  = now.strftime("%H:%M IST")
     date_str = now.strftime("%Y-%m-%d")
-
     _ia_first_seen[sym_key] = {
         "display": display,
         "date":    date_str,
-        "time":    now.strftime("%H:%M"),  # kept for legacy compat
+        "time":    now.strftime("%H:%M"),
     }
     _ia_save_first_seen()
-    print(f"[ia] NEW signal: {sym_key} first seen at {display}")
+    tag = "NEW" if is_new else "RECOVERED"
+    print(f"[ia] {tag} signal: {sym_key} first seen at {display}")
     return display
 
 # Load on startup
 _ia_load_first_seen()
+# Pre-populate prev_syms from disk so redeploys don't re-stamp today's signals
+_ia_prev_syms.update(_ia_first_seen.keys())
 
 
 def _ia_fetch_fresh_option_chain(tok, cid, sym_info, spot, direction, nearest_expiry, headers):
@@ -2577,9 +2620,11 @@ def _compute_ia(tok: str):
                   else f"Buy {bs} {opt_type}")
 
         # ── FIRST HIT — disk-backed, survives redeploys, never overwritten ──
-        # Key = sym + direction (not tied to specific strike price)
+        # Only stamp when stock is NEW to IA results (not in previous scan).
+        # This prevents all stocks getting the same boot-time timestamp.
         sym_key    = f"{sym}_{direction}"
-        first_time = _ia_get_first_time(sym_key)
+        is_new     = sym_key not in _ia_prev_syms
+        first_time = _ia_get_first_time(sym_key, is_new=is_new)
 
         results.append({
             "symbol":       sym,
@@ -2617,6 +2662,10 @@ def _compute_ia(tok: str):
         x["score"],
         abs(x["change"])
     ), reverse=True)
+
+    # Update prev_syms — next scan uses this to detect genuinely new signals
+    _ia_prev_syms.clear()
+    _ia_prev_syms.update(f"{r['symbol']}_{r['direction']}" for r in results)
 
     _ia_cache.update({
         "data":          results,
@@ -2686,9 +2735,13 @@ def get_institutional(x_client_id: str = Header(None),
     should_run = (refresh or _ia_stale()) and not _ia_lock.locked()
     if should_run:
         def _ps_then_ia():
-            if not _ps_cache.get("data"):
+            if not _ps_cache.get("data") and not _ps_lock.locked():
                 print(f"[ia] triggering Power Strike first...")
                 _run_ps_locked(tok)
+            elif _ps_lock.locked():
+                print(f"[ia] PS already running — waiting...")
+                while _ps_lock.locked():
+                    time.sleep(5)
             _run_ia_locked(tok)
         threading.Thread(target=_ps_then_ia, daemon=True).start()
 
