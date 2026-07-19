@@ -2777,3 +2777,158 @@ def ia_top(x_client_id: str = Header(None), x_access_token: str = Header(None)):
         "updated_at": _ia_cache["updated_at"],
         "note":       f"Score ≥{_IA_SCORE_INST}: all 3 gates strong",
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BACKTEST / OPTION CHAIN ANALYSIS ENDPOINTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/api/symbols")
+def get_symbols():
+    """Return all FNO symbols with their security IDs — used for search dropdown."""
+    return {
+        "symbols": [{"symbol": s["symbol"], "security_id": s["security_id"]} for s in SYMBOLS],
+        "count":   len(SYMBOLS),
+    }
+
+
+@app.get("/api/optionchain/expiry")
+def get_expiry(security_id: str = Query(...),
+               x_client_id: str = Header(None),
+               x_access_token: str = Header(None)):
+    """Fetch available expiry dates for a symbol."""
+    tok = x_access_token or CREDS.get("access_token", "")
+    cid = x_client_id   or CREDS.get("client_id", "")
+    if not tok or not cid:
+        return {"status": "no_credentials", "data": []}
+    headers = {"access-token": tok, "client-id": cid, "Content-Type": "application/json"}
+    try:
+        r = requests.post(
+            f"{DHAN_BASE}/v2/optionchain/expirylist",
+            json={"UnderlyingScrip": int(security_id), "UnderlyingSeg": "NSE_EQ"},
+            headers=headers, timeout=10
+        )
+        if r.status_code == 200:
+            return {"status": "ok", "data": r.json().get("data", [])}
+        return {"status": "error", "code": r.status_code}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.get("/api/optionchain/chain")
+def get_option_chain(security_id: str = Query(...),
+                     expiry: str = Query(...),
+                     x_client_id: str = Header(None),
+                     x_access_token: str = Header(None)):
+    """
+    Fetch full option chain for a symbol + expiry.
+    Returns all strikes with CE/PE OI, volume, LTP, IV, greeks, OI change.
+    """
+    tok = x_access_token or CREDS.get("access_token", "")
+    cid = x_client_id   or CREDS.get("client_id", "")
+    if not tok or not cid:
+        return {"status": "no_credentials", "data": {}}
+    headers = {"access-token": tok, "client-id": cid, "Content-Type": "application/json"}
+    try:
+        r = requests.post(
+            f"{DHAN_BASE}/v2/optionchain",
+            json={"UnderlyingScrip": int(security_id), "UnderlyingSeg": "NSE_EQ",
+                  "Expiry": expiry},
+            headers=headers, timeout=15
+        )
+        if r.status_code != 200:
+            return {"status": "error", "code": r.status_code}
+
+        resp = r.json()
+        if resp.get("status") != "success":
+            return {"status": "error", "msg": resp.get("remarks", "unknown")}
+
+        raw_oc = resp.get("data", {}).get("oc", {})
+        spot   = resp.get("data", {}).get("last_price", 0)
+
+        # Parse and enrich each strike
+        strikes = []
+        total_ce_oi = total_pe_oi = 0
+        for strike_str, sd in raw_oc.items():
+            sp  = float(strike_str)
+            ce  = sd.get("ce", {})
+            pe  = sd.get("pe", {})
+
+            ce_oi      = int(ce.get("oi", 0))
+            pe_oi      = int(pe.get("oi", 0))
+            ce_prev_oi = int(ce.get("previous_oi", 0))
+            pe_prev_oi = int(pe.get("previous_oi", 0))
+            ce_vol     = int(ce.get("volume", 0))
+            pe_vol     = int(pe.get("volume", 0))
+            ce_ltp     = float(ce.get("last_price", 0))
+            pe_ltp     = float(pe.get("last_price", 0))
+            ce_iv      = float(ce.get("implied_volatility", 0))
+            pe_iv      = float(pe.get("implied_volatility", 0))
+            ce_delta   = float(ce.get("greeks", {}).get("delta", 0))
+            pe_delta   = float(pe.get("greeks", {}).get("delta", 0))
+            ce_oi_chg  = ce_oi - ce_prev_oi
+            pe_oi_chg  = pe_oi - pe_prev_oi
+
+            total_ce_oi += ce_oi
+            total_pe_oi += pe_oi
+
+            # Buildup signal per strike
+            if ce_oi_chg > 0 and ce_ltp > 0:   ce_signal = "Long Buildup"
+            elif ce_oi_chg < 0 and ce_ltp > 0: ce_signal = "Short Covering"
+            elif ce_oi_chg > 0:                 ce_signal = "Short Buildup"
+            else:                               ce_signal = "—"
+
+            if pe_oi_chg > 0 and pe_ltp > 0:   pe_signal = "Short Buildup"
+            elif pe_oi_chg < 0 and pe_ltp > 0: pe_signal = "Long Covering"
+            elif pe_oi_chg > 0:                 pe_signal = "OI Add"
+            else:                               pe_signal = "—"
+
+            # Vol ratio vs OI (institutional footprint)
+            ce_vr = round(ce_vol / (ce_oi / 100), 2) if ce_oi > 0 else 0
+            pe_vr = round(pe_vol / (pe_oi / 100), 2) if pe_oi > 0 else 0
+
+            moneyness = "ATM"
+            if spot:
+                if sp < spot * 0.995:  moneyness = "ITM-CE / OTM-PE"
+                elif sp > spot * 1.005: moneyness = "OTM-CE / ITM-PE"
+
+            strikes.append({
+                "strike":     sp,
+                "moneyness":  moneyness,
+                "ce_ltp":     round(ce_ltp, 2),
+                "pe_ltp":     round(pe_ltp, 2),
+                "ce_oi":      ce_oi,
+                "pe_oi":      pe_oi,
+                "ce_oi_chg":  ce_oi_chg,
+                "pe_oi_chg":  pe_oi_chg,
+                "ce_vol":     ce_vol,
+                "pe_vol":     pe_vol,
+                "ce_iv":      round(ce_iv, 1),
+                "pe_iv":      round(pe_iv, 1),
+                "ce_delta":   round(ce_delta, 3),
+                "pe_delta":   round(pe_delta, 3),
+                "ce_vr":      ce_vr,
+                "pe_vr":      pe_vr,
+                "ce_signal":  ce_signal,
+                "pe_signal":  pe_signal,
+            })
+
+        # Sort by strike
+        strikes.sort(key=lambda x: x["strike"])
+        pcr = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi else 0
+
+        return {
+            "status":       "ok",
+            "symbol":       next((s["symbol"] for s in SYMBOLS
+                                  if str(s["security_id"]) == str(security_id)), security_id),
+            "security_id":  security_id,
+            "expiry":       expiry,
+            "spot":         spot,
+            "pcr":          pcr,
+            "total_ce_oi":  total_ce_oi,
+            "total_pe_oi":  total_pe_oi,
+            "strikes":      strikes,
+            "fetched_at":   ist_now().strftime("%H:%M:%S IST"),
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
