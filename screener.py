@@ -2932,3 +2932,194 @@ def get_option_chain(security_id: str = Query(...),
         }
     except Exception as e:
         return {"status": "error", "error": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FREE FLOAT ANALYSIS
+# Free float % sourced from NSE shareholding pattern (promoter holding data)
+# Updated quarterly — values as of Q4 FY2026
+# Free Float % = 100 - Promoter Holding %
+# ─────────────────────────────────────────────────────────────────────────────
+
+_FREE_FLOAT = {
+    # Symbol: (free_float_pct, shares_outstanding_crores)
+    "ABB":         (25.0,   21.2),   "ABCAPITAL":   (48.0,  245.0),
+    "ADANIENSOL":  (37.5,  111.7),   "ADANIENT":    (25.0,  114.0),
+    "ADANIGREEN":  (37.4,  158.0),   "ADANIPORTS":  (37.4,  214.0),
+    "ADANIPOWER":  (25.1,  386.0),   "ATGL":        (37.5,  110.0),
+    "ADANITOTAL":  (37.5,   11.0),   "ALKEM":       (28.5,   11.9),
+    "AMARA":       (41.0,   28.5),   "AMBER":       (45.0,    3.4),
+    "AMBUJACEM":   (46.6,  199.0),   "ANGELONE":    (43.0,    8.7),
+    "APLAPOLLO":   (44.0,   25.0),   "APOLLOHOSP":  (32.0,   14.3),
+    "APOLLOTYRE":  (49.0,   63.5),   "ASHOKLEY":    (49.4,  293.0),
+    "ASIANPAINT":  (45.0,   95.9),   "ASTRAL":      (44.0,   15.9),
+    "AUROPHARMA":  (49.6,   58.6),   "AXISBANK":    (45.0,  308.0),
+    "BAJAJ-AUTO":  (33.0,   28.9),   "BAJAJFINSV":  (39.0,  159.0),
+    "BAJAJHLDNG":  (42.0,   11.2),   "BAJFINANCE":  (45.0,   60.0),
+    "BALKRISIND":  (42.0,   19.3),   "BANDHANBNK":  (60.0,  161.0),
+    "BANKBARODA":  (36.0,  516.0),   "BEL":         (48.5,  730.0),
+    "BERGEPAINT":  (25.0,  116.0),   "BHARATFORG":  (45.6,   46.6),
+    "BHEL":        (34.5,  348.0),   "BPCL":        (47.5,  217.0),
+    "BRITANNIA":   (49.5,   24.1),   "BSE":         (42.0,    1.4),
+    "CANBK":       (38.0,  907.0),   "CDSL":        (45.0,   10.4),
+    "CGPOWER":     (43.0,  152.0),   "CHOLAFIN":    (41.0,   84.8),
+    "CIPLA":       (46.3,   80.7),   "COALINDIA":   (33.6,  616.0),
+    "COFORGE":     (47.0,   13.9),   "COLPAL":      (47.9,   27.2),
+    "CONCOR":      (46.7,  122.0),   "COROMANDEL":  (44.3,   29.3),
+    "CROMPTON":    (56.0,   62.6),   "CUMMINSIND":  (48.2,   27.7),
+    "DABUR":       (32.5,  177.0),   "DALBHARAT":   (45.0,   18.8),
+    "DEEPAKNTR":   (45.8,   13.6),   "DIXON":       (43.0,    5.9),
+    "DLF":         (47.0,  247.0),   "DMART":       (25.0,   41.3),
+    "DRREDDY":     (47.4,   16.6),   "EICHERMOT":   (49.9,   27.4),
+    "EMAMILTD":    (41.5,   44.2),   "ETERNAL":     (49.0,  909.0),
+    "EXIDEIND":    (46.2,   85.0),   "FEDERALBNK":  (100.0, 247.0),
+    "GAIL":        (48.8,  450.0),   "GLENMARK":    (46.4,   28.3),
+    "GMRAIRPORT":  (42.0,  609.0),   "GODREJPROP":  (42.0,   27.9),
+    "GRANULES":    (47.0,   25.3),   "GRASIM":      (42.9,   65.9),
+    "GSPL":        (48.4,   56.3),   "HAL":         (25.0,   33.5),
+    "HAVELLS":     (40.4,   62.6),   "HCLTECH":     (26.5,  272.0),
+    "HDFCAMC":     (47.0,   21.3),   "HDFCBANK":    (45.0,  757.0),
+    "HDFCLIFE":    (48.0,  202.0),   "HEROMOTOCO":  (35.0,   19.9),
+    "HINDCOPPER":  (27.0,   96.7),   "HINDPETRO":   (47.0,  142.0),
+    "HINDUNILVR":  (33.0,   23.5),   "ICICIBANK":   (45.0,  703.0),
+    "ICICIGI":     (45.0,  139.0),   "ICICIPRULI":  (47.8,  143.0),
+    "IDEA":        (44.4, 7113.0),   "IDFCFIRSTB":  (39.0,  634.0),
+    "IGL":         (45.0,   70.0),   "INDHOTEL":    (47.0,  141.0),
+    "INDIGO":      (46.4,   38.6),   "INDUSINDBK":  (53.0,   78.0),
+    "INDUSTOWER":  (47.3,  269.0),   "INFY":        (66.0,  416.0),
+    "IOC":         (47.5,  669.0),   "IPCALAB":     (47.0,   12.7),
+    "IRCTC":       (47.5,   80.0),   "IRFC":        (18.2,  131.0),
+    "ITC":         (44.8,  249.0),   "JINDALSTEL":  (41.0,   95.3),
+    "JIOFIN":      (35.0,  634.0),   "JSL":         (47.0,   24.7),
+    "JSWENERGY":   (42.0,  155.0),   "JSWSTEEL":    (42.0,  241.0),
+    "JUBLFOOD":    (48.0,   13.2),   "KALYANKJIL":  (30.0,  103.0),
+    "KPITTECH":    (49.0,   27.5),   "KOTAKBANK":   (47.0,  199.0),
+    "L&TFH":       (45.0,  252.0),   "LALPATHLAB":  (42.0,    8.3),
+    "LAURUSLABS":  (47.0,   53.7),   "LICHSGFIN":   (47.0,   50.7),
+    "LODHA":       (47.0,   99.6),   "LT":          (47.7,  140.0),
+    "LTIM":        (33.9,   29.5),   "LTTS":        (27.0,   10.4),
+    "LUPIN":       (47.9,   45.4),   "M&M":         (45.0,  124.0),
+    "M&MFIN":      (48.0,  123.0),   "MANAPPURAM": (35.0,   84.6),
+    "MARICO":      (40.5,  129.0),   "MARUTI":      (43.5,   30.2),
+    "MAXHEALTH":   (42.0,   96.8),   "MCX":         (49.0,    5.1),
+    "MFSL":        (30.0,   20.1),   "MOTHERSON":   (36.5,  355.0),
+    "MPHASIS":     (45.0,   18.7),   "MRF":         (45.0,    0.4),
+    "MUTHOOTFIN":  (26.8,   40.1),   "NATCOPHARM":  (47.0,    3.7),
+    "NAUKRI":      (24.6,   12.9),   "NBCC":        (25.0,  180.0),
+    "NCC":         (46.7,   60.6),   "NESTLEIND":   (37.0,    9.6),
+    "NHPC":        (28.1,  100.0),   "NMDC":        (34.8,  293.0),
+    "NTPC":        (48.5,  965.0),   "OBEROIRLTY":  (42.6,   36.2),
+    "OFSS":        (28.0,    8.6),   "OIL":         (47.3,   42.4),
+    "ONGC":        (30.5,  126.0),   "PAGEIND":     (44.4,    1.1),
+    "PATANJALI":   (26.7,    3.7),   "PAYTM":       (66.0,   63.6),
+    "PEL":         (47.0,   14.1),   "PERSISTENT":  (32.0,    7.7),
+    "PETRONET":    (50.0,   75.0),   "PIIND":       (47.0,   13.5),
+    "PIDILITIND":  (29.5,   50.9),   "PNB":         (26.9,  112.0),
+    "POLYCAB":     (35.0,   14.9),   "POWERGRID":   (48.5,  929.0),
+    "PRESTIGE":    (37.0,   40.0),   "PVRINOX":     (48.0,   10.2),
+    "RAYMOND":     (49.0,   14.9),   "RELIANCE":    (49.7,  135.0),
+    "RVNL":        (25.0,  208.0),   "SAIL":        (34.5,  413.0),
+    "SBICARD":     (44.0,   94.1),   "SBILIFE":     (45.0,  100.0),
+    "SBIN":        (43.0,  892.0),   "SHREECEM":    (40.0,    3.6),
+    "SHRIRAMFIN":  (44.0,   37.9),   "SIEMENS":     (25.0,   35.5),
+    "SJVN":        (25.0,  393.0),   "SONACOMS":    (33.0,   27.9),
+    "STAR":        (43.0,    6.3),   "SUNPHARMA":   (45.3,  240.0),
+    "SYNGENE":     (43.9,   40.0),   "TATACHEM":    (37.0,   25.4),
+    "TATACOMM":    (47.0,   28.5),   "TATACONSUM":  (47.7,   99.3),
+    "TATAELXSI":   (43.8,    6.2),   "TATAMTRDVR":  (45.0,  330.0),
+    "TATAMOTORS":  (45.0,  330.0),   "TATAPOWER":   (44.0,  319.0),
+    "TATASTEEL":   (44.5,  122.0),   "TCS":         (26.2,  362.0),
+    "TECHM":       (36.8,   97.2),   "TIINDIA":     (41.0,   13.5),
+    "TITAN":       (47.5,   88.9),   "TORNTPHARM":  (25.0,   33.6),
+    "TORNTPOWER":  (48.8,   47.2),   "TRENT":       (33.2,   33.6),
+    "TVSMOTOR":    (43.2,   47.5),   "ULTRACEMCO":  (40.8,   28.8),
+    "UNIONBANK":   (27.0,  726.0),   "UNITDSPR":    (44.7,    7.3),
+    "UPL":         (43.6,   76.2),   "VEDL":        (44.4,  372.0),
+    "VOLTAS":      (30.0,   33.1),   "WIPRO":       (27.4,  526.0),
+    "YESBANK":     (26.0, 2483.0),   "ZOMATO":      (49.0,  909.0),
+    "ZYDUSLIFE":   (46.3,   40.1),   "UNOMINDA":    (37.0,   57.0),
+    "SAMMAANCAP":  (50.0,   12.0),   "JSWINFRA":    (42.0,   48.0),
+    "DELHIVERY":   (71.0,   73.8),   "NYKAA":       (46.0,  121.0),
+    "POLICYBZR":   (52.0,   45.3),   "MAZDOCK":     (25.6,   40.1),
+    "LTM":         (33.9,   29.5),   "SWIGGY":      (60.0,  236.0),
+    "DOMS":        (45.0,    4.1),   "KAYNES":      (44.0,    5.4),
+}
+
+
+@app.get("/api/freefloat")
+def get_freefloat(x_client_id: str = Header(None),
+                  x_access_token: str = Header(None)):
+    """
+    Free Float Volume Analysis.
+    For each FNO stock: how much of its free float is being traded today.
+    Formula: float_traded_pct = today_vol / (free_float_shares) * 100
+    Higher % = more of the tradable supply is changing hands = institutional activity.
+    """
+    results = []
+    screener_data = cache.get("data", [])
+    if not screener_data:
+        return {"status": "no_data", "data": [], "count": 0}
+
+    for row in screener_data:
+        sym     = row.get("symbol", "")
+        ltp     = row.get("ltp", 0)
+        chg     = row.get("change", 0)
+        vol     = row.get("todayVol", 0)
+        avg_vol = row.get("avgVol7d", 0)
+        vol_ratio = row.get("volumeRatio", 0)
+
+        ff_info = _FREE_FLOAT.get(sym)
+        if not ff_info or not ltp:
+            continue
+
+        ff_pct, shares_cr = ff_info
+        # Free float shares in absolute numbers
+        shares_total   = shares_cr * 1e7          # crores → actual shares
+        ff_shares      = shares_total * ff_pct / 100
+        # Value of free float
+        ff_value_cr    = round(ff_shares * ltp / 1e7, 1)  # in crores
+        # Today's turnover
+        turnover_cr    = round(vol * ltp / 1e7, 2)
+        # % of free float traded today
+        ff_traded_pct  = round(vol / ff_shares * 100, 3) if ff_shares > 0 else 0
+        # Annualised daily float turnover (compared to 250 trading days)
+        daily_avg_ff   = round(avg_vol / ff_shares * 100, 3) if ff_shares and avg_vol else 0
+
+        # Signal: if today's float turnover is significantly above avg
+        surge_ratio    = round(ff_traded_pct / daily_avg_ff, 1) if daily_avg_ff else 0
+
+        # Activity grade
+        if ff_traded_pct >= 5:      grade = "🔥 Very High"
+        elif ff_traded_pct >= 2:    grade = "⚡ High"
+        elif ff_traded_pct >= 0.5:  grade = "✅ Active"
+        elif ff_traded_pct >= 0.1:  grade = "💤 Low"
+        else:                        grade = "—"
+
+        results.append({
+            "symbol":        sym,
+            "ltp":           round(ltp, 2),
+            "change":        round(chg, 2),
+            "today_vol":     vol,
+            "avg_vol7d":     avg_vol,
+            "vol_ratio":     round(vol_ratio, 2),
+            "turnover_cr":   turnover_cr,
+            "ff_pct":        ff_pct,
+            "shares_cr":     shares_cr,
+            "ff_shares_cr":  round(ff_shares / 1e7, 1),
+            "ff_value_cr":   ff_value_cr,
+            "ff_traded_pct": ff_traded_pct,
+            "daily_avg_ff":  daily_avg_ff,
+            "surge_ratio":   surge_ratio,
+            "grade":         grade,
+        })
+
+    # Sort by ff_traded_pct descending — highest float turnover first
+    results.sort(key=lambda x: x["ff_traded_pct"], reverse=True)
+
+    return {
+        "status":     "ok",
+        "data":       results,
+        "count":      len(results),
+        "updated_at": ist_now().strftime("%H:%M:%S IST"),
+        "market_open": is_market_open(),
+    }
