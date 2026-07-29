@@ -2846,7 +2846,7 @@ def _ia_stale() -> bool:
         t = datetime.strptime(last, "%H:%M:%S IST").replace(
             year=ist_now().year, month=ist_now().month,
             day=ist_now().day, tzinfo=IST)
-        threshold = 90 if is_market_open() else 3600
+        threshold = 120 if is_market_open() else 3600
         return (ist_now() - t).seconds > threshold
     except:
         return True
@@ -2860,7 +2860,7 @@ def _ia_scheduled():
     if _ia_lock.locked(): return
     threading.Thread(target=_run_ia_locked, args=(tok,), daemon=True).start()
 
-scheduler.add_job(_ia_scheduled, "interval", seconds=90, id="ia_scanner")
+scheduler.add_job(_ia_scheduled, "interval", minutes=2, id="ia_scanner")
 
 
 @app.get("/api/institutional")
