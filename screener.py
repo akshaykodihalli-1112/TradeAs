@@ -1692,7 +1692,7 @@ def _ps_stale():
     try:
         t = datetime.strptime(last, "%H:%M:%S IST").replace(
             year=ist_now().year, month=ist_now().month, day=ist_now().day, tzinfo=IST)
-        return (ist_now() - t).seconds > 300
+        return (ist_now() - t).seconds > (120 if is_market_open() else 3600)
     except: return True
 
 @app.get("/api/powerstrike")
@@ -1704,6 +1704,7 @@ def get_power_strike(x_client_id:str=Header(None), x_access_token:str=Header(Non
     CREDS["client_id"]=cid; CREDS["access_token"]=tok
     should_run = (refresh or _ps_stale()) and not _ps_lock.locked()
     if should_run:
+        _ps_cache["status"] = "fetching"
         threading.Thread(target=_run_ps_locked, args=(tok,), daemon=True).start()
     return _ps_cache
 
@@ -1896,8 +1897,8 @@ def _ois_load_first_seen():
     try:
         with open(_OIS_FIRST_SEEN_PATH) as f:
             data = json.load(f)
-        today = ist_now().strftime("%Y-%m-%d")
-        _ois_first_seen = {k: v for k, v in data.items() if v.get("date") == today}
+        session_date = _last_trading_day()
+        _ois_first_seen = {k: v for k, v in data.items() if v.get("date") == session_date}
         # Back-fill display string for older entries
         for entry in _ois_first_seen.values():
             if "display" not in entry and "time" in entry:
@@ -1921,10 +1922,11 @@ def _ois_get_first_entry(sym_key: str, strike: float, ltp: float) -> dict:
     if sym_key in _ois_first_seen:
         return _ois_first_seen[sym_key]
     now     = ist_now()
-    display = now.strftime("%H:%M IST")
+    session_date = _last_trading_day()
+    display = now.strftime("%H:%M IST") if is_market_open() else "15:30 IST"
     entry   = {
         "display": display,
-        "date":    now.strftime("%Y-%m-%d"),
+        "date":    session_date,
         "strike":  strike,
         "ltp":     ltp,
     }
@@ -2175,6 +2177,7 @@ def get_ois(x_client_id: str = Header(None), x_access_token: str = Header(None),
 
     should_run = (refresh or _ois_stale()) and not _ois_lock.locked()
     if should_run:
+        _ois_cache["status"] = "fetching"
         def _ps_then_ois():
             if not _ps_cache.get("data") and not _ps_lock.locked():
                 print(f"[ois] triggering Power Strike first for option data...")
@@ -2315,8 +2318,8 @@ def _ia_load_first_seen():
     try:
         with open(_IA_FIRST_SEEN_PATH) as f:
             data = json.load(f)
-        # Keep only today's entries — each new trading day starts fresh
-        today = ist_now().strftime("%Y-%m-%d")
+        # Before the next session opens, retain the latest completed session.
+        today = _last_trading_day()
         _ia_first_seen = {k: v for k, v in data.items()
                           if v.get("date") == today}
         # Back-fill display string for older entries that lack it
@@ -2347,8 +2350,8 @@ def _ia_get_first_time(sym_key: str, is_new: bool = True) -> str:
         return entry.get("display") or f"{entry.get('time', '—')} IST"
 
     now      = ist_now()
-    display  = now.strftime("%H:%M IST")
-    date_str = now.strftime("%Y-%m-%d")
+    display  = now.strftime("%H:%M IST") if is_market_open() else "15:30 IST"
+    date_str = _last_trading_day()
     _ia_first_seen[sym_key] = {
         "display": display,
         "date":    date_str,
@@ -2639,6 +2642,63 @@ def _compute_ia(tok: str):
                     "volRatio":  vr,
                     "todayVol":  tv,
                 })
+
+        # A backend restart after the bell has no in-memory Power Strike option
+        # cache. Rebuild the final-session IA snapshot from fresh option chains
+        # for a bounded set of the strongest screener candidates.
+        needs_close_chain = source and not any(row.get("opt_data") for row in source)
+        if needs_close_chain:
+            source = sorted(source, key=lambda item: abs(float(item.get("change") or 0)), reverse=True)[:12]
+            sym_map = {s["symbol"]: s for s in SYMBOLS}
+            nearest_expiry = None
+            for candidate in source[:3]:
+                si = sym_map.get(candidate.get("symbol"))
+                if not si:
+                    continue
+                try:
+                    response = requests.post(
+                        f"{DHAN_BASE}/v2/optionchain/expirylist",
+                        json={"UnderlyingScrip": int(si["security_id"]), "UnderlyingSeg": "NSE_EQ"},
+                        headers=headers, timeout=10,
+                    )
+                    time.sleep(3)
+                    if response.status_code == 200:
+                        dates = response.json().get("data", [])
+                        if dates:
+                            nearest_expiry = dates[0]
+                            break
+                except Exception:
+                    continue
+
+            if nearest_expiry:
+                enriched = []
+                for candidate in source:
+                    si = sym_map.get(candidate.get("symbol"))
+                    if not si:
+                        enriched.append(candidate)
+                        continue
+                    fresh_opt, fresh_strikes = _ia_fetch_fresh_option_chain(
+                        tok, cid, si, candidate["ltp"], candidate["direction"],
+                        nearest_expiry, headers,
+                    )
+                    updated = dict(candidate)
+                    if fresh_opt:
+                        updated["opt_data"] = fresh_opt
+                        updated["strikes"] = fresh_strikes
+                        best = fresh_opt.get("best_strike")
+                        if best:
+                            is_bull = candidate["direction"] == "bull"
+                            updated.update({
+                                "best_strike": best["strike"],
+                                "best_ltp": best["ce_ltp"] if is_bull else best["pe_ltp"],
+                                "best_delta": best["ce_delta"] if is_bull else best["pe_delta"],
+                                "best_gamma": best["ce_gamma"] if is_bull else best["pe_gamma"],
+                                "best_iv": best["ce_iv"] if is_bull else best["pe_iv"],
+                            })
+                    enriched.append(updated)
+                source = enriched
+                source_type = "market_close_fresh"
+                print(f"[ia] rebuilt {len(source)} closed-market option candidates")
         print(f"[ia] {len(source)} candidates from {source_type} (closed market)")
 
     # ── Score each candidate ──────────────────────────────────────────────────
@@ -2822,6 +2882,7 @@ def get_institutional(x_client_id: str = Header(None),
 
     should_run = (refresh or _ia_stale()) and not _ia_lock.locked()
     if should_run:
+        _ia_cache["status"] = "fetching"
         def _ps_then_ia():
             if not _ps_cache.get("data") and not _ps_lock.locked():
                 print(f"[ia] triggering Power Strike first...")
