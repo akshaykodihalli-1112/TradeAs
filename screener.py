@@ -286,6 +286,31 @@ def fix_missing_ids(tok):
         print("[fix] no corrections needed")
 
 # ── Quotes ─────────────────────────────────────────────────────────────────────
+def _quote_prev_close(ltp, quote):
+    """Use Dhan's net_change as the authoritative previous-close reference."""
+    try:
+        if quote.get("net_change") is not None:
+            previous = float(ltp) - float(quote.get("net_change"))
+            if previous > 0:
+                return round(previous, 2), "net_change"
+    except (TypeError, ValueError):
+        pass
+    try:
+        close_value = float((quote.get("ohlc") or {}).get("close", 0))
+        if close_value > 0:
+            return round(close_value, 2), "ohlc_close_fallback"
+    except (TypeError, ValueError):
+        pass
+    return 0.0, "unavailable"
+
+
+def _daily_change_pct(ltp, prev_close):
+    try:
+        return round((float(ltp) - float(prev_close)) / float(prev_close) * 100, 2) if float(prev_close) > 0 else 0.0
+    except (TypeError, ValueError, ZeroDivisionError):
+        return 0.0
+
+
 def get_all_quotes(tok):
     cid     = CREDS["client_id"]
     headers = {"access-token":tok,"client-id":cid,"Content-Type":"application/json"}
@@ -312,11 +337,12 @@ def get_all_quotes(tok):
                         if sym:
                             ohlc = q.get("ohlc", {})
                             ltp  = float(q.get("last_price", 0))
-                            # ohlc.close = previous day's settled close ✓
-                            prev_close = round(float(ohlc.get("close", 0)), 2)
+                            prev_close, prev_source = _quote_prev_close(ltp, q)
                             quotes[sym] = {
                                 "ltp":        round(ltp, 2),
                                 "prev_close": prev_close,
+                                "prev_source": prev_source,
+                                "net_change": round(ltp - prev_close, 2) if prev_close else None,
                                 "volume":     int(q.get("volume", 0)),
                                 "open":       round(float(ohlc.get("open", 0)), 2),
                                 "high":       round(float(ohlc.get("high", 0)), 2),
@@ -354,10 +380,8 @@ def get_historical(security_id, tok):
 # ── Screener ───────────────────────────────────────────────────────────────────
 def compute_metrics(q, hist, market_open, today_str):
     """
-    change% formula:
-      Market OPEN:   (ltp - closes[-1]) / closes[-1]      closes[-1] = yesterday settled
-      Market CLOSED: (closes[-1] - closes[-2]) / closes[-2]  closes[-1] = today settled
-    Fallback (no hist): use quote prev_close from Dhan API
+    Daily change always uses the previous close derived from Dhan quote net_change.
+    Historical candles are used only for 5-day momentum and volume averages.
     """
     ltp       = q["ltp"]
     today_vol = q["volume"]
@@ -365,28 +389,8 @@ def compute_metrics(q, hist, market_open, today_str):
     volumes   = hist.get("volume", []) if hist else []
 
     # ── Change % ──────────────────────────────────────────────────────
-    chg_pct    = 0.0
-    prev_close = 0.0
-
-    if len(closes) >= 2:
-        if market_open:
-            # Today's bar not yet settled — closes[-1] is yesterday's close
-            prev_close = closes[-1]
-            today_price = ltp
-        else:
-            # Market closed — closes[-1] is today's settled close
-            # closes[-2] is yesterday's close
-            today_price = closes[-1]
-            prev_close  = closes[-2]
-            ltp = today_price  # show today's close as LTP after hours
-        if prev_close:
-            chg_pct = round(((today_price - prev_close) / prev_close) * 100, 2)
-
-    elif q.get("prev_close"):
-        # Fallback: use Dhan's prev_close field
-        prev_close = q["prev_close"]
-        if prev_close:
-            chg_pct = round(((ltp - prev_close) / prev_close) * 100, 2)
+    prev_close = q.get("prev_close", 0.0)
+    chg_pct = _daily_change_pct(ltp, prev_close)
 
     # ── Momentum 5D ───────────────────────────────────────────────────
     momentum5d = 0.0
@@ -413,7 +417,7 @@ def compute_metrics(q, hist, market_open, today_str):
 
 def _trigger_downstream(tok):
     """Fire PS first, then OIS+IA after PS finishes (they need PS option chain data)."""
-    print(f"[screener] downstream triggered — launching PS→OIS+IA, ND in parallel")
+    print(f"[screener] downstream triggered — launching PS→OIS+IA")
 
     def _ps_then_rest():
         # PS first — fetches option chains for all candidates
@@ -429,9 +433,6 @@ def _trigger_downstream(tok):
     else:
         # PS already running — OIS/IA will get data when PS finishes via next scheduler cycle
         print(f"[screener] PS already running — OIS/IA will fire after PS completes")
-
-    if not _nd_lock.locked():
-        threading.Thread(target=_run_nd_locked, args=(tok,), daemon=True).start()
 
 def run_screener(tok):
     global cache
@@ -487,24 +488,19 @@ def run_screener(tok):
 
                 ltp = q["ltp"]  # today's close from quote API
 
+                prev_close = q.get("prev_close", 0.0)
                 if hist:
                     closes  = hist.get("close",  [])
                     volumes = hist.get("volume", [])
 
-                    # Dhan DOES include today's bar in historical after market close.
-                    # Confirmed from logs: last3=[270.0, 264.15, 259.25] and ltp=259.25
-                    # So closes[-1] == ltp (today) and closes[-2] == yesterday.
-                    # Strategy: if closes[-1] matches ltp closely, today is included.
+                    # Historical candles are not the daily-change source. They are
+                    # retained only for momentum and average-volume calculations.
                     if closes and abs(closes[-1] - ltp) / max(ltp, 0.01) < 0.001:
-                        # Today IS in historical — use closes[-2] as prev_close
-                        prev_close = closes[-2] if len(closes) >= 2 else 0
                         ref_closes = closes  # today already appended by Dhan
                     else:
-                        # Today NOT in historical — closes[-1] is yesterday
-                        prev_close = closes[-1] if closes else 0
                         ref_closes = closes + [ltp]  # append today manually
-
-                    chg_pct = round((ltp - prev_close) / prev_close * 100, 2) if prev_close else 0.0
+                    if not prev_close and closes:
+                        prev_close = closes[-2] if len(closes) >= 2 and ref_closes is closes else closes[-1]
 
                     # Momentum 5D — use last 6 values of ref_closes
                     mom5d = 0.0
@@ -518,10 +514,12 @@ def run_screener(tok):
                         avg_vol7d = int(sum(volumes[-8:-1]) / 7)
                         vol_ratio = round(q["volume"] / avg_vol7d, 2) if avg_vol7d else 0.0
                 else:
-                    prev_close = 0.0; chg_pct = 0.0; mom5d = 0.0
+                    mom5d = 0.0
                     vol_ratio = 0.0; avg_vol7d = 0
 
-                print(f"[close] {sym['symbol']} ltp={ltp} prev={prev_close} chg={chg_pct}% ref_len={len(ref_closes) if hist else 0}") if sym["symbol"] in ("ANGELONE","SAIL","MANAPPURAM","RELIANCE") else None
+                chg_pct = _daily_change_pct(ltp, prev_close)
+
+                print(f"[close] {sym['symbol']} ltp={ltp} prev={prev_close} source={q.get('prev_source')} chg={chg_pct}% ref_len={len(ref_closes) if hist else 0}") if sym["symbol"] in ("DMART","ANGELONE","SAIL","MANAPPURAM","RELIANCE") else None
 
                 results.append({
                     "symbol":      sym["symbol"], "exchange": "NSE",
@@ -561,7 +559,7 @@ def run_screener(tok):
             if not q: skipped.append(f"{sym['symbol']}:no_quote"); continue
             pc        = q.get("prev_close", 0)
             ltp       = q["ltp"]
-            chg       = round((ltp - pc) / pc * 100, 2) if pc else 0.0
+            chg       = _daily_change_pct(ltp, pc)
             prev      = prev_map.get(sym["symbol"], {})
             avg_vol7d = prev.get("avgVol7d", 0)
             today_vol = q["volume"]
@@ -1030,6 +1028,14 @@ def _parse_ts(ts_val):
     except:
         return ""
 
+def _pct_from_reference(price, reference):
+    try:
+        price_num = float(price)
+        reference_num = float(reference)
+        return round((price_num - reference_num) / reference_num * 100, 2) if reference_num > 0 else 0.0
+    except (TypeError, ValueError, ZeroDivisionError):
+        return 0.0
+
 def _compute_breakout(tok):
     global _bk_cache
     if not SYMBOLS or not tok: return
@@ -1111,7 +1117,7 @@ def _compute_breakout(tok):
 
             # ── Step 2: Find close-based breakout ────────────────────────────
             direction = signal_time = signal_price = None
-            signal_pct = 0.0
+            boundary_signal_pct = 0.0
             ltp = range_ref
 
             for i, ts in enumerate(timestamps):
@@ -1124,28 +1130,33 @@ def _compute_breakout(tok):
                     if closes[i] > range_high:
                         direction = "bull"; signal_time = t
                         signal_price = round(closes[i], 2)
-                        signal_pct = round((closes[i] - range_high) / range_high * 100, 2)
+                        boundary_signal_pct = _pct_from_reference(closes[i], range_high)
                     elif closes[i] < range_low:
                         direction = "bear"; signal_time = t
                         signal_price = round(closes[i], 2)
-                        signal_pct = round((closes[i] - range_low) / range_low * 100, 2)
+                        boundary_signal_pct = _pct_from_reference(closes[i], range_low)
                     break
                 else:
                     if direction is None:
                         if closes[i] > range_high:
                             direction = "bull"; signal_time = t
                             signal_price = round(closes[i], 2)
-                            signal_pct = round((closes[i] - range_high) / range_high * 100, 2)
+                            boundary_signal_pct = _pct_from_reference(closes[i], range_high)
                         elif closes[i] < range_low:
                             direction = "bear"; signal_time = t
                             signal_price = round(closes[i], 2)
-                            signal_pct = round((closes[i] - range_low) / range_low * 100, 2)
+                            boundary_signal_pct = _pct_from_reference(closes[i], range_low)
 
             if not direction:
                 no_break += 1; continue
 
-            current_pct = round((ltp - range_high) / range_high * 100, 2) if direction == "bull" \
-                     else round((ltp - range_low)  / range_low  * 100, 2)
+            # The UI displays the 9:45 close as its reference, so both percentages
+            # must use that same visible price. Boundary penetration is retained
+            # separately for diagnostics and never mislabeled as Break %.
+            signal_pct = _pct_from_reference(signal_price, range_ref)
+            current_pct = _pct_from_reference(ltp, range_ref)
+            boundary = range_high if direction == "bull" else range_low
+            current_boundary_pct = _pct_from_reference(ltp, boundary)
 
             today_vol, avg_vol = vol_map.get(sym, (0, 0))
             vol_ratio     = round(today_vol / avg_vol, 2) if avg_vol else 0.0
@@ -1162,8 +1173,11 @@ def _compute_breakout(tok):
                 "signal_time":   signal_time,
                 "signal_price":  signal_price,
                 "signalPct":     signal_pct,
+                "move_pct":      signal_pct,
                 "current_pct":   current_pct,
-                "breakoutPct":   current_pct,    # alias for frontend compat
+                "breakoutPct":   signal_pct,
+                "boundary_break_pct": boundary_signal_pct,
+                "current_boundary_pct": current_boundary_pct,
                 "volRatio":      vol_ratio,
                 "vol_confirmed": vol_confirmed,
                 "todayVol":      today_vol,
@@ -3509,6 +3523,42 @@ def apply_intraday_classification(
             ]
 
 
+def apply_market_close_classification(
+    contracts: Mapping[str, Mapping[str, Dict[str, Any]]],
+    config: Optional[Mapping[str, Any]] = None,
+) -> None:
+    """Use Dhan's final session premium/OI changes when the market is closed."""
+    cfg = merged_config(config)
+    for side in SIDES:
+        for contract in contracts.get(side, {}).values():
+            premium_change_pct = _number(contract.get("session_premium_change_pct"))
+            oi_change = _number(contract.get("session_oi_change"))
+            oi_change_pct = _number(contract.get("session_oi_change_pct"))
+            session_volume = _number(contract.get("volume"))
+            contract.update(
+                {
+                    "signal_window": "MARKET CLOSE",
+                    "premium_change_pct": _round(premium_change_pct),
+                    "oi_change": int(oi_change) if oi_change is not None else None,
+                    "oi_change_pct": _round(oi_change_pct),
+                    "volume_change": (
+                        int(session_volume) if session_volume is not None else None
+                    ),
+                    "volume_expanding": (
+                        session_volume >= cfg["intraday_volume_change_min_abs"]
+                        if session_volume is not None
+                        else None
+                    ),
+                    "classification": classify_position(
+                        premium_change_pct, oi_change, oi_change_pct, cfg
+                    ),
+                }
+            )
+            contract["missing"] = [
+                item for item in contract.get("missing", []) if item != "intraday snapshot"
+            ]
+
+
 def _floor_time_key(now: datetime, interval: int = 15) -> str:
     minute = (now.minute // interval) * interval
     return f"{now.hour:02d}:{minute:02d}"
@@ -4153,7 +4203,10 @@ def analyse_option_chain(
         rows.append({"strike": strike, "ce": ce, "pe": pe})
 
     apply_snapshot_deltas(contracts, snapshots or [], expiry, now, cfg)
-    apply_intraday_classification(contracts, cfg)
+    if cfg.get("market_open", True):
+        apply_intraday_classification(contracts, cfg)
+    else:
+        apply_market_close_classification(contracts, cfg)
     bull = score_direction("bull", contracts, cfg)
     bear = score_direction("bear", contracts, cfg)
     progression = detect_progression(contracts)
@@ -4799,14 +4852,32 @@ class OIActionService:
             daemon=True,
         ).start()
 
-    def _first_hit_time(self, symbol: str, signal: str, now: datetime) -> str:
+    @staticmethod
+    def _last_market_close(now: datetime) -> datetime:
+        close_day = now.date()
+        if now.weekday() >= 5 or (now.hour, now.minute) < (9, 15):
+            close_day -= timedelta(days=1)
+            while close_day.weekday() >= 5:
+                close_day -= timedelta(days=1)
+        return datetime(
+            close_day.year, close_day.month, close_day.day, 15, 30, tzinfo=IST
+        )
+
+    def _first_hit_time(
+        self,
+        symbol: str,
+        signal: str,
+        now: datetime,
+        fallback_time: Optional[datetime] = None,
+    ) -> str:
+        target_date = (fallback_time or now).date()
         for snapshot in self.snapshots.history(symbol):
             if not snapshot.get("rule_met") or snapshot.get("signal") != signal:
                 continue
             timestamp = _parse_iso(snapshot.get("signal_time") or snapshot.get("timestamp"))
-            if timestamp is not None and timestamp.date() == now.date():
+            if timestamp is not None and timestamp.date() == target_date:
                 return timestamp.isoformat()
-        return now.isoformat()
+        return (fallback_time or now).isoformat()
 
     def scan(self, tok: str, cid: str) -> None:
         if not tok or not cid:
@@ -4835,7 +4906,11 @@ class OIActionService:
             )
             return
 
-        print(f"[oi-action] scanning {len(symbols)} symbols, expiry={expiry}")
+        market_open = self.is_market_open()
+        print(
+            f"[oi-action] scanning {len(symbols)} symbols, expiry={expiry}, "
+            f"mode={'intraday' if market_open else 'market_close'}"
+        )
         details: Dict[str, dict] = {}
         errors = []
         completed = 0
@@ -4864,11 +4939,17 @@ class OIActionService:
                             baseline=None,
                             snapshots=self.snapshots.history(symbol),
                             now=scan_time,
-                            config=self.config,
+                            config={**self.config, "market_open": market_open},
                         )
                         if detail.get("rule_met"):
+                            fallback_time = (
+                                None if market_open else self._last_market_close(scan_time)
+                            )
                             detail["signal_time"] = self._first_hit_time(
-                                symbol, detail["signal"], scan_time
+                                symbol,
+                                detail["signal"],
+                                scan_time,
+                                fallback_time=fallback_time,
                             )
                         details[symbol] = detail
                         self.snapshots.append(detail)
@@ -4900,7 +4981,12 @@ class OIActionService:
                     "updated_at": self.ist_now().isoformat(),
                     "updated_epoch": time.time(),
                     "expiry": expiry,
-                    "market_open": self.is_market_open(),
+                    "market_open": market_open,
+                    "intraday_note": (
+                        "Intraday only: premium, OI and volume changes are measured between today's rolling option-chain snapshots."
+                        if market_open
+                        else "Market closed: showing the final session premium, OI and volume rule state from the last market close."
+                    ),
                     "errors": errors[:50],
                     "progress": 100,
                     "total": len(symbols),
