@@ -311,14 +311,46 @@ def _daily_change_pct(ltp, prev_close):
         return 0.0
 
 
+def _historical_previous_close(hist, settled_ltp):
+    """Return the close before the latest completed market session.
+
+    Dhan's daily history may already contain the latest settled candle, or it
+    may end at the preceding session.  Match the last candle to settled LTP to
+    choose the correct reference without assuming that today is a trading day.
+    """
+    if not hist:
+        return 0.0, "historical_unavailable"
+    closes = []
+    for value in hist.get("close", []):
+        try:
+            price = float(value)
+            if price > 0:
+                closes.append(price)
+        except (TypeError, ValueError):
+            continue
+    if not closes:
+        return 0.0, "historical_unavailable"
+    try:
+        ltp = float(settled_ltp)
+    except (TypeError, ValueError):
+        ltp = 0.0
+    tolerance = max(0.10, abs(ltp) * 0.0005)
+    latest_is_settled_session = ltp > 0 and abs(closes[-1] - ltp) <= tolerance
+    if latest_is_settled_session and len(closes) >= 2:
+        return round(closes[-2], 2), "historical_previous_session"
+    return round(closes[-1], 2), "historical_latest_prior"
+
+
 def get_all_quotes(tok):
     cid     = CREDS["client_id"]
     headers = {"access-token":tok,"client-id":cid,"Content-Type":"application/json"}
     id_map  = {s["security_id"]:s["symbol"] for s in SYMBOLS}
     quotes  = {}
     _logged = False
-    for i in range(0, len(SYMBOLS), 50):
-        batch   = [int(s["security_id"]) for s in SYMBOLS[i:i+50]]
+    # Dhan v2 permits up to 1000 instruments in one market-quote request.
+    # The F&O equity universe therefore fits in a single rate-limit-friendly call.
+    for i in range(0, len(SYMBOLS), 1000):
+        batch   = [int(s["security_id"]) for s in SYMBOLS[i:i+1000]]
         payload = {"NSE_EQ": batch}
         for attempt in range(3):
             try:
@@ -355,7 +387,7 @@ def get_all_quotes(tok):
                     break
             except Exception as e:
                 print(f"  quote err: {e}"); time.sleep(2)
-        time.sleep(1.2)
+        time.sleep(1.05)
     missing=[s["symbol"] for s in SYMBOLS if s["symbol"] not in quotes]
     print(f"[quotes] got={len(quotes)} missing={len(missing)} sample={missing[:5]}")
     cache["debug"]={"quotes_fetched":len(quotes),"missing_count":len(missing),
@@ -434,7 +466,7 @@ def _trigger_downstream(tok):
         # PS already running — OIS/IA will get data when PS finishes via next scheduler cycle
         print(f"[screener] PS already running — OIS/IA will fire after PS completes")
 
-def run_screener(tok):
+def run_screener(tok, force=False):
     global cache
     ensure_symbols(tok)
     if not SYMBOLS:
@@ -447,7 +479,7 @@ def run_screener(tok):
     # Use quote API: ltp = today's final close, ohlc.close = yesterday's close
     # change% = (ltp - prev_close) / prev_close * 100  ← simple and correct
     if not market_open:
-        if cache.get("data") and cache.get("updated_at"):
+        if not force and cache.get("data") and cache.get("updated_at"):
             print(f"[screener] market closed — keeping settled data ({len(cache['data'])} results)")
             cache.update({"status": "ok", "market_open": False, "progress": 100, "errors": []})
             return
@@ -489,6 +521,7 @@ def run_screener(tok):
                 ltp = q["ltp"]  # today's close from quote API
 
                 prev_close = q.get("prev_close", 0.0)
+                change_source = q.get("prev_source", "quote")
                 if hist:
                     closes  = hist.get("close",  [])
                     volumes = hist.get("volume", [])
@@ -499,8 +532,13 @@ def run_screener(tok):
                         ref_closes = closes  # today already appended by Dhan
                     else:
                         ref_closes = closes + [ltp]  # append today manually
-                    if not prev_close and closes:
-                        prev_close = closes[-2] if len(closes) >= 2 and ref_closes is closes else closes[-1]
+                    # After close use completed daily candles as the authoritative
+                    # session reference.  This prevents a settled net_change=0
+                    # response from turning every stock into a 0.00% mover.
+                    hist_prev, hist_source = _historical_previous_close(hist, ltp)
+                    if hist_prev > 0:
+                        prev_close = hist_prev
+                        change_source = hist_source
 
                     # Momentum 5D — use last 6 values of ref_closes
                     mom5d = 0.0
@@ -519,14 +557,14 @@ def run_screener(tok):
 
                 chg_pct = _daily_change_pct(ltp, prev_close)
 
-                print(f"[close] {sym['symbol']} ltp={ltp} prev={prev_close} source={q.get('prev_source')} chg={chg_pct}% ref_len={len(ref_closes) if hist else 0}") if sym["symbol"] in ("DMART","ANGELONE","SAIL","MANAPPURAM","RELIANCE") else None
+                print(f"[close] {sym['symbol']} ltp={ltp} prev={prev_close} source={change_source} chg={chg_pct}% ref_len={len(ref_closes) if hist else 0}") if sym["symbol"] in ("DMART","ANGELONE","SAIL","MANAPPURAM","RELIANCE") else None
 
                 results.append({
                     "symbol":      sym["symbol"], "exchange": "NSE",
                     "ltp":         ltp,           "prev_close": round(prev_close, 2),
                     "change":      chg_pct,       "momentum5d": mom5d,
                     "volumeRatio": vol_ratio,     "todayVol":   q["volume"],
-                    "avgVol7d":    avg_vol7d,
+                    "avgVol7d":    avg_vol7d,     "changeSource": change_source,
                 })
             except Exception as e:
                 skipped.append(f"{sym['symbol']}:{e}")
@@ -631,15 +669,15 @@ def _enrich_historical(tok, quotes, market_open, today_str):
     print(f"[hist] cache enriched with historical data ✓")
     _trigger_downstream(tok)
 
-def trigger_screener(cid="",tok=""):
+def trigger_screener(cid="",tok="",force=False):
     cid=cid or CREDS["client_id"]; tok=tok or CREDS["access_token"]
     if not cid or not tok: cache["status"]="no_credentials"; return
     CREDS["client_id"]=cid; CREDS["access_token"]=tok
     if _lock.locked(): return
-    threading.Thread(target=lambda:_run_locked(tok),daemon=True).start()
+    threading.Thread(target=lambda:_run_locked(tok,force),daemon=True).start()
 
-def _run_locked(tok):
-    with _lock: run_screener(tok)
+def _run_locked(tok,force=False):
+    with _lock: run_screener(tok,force=force)
 
 # ── Scheduler ──────────────────────────────────────────────────────────────────
 def scheduled_job():
@@ -656,7 +694,7 @@ def keep_alive():
         except: pass
 
 scheduler=BackgroundScheduler()
-scheduler.add_job(scheduled_job,"interval",minutes=5,id="screener")
+scheduler.add_job(scheduled_job,"interval",minutes=2,id="screener")
 scheduler.add_job(keep_alive,"interval",minutes=10,id="keepalive")
 scheduler.start()
 
@@ -691,12 +729,13 @@ def health():
             "debug":cache.get("debug",{})}
 
 @app.get("/api/screener")
-def get_screener(x_client_id:str=Header(None),x_access_token:str=Header(None)):
+def get_screener(x_client_id:str=Header(None),x_access_token:str=Header(None),
+                 refresh:bool=Query(False)):
     cid=x_client_id or CREDS.get("client_id",""); tok=x_access_token or CREDS.get("access_token","")
     if cid: CREDS["client_id"]=cid
     if tok: CREDS["access_token"]=tok
-    if cid and tok and cache.get("status") in ("idle","no_credentials","error"):
-        trigger_screener(cid,tok)
+    if cid and tok and (refresh or cache.get("status") in ("idle","no_credentials","error")):
+        trigger_screener(cid,tok,force=refresh)
     return cache
 
 @app.get("/api/boot")
@@ -793,8 +832,8 @@ def get_ltp_live(x_client_id:str=Header(None),x_access_token:str=Header(None)):
     # Also build prev_close from existing cache for change% computation
     prev_map={r["symbol"]:r["prev_close"] for r in cache.get("data",[]) if r.get("prev_close")}
     quotes={}
-    for i in range(0,len(SYMBOLS),100):
-        batch=[int(s["security_id"]) for s in SYMBOLS[i:i+100]]
+    for i in range(0,len(SYMBOLS),1000):
+        batch=[int(s["security_id"]) for s in SYMBOLS[i:i+1000]]
         for attempt in range(2):
             try:
                 r=requests.post(f"{DHAN_BASE}/v2/marketfeed/ltp",
@@ -811,7 +850,7 @@ def get_ltp_live(x_client_id:str=Header(None),x_access_token:str=Header(None)):
                     time.sleep(3*(attempt+1))
             except Exception as e:
                 time.sleep(1)
-        time.sleep(0.3)
+        time.sleep(1.05)
     return {"status":"ok","count":len(quotes),"quotes":quotes,
             "updated_at":ist_now().strftime("%H:%M:%S IST"),"market_open":is_market_open()}
 
@@ -1629,7 +1668,7 @@ def _nd_stale():
     try:
         t = datetime.strptime(last, "%H:%M:%S IST").replace(
             year=ist_now().year, month=ist_now().month, day=ist_now().day, tzinfo=IST)
-        return (ist_now() - t).seconds > 300
+        return (ist_now() - t).seconds > (120 if is_market_open() else 3600)
     except: return True
 
 @app.get("/api/nextday")
@@ -1920,8 +1959,7 @@ def _compute_ois(tok: str):
             time.sleep(10); wait += 10
         source_data = _ps_cache.get("data", [])
         if not source_data:
-            print(f"[ois] PS has no data — skipping")
-            _ois_cache["status"] = "idle"; return
+            print(f"[ois] PS has no data — using live screener fallback")
     else:
         # Closed market — use PS data if available (has option chains), else screener
         source_data = _ps_cache.get("data", [])
@@ -2117,7 +2155,7 @@ def _ois_stale() -> bool:
     try:
         t = datetime.strptime(last, "%H:%M:%S IST").replace(
             year=ist_now().year, month=ist_now().month, day=ist_now().day, tzinfo=IST)
-        return (ist_now() - t).seconds > 300
+        return (ist_now() - t).seconds > (120 if is_market_open() else 3600)
     except:
         return True
 
@@ -2482,8 +2520,37 @@ def _compute_ia(tok: str):
 
         ps_data = list(_ps_cache.get("data", []))
         if not ps_data:
-            print(f"[ia] PS has no candidates yet — skipping this IA run")
-            _ia_cache["status"] = "idle"; return
+            # Preserve the earlier working IA behaviour: if Power Strike has no
+            # candidates yet, use the strongest live equity movers and validate
+            # them against a fresh option chain below.  IA gates still decide
+            # whether a row is emitted; this only restores candidate discovery.
+            fallback_rows = sorted(
+                cache.get("data", []),
+                key=lambda item: abs(float(item.get("change") or 0)),
+                reverse=True,
+            )
+            for row in fallback_rows:
+                change = float(row.get("change") or 0)
+                if not row.get("ltp") or abs(change) < chg_min:
+                    continue
+                candidate = dict(row)
+                candidate.update({
+                    "direction": "bull" if change > 0 else "bear",
+                    "volRatio": row.get("volumeRatio", 0),
+                    "eq_score": 2 if abs(change) >= 2.5 else 1,
+                    "opt_data": {}, "strikes": [],
+                })
+                ps_data.append(candidate)
+                if len(ps_data) >= 12:
+                    break
+            print(f"[ia] PS empty — validating {len(ps_data)} top live movers directly")
+            if not ps_data:
+                _ia_cache.update({
+                    "data": [], "status": "ok", "updated_at": ist_now().strftime("%H:%M:%S IST"),
+                    "count": 0, "ce_signals": 0, "pe_signals": 0, "institutional": 0,
+                    "market_open": True, "mode": "live", "source": "screener_fallback",
+                })
+                return
 
         # ── LIVE: Re-fetch FRESH option chains for each PS candidate ──────────
         # This is the key — we don't reuse stale PS option data from 5 min ago
@@ -2719,7 +2786,7 @@ def _ia_stale() -> bool:
         t = datetime.strptime(last, "%H:%M:%S IST").replace(
             year=ist_now().year, month=ist_now().month,
             day=ist_now().day, tzinfo=IST)
-        threshold = 120 if is_market_open() else 3600
+        threshold = 90 if is_market_open() else 3600
         return (ist_now() - t).seconds > threshold
     except:
         return True
@@ -2733,7 +2800,7 @@ def _ia_scheduled():
     if _ia_lock.locked(): return
     threading.Thread(target=_run_ia_locked, args=(tok,), daemon=True).start()
 
-scheduler.add_job(_ia_scheduled, "interval", minutes=2, id="ia_scanner")
+scheduler.add_job(_ia_scheduled, "interval", seconds=90, id="ia_scanner")
 
 
 @app.get("/api/institutional")
@@ -5141,3 +5208,61 @@ _oi_action_service = install_oi_action(
     ist_now=ist_now,
     is_market_open=is_market_open,
 )
+
+
+@app.get("/api/rule-alerts")
+def get_rule_alerts():
+    """Compact, cache-only alert feed for the dashboard floating notifier."""
+    alerts = []
+
+    def add(source, symbol, title, message, tone, event_time, priority):
+        alerts.append({
+            "source": source, "symbol": symbol, "title": title,
+            "message": message, "tone": tone, "time": event_time or "—",
+            "priority": priority,
+        })
+
+    for row in list(_oi_action_service.cache.get("data", []))[:12]:
+        signal = str(row.get("signal", "NEUTRAL"))
+        if signal == "NEUTRAL":
+            continue
+        bull = int(row.get("bull_score") or 0)
+        bear = int(row.get("bear_score") or 0)
+        tone = "bull" if "BULL" in signal else "bear" if "BEAR" in signal else "mixed"
+        add("OI Action", row.get("symbol", ""), f"{row.get('symbol', '')} · {signal}",
+            f"OI rules met · Bull {bull} / Bear {bear}", tone,
+            row.get("signal_time"), 300 + abs(bull - bear))
+
+    for row in list(_ia_cache.get("data", []))[:10]:
+        direction = row.get("direction", "bull")
+        tone = "bull" if direction == "bull" else "bear"
+        score = int(row.get("score") or 0)
+        add("IA", row.get("symbol", ""), f"{row.get('symbol', '')} · IA {direction.upper()}",
+            f"{row.get('grade', 'signal').title()} · {row.get('action', 'rule met')}",
+            tone, row.get("signal_time"), 200 + score)
+
+    for row in list(_ois_cache.get("data", []))[:10]:
+        direction = row.get("direction", "bull")
+        tone = "bull" if direction == "bull" else "bear"
+        score = int(row.get("ois_score") or 0)
+        add("OS", row.get("symbol", ""), f"{row.get('symbol', '')} · OS {direction.upper()}",
+            f"Score {score}/100 · {row.get('action', 'rule met')}",
+            tone, row.get("signal_time"), 100 + score)
+
+    for row in list(_bk_cache.get("data", []))[:8]:
+        direction = row.get("direction", "bull")
+        tone = "bull" if direction == "bull" else "bear"
+        move = abs(float(row.get("move_pct") or 0))
+        label = "Breakout" if direction == "bull" else "Breakdown"
+        add("Breakout", row.get("symbol", ""), f"{row.get('symbol', '')} · {label}",
+            f"Opening-range rule met · {move:.2f}%", tone,
+            row.get("signal_time"), 50 + move)
+
+    alerts.sort(key=lambda item: item["priority"], reverse=True)
+    for item in alerts:
+        item.pop("priority", None)
+    return {
+        "status": "ok", "data": alerts[:20], "count": len(alerts),
+        "market_open": is_market_open(),
+        "updated_at": ist_now().strftime("%H:%M:%S IST"),
+    }
