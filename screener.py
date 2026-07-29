@@ -2157,7 +2157,9 @@ def _ois_stale() -> bool:
     try:
         t = datetime.strptime(last, "%H:%M:%S IST").replace(
             year=ist_now().year, month=ist_now().month, day=ist_now().day, tzinfo=IST)
-        return (ist_now() - t).seconds > (120 if is_market_open() else 3600)
+        # Keep the visible OI Strategy page on a real two-minute cadence even
+        # after the market closes. Market-closed calculations use settled data.
+        return (ist_now() - t).seconds > 120
     except:
         return True
 
@@ -2825,8 +2827,7 @@ def _compute_ia(tok: str):
         "institutional": sum(1 for r in results if r["grade"] == "institutional"),
         "market_open":   market_open,
         "mode":          "live" if market_open else "closed",
-        "next_refresh":  (ist_now() + timedelta(minutes=2)).strftime("%H:%M IST")
-                         if market_open else None,
+        "next_refresh":  (ist_now() + timedelta(minutes=2)).strftime("%H:%M IST"),
         "source":        source_type,
     })
     print(f"[ia] done — {len(results)} signals "
@@ -2839,15 +2840,14 @@ def _run_ia_locked(tok: str):
 
 
 def _ia_stale() -> bool:
-    """Stale after 2 min live, 1 hr closed."""
+    """Stale after two minutes in both live and settled-market modes."""
     last = _ia_cache.get("updated_at")
     if not last: return True
     try:
         t = datetime.strptime(last, "%H:%M:%S IST").replace(
             year=ist_now().year, month=ist_now().month,
             day=ist_now().day, tzinfo=IST)
-        threshold = 120 if is_market_open() else 3600
-        return (ist_now() - t).seconds > threshold
+        return (ist_now() - t).seconds > 120
     except:
         return True
 
@@ -2872,7 +2872,7 @@ def get_institutional(x_client_id: str = Header(None),
     3 gates live: OI Buildup + Volume ≥1.5× + PCR aligned.
     2 gates closed: OI Buildup + Volume ≥1.0× (PCR stale after hours).
     Grades: institutional ≥85 | high ≥70 | moderate ≥55.
-    Refreshes every 2 min live, 1 hr closed.
+    Refreshes every 2 minutes while the dashboard page is active.
     """
     cid = x_client_id or CREDS.get("client_id", "")
     tok = x_access_token or CREDS.get("access_token", "")
