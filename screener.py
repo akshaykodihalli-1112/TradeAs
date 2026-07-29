@@ -7,6 +7,13 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from io import StringIO
 import builtins
+import calendar, math, statistics
+from collections import defaultdict, deque
+from copy import deepcopy
+from datetime import date
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ── In-memory log buffer ───────────────────────────────────────────────────────
 _log_buffer = []
@@ -3123,3 +3130,1843 @@ def get_freefloat(x_client_id: str = Header(None),
         "updated_at": ist_now().strftime("%H:%M:%S IST"),
         "market_open": is_market_open(),
     }
+
+
+
+
+# ============================================================================
+# OI ACTION ENGINE (MERGED)
+# Self-contained options-only classification, scoring, snapshot and baseline code.
+# ============================================================================
+SIDES = ("CE", "PE")
+MONEYNESS = ("ITM2", "ITM1", "ATM", "OTM1", "OTM2")
+
+
+DEFAULT_CONFIG: Dict[str, Any] = {
+    # Position classification
+    "premium_change_min_pct": 0.25,
+    "oi_change_min_pct": 0.50,
+    "oi_change_min_abs": 1,
+    "volume_expanding_ratio": 1.15,
+    # Historical normalisation
+    "relative_volume_elevated": 1.50,
+    "relative_volume_strong": 2.00,
+    "relative_volume_exceptional": 3.00,
+    "oi_percentile_high": 80,
+    "oi_percentile_strong": 90,
+    "oi_percentile_extreme": 95,
+    "baseline_days": 183,
+    "baseline_min_observations": 20,
+    "baseline_interval": "15",
+    "history_chunk_days": 30,
+    "near_expiry_days": 4,
+    # Signal and conflict thresholds
+    "strong_score": 75,
+    "directional_score": 55,
+    "strong_score_difference": 30,
+    "directional_score_difference": 15,
+    "mixed_min_score": 60,
+    "mixed_score_difference": 15,
+    # Live tracking / performance (the FastAPI integration consumes these too)
+    "snapshot_intervals": [1, 3, 5, 15],
+    "snapshot_cadence_minutes": 3,
+    "stale_after_seconds": 420,
+    "refresh_seconds": 180,
+    "scan_batch_size": 6,
+    "scan_batch_pause_seconds": 3.1,
+    "baseline_symbols_per_cycle": 1,
+}
+
+
+def merged_config(overrides: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    config = deepcopy(DEFAULT_CONFIG)
+    if overrides:
+        config.update(dict(overrides))
+    return config
+
+
+def _number(value: Any) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _integer(value: Any) -> Optional[int]:
+    number = _number(value)
+    return int(number) if number is not None else None
+
+
+def _round(value: Optional[float], digits: int = 2) -> Optional[float]:
+    return round(value, digits) if value is not None else None
+
+
+def percent_change(current: Any, previous: Any) -> Optional[float]:
+    current_num = _number(current)
+    previous_num = _number(previous)
+    if current_num is None or previous_num in (None, 0):
+        return None
+    return ((current_num - previous_num) / abs(previous_num)) * 100.0
+
+
+def percentile(values: Sequence[float], p: float) -> Optional[float]:
+    clean = sorted(v for v in (_number(x) for x in values) if v is not None)
+    if not clean:
+        return None
+    if len(clean) == 1:
+        return clean[0]
+    rank = (len(clean) - 1) * (p / 100.0)
+    lower = int(math.floor(rank))
+    upper = int(math.ceil(rank))
+    if lower == upper:
+        return clean[lower]
+    weight = rank - lower
+    return clean[lower] * (1.0 - weight) + clean[upper] * weight
+
+
+def percentile_rank(values: Sequence[float], current: Any) -> Optional[float]:
+    current_num = _number(current)
+    clean = sorted(v for v in (_number(x) for x in values) if v is not None)
+    if current_num is None or not clean:
+        return None
+    below = sum(1 for value in clean if value < current_num)
+    equal = sum(1 for value in clean if value == current_num)
+    return round(100.0 * (below + 0.5 * equal) / len(clean), 1)
+
+
+def classify_position(
+    premium_change_pct: Any,
+    oi_change: Any,
+    oi_change_pct: Any,
+    config: Optional[Mapping[str, Any]] = None,
+) -> str:
+    """Classify price/OI behaviour; volume is never treated as direction."""
+    cfg = merged_config(config)
+    premium = _number(premium_change_pct)
+    oi_delta = _number(oi_change)
+    oi_pct = _number(oi_change_pct)
+    if premium is None or oi_delta is None or oi_pct is None:
+        return "UNAVAILABLE"
+
+    oi_active = (
+        abs(oi_delta) >= cfg["oi_change_min_abs"]
+        and abs(oi_pct) >= cfg["oi_change_min_pct"]
+    )
+    premium_active = abs(premium) >= cfg["premium_change_min_pct"]
+    if not oi_active or not premium_active:
+        return "NEUTRAL"
+    if premium > 0 and oi_delta > 0:
+        return "LONG BUILDUP"
+    if premium < 0 and oi_delta > 0:
+        return "SHORT BUILDUP"
+    if premium < 0 and oi_delta < 0:
+        return "LONG UNWINDING"
+    if premium > 0 and oi_delta < 0:
+        return "SHORT COVERING"
+    return "NEUTRAL"
+
+
+def _field(node: Mapping[str, Any], key: str, integer: bool = False) -> Any:
+    if key not in node or node.get(key) is None:
+        return None
+    return _integer(node.get(key)) if integer else _number(node.get(key))
+
+
+def build_contract(
+    node: Mapping[str, Any],
+    strike: float,
+    moneyness: str,
+    option_type: str,
+    config: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    cfg = merged_config(config)
+    ltp = _field(node, "last_price")
+    previous_close = _field(node, "previous_close_price")
+    oi = _field(node, "oi", integer=True)
+    previous_oi = _field(node, "previous_oi", integer=True)
+    volume = _field(node, "volume", integer=True)
+    previous_volume = _field(node, "previous_volume", integer=True)
+    oi_change = oi - previous_oi if oi is not None and previous_oi is not None else None
+    oi_change_pct = percent_change(oi, previous_oi)
+    premium_change_pct = percent_change(ltp, previous_close)
+    previous_volume_ratio = (
+        volume / previous_volume
+        if volume is not None and previous_volume not in (None, 0)
+        else None
+    )
+    classification = classify_position(
+        premium_change_pct, oi_change, oi_change_pct, cfg
+    )
+    missing = []
+    for field_name, value in (
+        ("ltp", ltp),
+        ("previous_close", previous_close),
+        ("oi", oi),
+        ("previous_oi", previous_oi),
+        ("volume", volume),
+    ):
+        if value is None:
+            missing.append(field_name)
+    return {
+        "strike": strike,
+        "moneyness": moneyness,
+        "option_type": option_type,
+        "security_id": _field(node, "security_id", integer=True),
+        "ltp": _round(ltp),
+        "previous_close": _round(previous_close),
+        "premium_change_pct": _round(premium_change_pct),
+        "oi": oi,
+        "previous_oi": previous_oi,
+        "oi_change": oi_change,
+        "oi_change_pct": _round(oi_change_pct),
+        "volume": volume,
+        "previous_volume": previous_volume,
+        "previous_volume_ratio": _round(previous_volume_ratio),
+        "volume_expanding": (
+            previous_volume_ratio >= cfg["volume_expanding_ratio"]
+            if previous_volume_ratio is not None
+            else None
+        ),
+        "relative_volume": None,
+        "oi_percentile": None,
+        "baseline_status": "unavailable",
+        "baseline_sample_size": 0,
+        "classification": classification,
+        "missing": missing,
+        "deltas": {
+            f"{minutes}m": {"oi": None, "volume": None, "premium_pct": None}
+            for minutes in cfg["snapshot_intervals"]
+        },
+    }
+
+
+def _strike_interval(strikes: Sequence[float], atm_index: int) -> Optional[float]:
+    start = max(0, atm_index - 5)
+    end = min(len(strikes), atm_index + 6)
+    local = strikes[start:end]
+    gaps = [b - a for a, b in zip(local, local[1:]) if b > a]
+    return _round(statistics.median(gaps)) if gaps else None
+
+
+def select_relevant_strikes(
+    option_chain: Mapping[str, Any], spot: Any
+) -> Tuple[Optional[float], Optional[float], List[Tuple[int, float, Mapping[str, Any]]]]:
+    spot_num = _number(spot)
+    parsed: List[Tuple[float, Mapping[str, Any]]] = []
+    for strike_value, strike_data in option_chain.items():
+        strike = _number(strike_value)
+        if strike is not None and isinstance(strike_data, Mapping):
+            parsed.append((strike, strike_data))
+    parsed.sort(key=lambda item: item[0])
+    if spot_num is None or not parsed:
+        return None, None, []
+    strikes = [item[0] for item in parsed]
+    atm_index = min(range(len(strikes)), key=lambda index: abs(strikes[index] - spot_num))
+    selected = []
+    for offset in range(-2, 3):
+        index = atm_index + offset
+        if 0 <= index < len(parsed):
+            selected.append((offset, parsed[index][0], parsed[index][1]))
+    return strikes[atm_index], _strike_interval(strikes, atm_index), selected
+
+
+def _parse_iso(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=IST)
+        return parsed.astimezone(IST)
+    except (TypeError, ValueError):
+        return None
+
+
+def _snapshot_contract(snapshot: Mapping[str, Any], key: str) -> Optional[Mapping[str, Any]]:
+    contracts = snapshot.get("contracts")
+    if isinstance(contracts, Mapping):
+        contract = contracts.get(key)
+        return contract if isinstance(contract, Mapping) else None
+    return None
+
+
+def apply_snapshot_deltas(
+    contracts: Mapping[str, Mapping[str, Dict[str, Any]]],
+    snapshots: Sequence[Mapping[str, Any]],
+    expiry: str,
+    now: datetime,
+    config: Optional[Mapping[str, Any]] = None,
+) -> None:
+    cfg = merged_config(config)
+    candidates: List[Tuple[float, Mapping[str, Any]]] = []
+    for snapshot in snapshots:
+        timestamp = _parse_iso(snapshot.get("timestamp"))
+        if timestamp is None or timestamp >= now or snapshot.get("expiry") != expiry:
+            continue
+        age_minutes = (now - timestamp).total_seconds() / 60.0
+        candidates.append((age_minutes, snapshot))
+
+    for side in SIDES:
+        for label, contract in contracts.get(side, {}).items():
+            key = f"{side}:{label}"
+            for minutes in cfg["snapshot_intervals"]:
+                tolerance = max(0.75, minutes * 0.45)
+                viable = [item for item in candidates if abs(item[0] - minutes) <= tolerance]
+                if not viable:
+                    continue
+                _, snapshot = min(viable, key=lambda item: abs(item[0] - minutes))
+                previous = _snapshot_contract(snapshot, key)
+                if not previous:
+                    continue
+                if (
+                    _number(previous.get("strike")) != _number(contract.get("strike"))
+                    or snapshot.get("expiry") != expiry
+                ):
+                    continue
+                current_oi = _number(contract.get("oi"))
+                previous_oi = _number(previous.get("oi"))
+                current_volume = _number(contract.get("volume"))
+                previous_volume = _number(previous.get("volume"))
+                current_ltp = _number(contract.get("ltp"))
+                previous_ltp = _number(previous.get("ltp"))
+                contract["deltas"][f"{minutes}m"] = {
+                    "oi": (
+                        int(current_oi - previous_oi)
+                        if current_oi is not None and previous_oi is not None
+                        else None
+                    ),
+                    "volume": (
+                        int(current_volume - previous_volume)
+                        if current_volume is not None and previous_volume is not None
+                        else None
+                    ),
+                    "premium_pct": _round(percent_change(current_ltp, previous_ltp)),
+                }
+
+
+def _floor_time_key(now: datetime, interval: int = 15) -> str:
+    minute = (now.minute // interval) * interval
+    return f"{now.hour:02d}:{minute:02d}"
+
+
+def _expiry_bucket(expiry: str, now: datetime, config: Mapping[str, Any]) -> str:
+    try:
+        expiry_date = date.fromisoformat(expiry)
+        days = (expiry_date - now.date()).days
+        return "near_expiry" if 0 <= days <= config["near_expiry_days"] else "normal"
+    except (TypeError, ValueError):
+        return "normal"
+
+
+def _resolve_baseline_metrics(
+    baseline: Optional[Mapping[str, Any]],
+    expiry: str,
+    now: datetime,
+    side: str,
+    label: str,
+    config: Mapping[str, Any],
+) -> Optional[Mapping[str, Any]]:
+    if not baseline:
+        return None
+    categories = baseline.get("categories")
+    if not isinstance(categories, Mapping):
+        return None
+    bucket_data = categories.get(_expiry_bucket(expiry, now, config))
+    if not isinstance(bucket_data, Mapping) or not bucket_data:
+        bucket_data = categories.get("normal")
+    if not isinstance(bucket_data, Mapping) or not bucket_data:
+        return None
+    target = _floor_time_key(now, int(config["baseline_interval"]))
+    eligible = sorted(key for key in bucket_data if key <= target)
+    time_key = eligible[-1] if eligible else min(bucket_data)
+    side_data = bucket_data.get(time_key, {}).get(side, {})
+    metrics = side_data.get(label) if isinstance(side_data, Mapping) else None
+    if not isinstance(metrics, Mapping):
+        return None
+    if int(metrics.get("sample_size", 0)) < int(config["baseline_min_observations"]):
+        return None
+    return metrics
+
+
+def apply_historical_baseline(
+    contracts: Mapping[str, Mapping[str, Dict[str, Any]]],
+    baseline: Optional[Mapping[str, Any]],
+    expiry: str,
+    now: datetime,
+    config: Optional[Mapping[str, Any]] = None,
+) -> None:
+    cfg = merged_config(config)
+    for side in SIDES:
+        for label, contract in contracts.get(side, {}).items():
+            metrics = _resolve_baseline_metrics(
+                baseline, expiry, now, side, label, cfg
+            )
+            if not metrics:
+                continue
+            median_volume = _number(metrics.get("median_volume"))
+            current_volume = _number(contract.get("volume"))
+            relative_volume = (
+                current_volume / median_volume
+                if current_volume is not None and median_volume not in (None, 0)
+                else None
+            )
+            oi_rank = percentile_rank(
+                metrics.get("oi_change_distribution", []), contract.get("oi_change")
+            )
+            contract.update(
+                {
+                    "relative_volume": _round(relative_volume),
+                    "oi_percentile": oi_rank,
+                    "baseline_status": "available",
+                    "baseline_sample_size": int(metrics.get("sample_size", 0)),
+                    "baseline_time": metrics.get("time_key"),
+                    "baseline_expiry_bucket": metrics.get("expiry_bucket"),
+                }
+            )
+
+
+def _fmt_pct(value: Any) -> str:
+    number = _number(value)
+    return "unavailable" if number is None else f"{number:+.2f}%"
+
+
+def _fmt_int(value: Any) -> str:
+    number = _number(value)
+    return "unavailable" if number is None else f"{int(number):+,}"
+
+
+def _volume_activity(contract: Mapping[str, Any], config: Mapping[str, Any]) -> bool:
+    ratio = _number(contract.get("previous_volume_ratio"))
+    if ratio is not None and ratio >= config["volume_expanding_ratio"]:
+        return True
+    for delta in contract.get("deltas", {}).values():
+        if isinstance(delta, Mapping) and _number(delta.get("volume")) not in (None, 0):
+            if _number(delta.get("volume")) > 0:
+                return True
+    return False
+
+
+def _long_component(
+    name: str, contract: Optional[Mapping[str, Any]], maximum: int, config: Mapping[str, Any]
+) -> Dict[str, Any]:
+    if not contract or contract.get("classification") == "UNAVAILABLE":
+        return {
+            "name": name,
+            "earned": 0,
+            "max": maximum,
+            "available_max": 0,
+            "available": False,
+            "evidence": ["Required premium/OI input unavailable"],
+        }
+    evidence = [
+        f"Premium change {_fmt_pct(contract.get('premium_change_pct'))}",
+        f"OI change {_fmt_int(contract.get('oi_change'))} ({_fmt_pct(contract.get('oi_change_pct'))})",
+        f"Classification {contract.get('classification')}",
+    ]
+    ratio = _number(contract.get("previous_volume_ratio"))
+    if ratio is not None:
+        evidence.append(f"Volume {ratio:.2f}x previous comparable day")
+    else:
+        evidence.append("Previous-day volume comparison unavailable")
+    points = 0.0
+    if contract.get("classification") == "LONG BUILDUP":
+        points = 12.0
+        premium = abs(_number(contract.get("premium_change_pct")) or 0)
+        oi_pct = abs(_number(contract.get("oi_change_pct")) or 0)
+        points += 3 if premium >= 2 else 2 if premium >= 1 else 1
+        points += 3 if oi_pct >= 10 else 2 if oi_pct >= 5 else 1
+        if _volume_activity(contract, config):
+            points += 2
+            evidence.append("Volume is expanding")
+        else:
+            evidence.append("Volume expansion not confirmed")
+    else:
+        evidence.append("No long-buildup points: premium and OI are not both rising")
+    return {
+        "name": name,
+        "earned": int(min(maximum, round(points))),
+        "max": maximum,
+        "available_max": maximum,
+        "available": True,
+        "evidence": evidence,
+    }
+
+
+def _progression_component(
+    name: str,
+    side_contracts: Mapping[str, Mapping[str, Any]],
+    config: Mapping[str, Any],
+) -> Dict[str, Any]:
+    selected = [side_contracts.get(label) for label in ("ATM", "OTM1", "OTM2")]
+    valid = [c for c in selected if c and c.get("classification") != "UNAVAILABLE"]
+    evidence = []
+    for label, contract in zip(("ATM", "OTM1", "OTM2"), selected):
+        evidence.append(
+            f"{label}: {contract.get('classification') if contract else 'UNAVAILABLE'}"
+        )
+    if len(valid) < 3:
+        return {
+            "name": name,
+            "earned": 0,
+            "max": 15,
+            "available_max": 0,
+            "available": False,
+            "evidence": evidence + ["All three progression strikes are required"],
+        }
+    classifications = [contract.get("classification") for contract in selected]
+    activities = [_volume_activity(contract, config) for contract in selected]
+    points = 0
+    if classifications == ["LONG BUILDUP", "LONG BUILDUP", "LONG BUILDUP"]:
+        points = 12 + sum(1 for active in activities if active)
+        evidence.append("Current long buildup reaches ATM, OTM1 and OTM2")
+    elif classifications[:2] == ["LONG BUILDUP", "LONG BUILDUP"]:
+        otm2 = selected[2]
+        if (
+            (_number(otm2.get("oi_change")) or 0) > 0
+            and (_number(otm2.get("premium_change_pct")) or 0) > 0
+        ):
+            points = 10 + (2 if activities[2] else 0)
+            evidence.append("OTM2 is active but below full buildup thresholds")
+        else:
+            points = 6
+            evidence.append("Participation has not yet reached OTM2")
+    else:
+        points = 3 * sum(1 for value in classifications if value == "LONG BUILDUP")
+        evidence.append("Progression is incomplete")
+    return {
+        "name": name,
+        "earned": min(15, points),
+        "max": 15,
+        "available_max": 15,
+        "available": True,
+        "evidence": evidence,
+    }
+
+
+def _writing_component(
+    name: str, side_contracts: Mapping[str, Mapping[str, Any]]
+) -> Dict[str, Any]:
+    earned = 0
+    available_max = 0
+    evidence = []
+    for label in ("ATM", "OTM1", "OTM2"):
+        contract = side_contracts.get(label)
+        if not contract or contract.get("classification") == "UNAVAILABLE":
+            evidence.append(f"{label}: unavailable")
+            continue
+        available_max += 5
+        classification = contract.get("classification")
+        if classification == "SHORT BUILDUP":
+            earned += 5
+            evidence.append(
+                f"{label}: SHORT BUILDUP (premium {_fmt_pct(contract.get('premium_change_pct'))}, "
+                f"OI {_fmt_int(contract.get('oi_change'))}) +5"
+            )
+        else:
+            evidence.append(f"{label}: {classification} +0")
+    return {
+        "name": name,
+        "earned": earned,
+        "max": 15,
+        "available_max": available_max,
+        "available": available_max > 0,
+        "evidence": evidence,
+    }
+
+
+def _relative_volume_component(
+    name: str,
+    side_contracts: Mapping[str, Mapping[str, Any]],
+    config: Mapping[str, Any],
+) -> Dict[str, Any]:
+    earned = 0
+    available_max = 0
+    evidence = []
+    for label in ("ATM", "OTM1", "OTM2"):
+        contract = side_contracts.get(label)
+        ratio = _number(contract.get("relative_volume")) if contract else None
+        if ratio is None:
+            evidence.append(f"{label}: baseline unavailable")
+            continue
+        available_max += 5
+        points = 0
+        if ratio >= config["relative_volume_exceptional"]:
+            points = 5
+        elif ratio >= config["relative_volume_strong"]:
+            points = 4
+        elif ratio >= config["relative_volume_elevated"]:
+            points = 2
+        earned += points
+        evidence.append(f"{label}: {ratio:.2f}x historical median +{points}")
+    return {
+        "name": name,
+        "earned": earned,
+        "max": 15,
+        "available_max": available_max,
+        "available": available_max > 0,
+        "evidence": evidence,
+    }
+
+
+def _relative_oi_component(
+    name: str,
+    side_contracts: Mapping[str, Mapping[str, Any]],
+    config: Mapping[str, Any],
+) -> Dict[str, Any]:
+    earned = 0
+    available_max = 0
+    evidence = []
+    for label in ("ATM", "OTM1", "OTM2"):
+        contract = side_contracts.get(label)
+        rank = _number(contract.get("oi_percentile")) if contract else None
+        if rank is None:
+            evidence.append(f"{label}: baseline unavailable")
+            continue
+        available_max += 5
+        points = 0
+        if contract.get("classification") == "LONG BUILDUP":
+            if rank >= config["oi_percentile_extreme"]:
+                points = 5
+            elif rank >= config["oi_percentile_strong"]:
+                points = 4
+            elif rank >= config["oi_percentile_high"]:
+                points = 3
+            evidence.append(
+                f"{label}: OI addition percentile {rank:.1f}, LONG BUILDUP +{points}"
+            )
+        else:
+            evidence.append(
+                f"{label}: OI percentile {rank:.1f} but {contract.get('classification')} +0"
+            )
+        earned += points
+    return {
+        "name": name,
+        "earned": earned,
+        "max": 15,
+        "available_max": available_max,
+        "available": available_max > 0,
+        "evidence": evidence,
+    }
+
+
+def score_direction(
+    direction: str,
+    contracts: Mapping[str, Mapping[str, Mapping[str, Any]]],
+    config: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    cfg = merged_config(config)
+    bullish = direction.lower() == "bull"
+    primary_side = "CE" if bullish else "PE"
+    writing_side = "PE" if bullish else "CE"
+    label = "CE" if bullish else "PE"
+    components = [
+        _long_component(
+            f"ATM {label} Long Buildup",
+            contracts.get(primary_side, {}).get("ATM"),
+            20,
+            cfg,
+        ),
+        _long_component(
+            f"OTM1 {label} Confirmation",
+            contracts.get(primary_side, {}).get("OTM1"),
+            20,
+            cfg,
+        ),
+        _progression_component(
+            f"OTM2 {label} Expansion", contracts.get(primary_side, {}), cfg
+        ),
+        _writing_component(
+            f"{'PE' if bullish else 'CE'} Writing", contracts.get(writing_side, {})
+        ),
+        _relative_volume_component(
+            f"Relative {label} Volume", contracts.get(primary_side, {}), cfg
+        ),
+        _relative_oi_component(
+            f"Relative {label} OI", contracts.get(primary_side, {}), cfg
+        ),
+    ]
+    earned = sum(component["earned"] for component in components)
+    available_max = sum(component["available_max"] for component in components)
+    live_components = components[:4]
+    live_earned = sum(component["earned"] for component in live_components)
+    live_available_max = sum(component["available_max"] for component in live_components)
+    score = round(100 * earned / available_max) if available_max else 0
+    live_score = round(100 * live_earned / live_available_max) if live_available_max else 0
+    historical_available = sum(component["available_max"] for component in components[4:])
+    basis = (
+        "FULL"
+        if historical_available == 30
+        else "LIVE + PARTIAL BASELINE"
+        if historical_available
+        else "LIVE"
+    )
+    return {
+        "score": max(0, min(100, score)),
+        "live_score": max(0, min(100, live_score)),
+        "raw_points": earned,
+        "available_max": available_max,
+        "score_basis": basis,
+        "components": components,
+    }
+
+
+def detect_progression(
+    contracts: Mapping[str, Mapping[str, Mapping[str, Any]]]
+) -> str:
+    call_classes = [
+        contracts.get("CE", {}).get(label, {}).get("classification")
+        for label in ("ATM", "OTM1", "OTM2")
+    ]
+    put_classes = [
+        contracts.get("PE", {}).get(label, {}).get("classification")
+        for label in ("ATM", "OTM1", "OTM2")
+    ]
+    call_expanding = call_classes == ["LONG BUILDUP"] * 3
+    put_expanding = put_classes == ["LONG BUILDUP"] * 3
+    if call_expanding and put_expanding:
+        return "CALL + PUT PARTICIPATION EXPANDING"
+    if call_expanding:
+        return "CALL PARTICIPATION EXPANDING TO HIGHER STRIKES"
+    if put_expanding:
+        return "PUT PARTICIPATION EXPANDING TO LOWER STRIKES"
+    return "NO CONFIRMED PROGRESSION"
+
+
+def detect_conflicts(
+    contracts: Mapping[str, Mapping[str, Mapping[str, Any]]]
+) -> List[str]:
+    conflicts = []
+    for side, word in (("CE", "call"), ("PE", "put")):
+        atm = contracts.get(side, {}).get("ATM", {}).get("classification")
+        outer = [
+            contracts.get(side, {}).get(label, {}).get("classification")
+            for label in ("OTM1", "OTM2")
+        ]
+        if atm == "LONG BUILDUP" and "SHORT BUILDUP" in outer:
+            conflicts.append(f"ATM {word} long buildup conflicts with OTM {word} writing")
+    call_long = contracts.get("CE", {}).get("ATM", {}).get("classification") == "LONG BUILDUP"
+    put_long = contracts.get("PE", {}).get("ATM", {}).get("classification") == "LONG BUILDUP"
+    if call_long and put_long:
+        conflicts.append("ATM calls and puts both show long buildup")
+    return conflicts
+
+
+def signal_status(
+    bull_score: int,
+    bear_score: int,
+    conflicts: Sequence[str],
+    config: Optional[Mapping[str, Any]] = None,
+    bull_live_score: Optional[int] = None,
+    bear_live_score: Optional[int] = None,
+) -> str:
+    cfg = merged_config(config)
+    # Historical abnormality can strengthen a signal but can never create one
+    # without live premium+OI behaviour. This also prevents volume alone from
+    # becoming directional when live inputs are missing.
+    if bull_live_score is not None and bull_live_score < cfg["directional_score"]:
+        bull_score = 0
+    if bear_live_score is not None and bear_live_score < cfg["directional_score"]:
+        bear_score = 0
+    difference = bull_score - bear_score
+    if (
+        bull_score >= cfg["mixed_min_score"]
+        and bear_score >= cfg["mixed_min_score"]
+        and abs(difference) <= cfg["mixed_score_difference"]
+    ):
+        return "MIXED"
+    if conflicts and min(bull_score, bear_score) >= cfg["directional_score"]:
+        return "MIXED"
+    if (
+        bull_score >= cfg["strong_score"]
+        and difference >= cfg["strong_score_difference"]
+    ):
+        return "STRONG BULL"
+    if (
+        bear_score >= cfg["strong_score"]
+        and -difference >= cfg["strong_score_difference"]
+    ):
+        return "STRONG BEAR"
+    if (
+        bull_score >= cfg["directional_score"]
+        and difference >= cfg["directional_score_difference"]
+    ):
+        return "BULL"
+    if (
+        bear_score >= cfg["directional_score"]
+        and -difference >= cfg["directional_score_difference"]
+    ):
+        return "BEAR"
+    if conflicts and max(bull_score, bear_score) >= cfg["mixed_min_score"]:
+        return "MIXED"
+    return "NEUTRAL"
+
+
+def confidence_level(
+    contracts: Mapping[str, Mapping[str, Mapping[str, Any]]], stale: bool = False
+) -> Tuple[str, Dict[str, Any]]:
+    core_total = 0
+    core_valid = 0
+    history_total = 0
+    history_valid = 0
+    missing = []
+    for side in SIDES:
+        for label in MONEYNESS:
+            contract = contracts.get(side, {}).get(label)
+            if not contract:
+                missing.append(f"{side} {label} strike unavailable")
+                core_total += 5
+                if label in ("ATM", "OTM1", "OTM2"):
+                    history_total += 2
+                continue
+            for field in ("ltp", "premium_change_pct", "oi", "oi_change", "volume"):
+                core_total += 1
+                if contract.get(field) is not None:
+                    core_valid += 1
+                else:
+                    missing.append(f"{side} {label} {field} unavailable")
+            if label in ("ATM", "OTM1", "OTM2"):
+                history_total += 2
+                history_valid += int(contract.get("relative_volume") is not None)
+                history_valid += int(contract.get("oi_percentile") is not None)
+    live_coverage = core_valid / core_total if core_total else 0
+    history_coverage = history_valid / history_total if history_total else 0
+    if stale or live_coverage < 0.75:
+        level = "LOW"
+    elif live_coverage >= 0.90 and history_coverage >= 0.85:
+        level = "HIGH"
+    else:
+        level = "MEDIUM"
+    return level, {
+        "live_coverage_pct": round(live_coverage * 100),
+        "historical_coverage_pct": round(history_coverage * 100),
+        "stale": stale,
+        "issues": missing[:20],
+    }
+
+
+def deterministic_explanation(
+    status: str,
+    bull: Mapping[str, Any],
+    bear: Mapping[str, Any],
+    progression: str,
+    conflicts: Sequence[str],
+) -> str:
+    if status == "MIXED":
+        reason = conflicts[0] if conflicts else "call and put evidence are both strong"
+        return (
+            f"Options positioning is mixed: {reason}. Bull {bull['score']} and Bear "
+            f"{bear['score']} are too close for a directional signal."
+        )
+    if status in ("STRONG BULL", "BULL"):
+        parts = []
+        if bull["components"][0]["earned"]:
+            parts.append("ATM calls show fresh long buildup")
+        if bull["components"][1]["earned"]:
+            parts.append("OTM1 calls confirm the move")
+        if "CALL PARTICIPATION" in progression:
+            parts.append("call activity is expanding toward OTM2")
+        if bull["components"][3]["earned"]:
+            parts.append("puts show writing across relevant strikes")
+        return ". ".join(parts).capitalize() + ". Bullish options positioning is strong." 
+    if status in ("STRONG BEAR", "BEAR"):
+        parts = []
+        if bear["components"][0]["earned"]:
+            parts.append("ATM puts show fresh long buildup")
+        if bear["components"][1]["earned"]:
+            parts.append("OTM1 puts confirm the move")
+        if "PUT PARTICIPATION" in progression:
+            parts.append("put activity is expanding toward OTM2")
+        if bear["components"][3]["earned"]:
+            parts.append("calls show writing across relevant strikes")
+        return ". ".join(parts).capitalize() + ". Bearish options positioning is strong."
+    return (
+        "Current premium, OI and volume behaviour does not provide a clear directional "
+        "options-positioning advantage."
+    )
+
+
+def make_snapshot(analysis: Mapping[str, Any]) -> Dict[str, Any]:
+    contracts = {}
+    for side in SIDES:
+        for label, contract in analysis.get("contracts", {}).get(side, {}).items():
+            contracts[f"{side}:{label}"] = {
+                "strike": contract.get("strike"),
+                "ltp": contract.get("ltp"),
+                "oi": contract.get("oi"),
+                "volume": contract.get("volume"),
+            }
+    return {
+        "timestamp": analysis.get("last_updated"),
+        "symbol": analysis.get("symbol"),
+        "spot": analysis.get("spot"),
+        "expiry": analysis.get("expiry"),
+        "contracts": contracts,
+    }
+
+
+def analyse_option_chain(
+    symbol: str,
+    security_id: Any,
+    expiry: str,
+    response: Mapping[str, Any],
+    baseline: Optional[Mapping[str, Any]] = None,
+    snapshots: Optional[Sequence[Mapping[str, Any]]] = None,
+    now: Optional[datetime] = None,
+    config: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    cfg = merged_config(config)
+    now = (now or datetime.now(IST)).astimezone(IST)
+    response_data = response.get("data", response)
+    option_chain = response_data.get("oc", {}) if isinstance(response_data, Mapping) else {}
+    spot = _number(response_data.get("last_price")) if isinstance(response_data, Mapping) else None
+    atm_strike, strike_interval, selected = select_relevant_strikes(option_chain, spot)
+    contracts: Dict[str, Dict[str, Dict[str, Any]]] = {"CE": {}, "PE": {}}
+    rows = []
+    ce_labels = {-2: "ITM2", -1: "ITM1", 0: "ATM", 1: "OTM1", 2: "OTM2"}
+    pe_labels = {-2: "OTM2", -1: "OTM1", 0: "ATM", 1: "ITM1", 2: "ITM2"}
+    for offset, strike, strike_data in selected:
+        ce = build_contract(strike_data.get("ce", {}), strike, ce_labels[offset], "CE", cfg)
+        pe = build_contract(strike_data.get("pe", {}), strike, pe_labels[offset], "PE", cfg)
+        contracts["CE"][ce_labels[offset]] = ce
+        contracts["PE"][pe_labels[offset]] = pe
+        rows.append({"strike": strike, "ce": ce, "pe": pe})
+
+    apply_snapshot_deltas(contracts, snapshots or [], expiry, now, cfg)
+    apply_historical_baseline(contracts, baseline, expiry, now, cfg)
+    bull = score_direction("bull", contracts, cfg)
+    bear = score_direction("bear", contracts, cfg)
+    progression = detect_progression(contracts)
+    conflicts = detect_conflicts(contracts)
+    status = signal_status(
+        bull["score"],
+        bear["score"],
+        conflicts,
+        cfg,
+        bull_live_score=bull["live_score"],
+        bear_live_score=bear["live_score"],
+    )
+    confidence, quality = confidence_level(contracts, stale=False)
+    historical_coverage = quality["historical_coverage_pct"]
+    baseline_status = (
+        "available"
+        if historical_coverage >= 85
+        else "partial"
+        if historical_coverage > 0
+        else "unavailable"
+    )
+    explanation = deterministic_explanation(
+        status, bull, bear, progression, conflicts
+    )
+    atm_ce = contracts.get("CE", {}).get("ATM", {})
+    atm_pe = contracts.get("PE", {}).get("ATM", {})
+    ce_rel_values = [
+        _number(contracts.get("CE", {}).get(label, {}).get("relative_volume"))
+        for label in ("ATM", "OTM1", "OTM2")
+    ]
+    pe_rel_values = [
+        _number(contracts.get("PE", {}).get(label, {}).get("relative_volume"))
+        for label in ("ATM", "OTM1", "OTM2")
+    ]
+    ce_oi_values = [
+        _number(contracts.get("CE", {}).get(label, {}).get("oi_percentile"))
+        for label in ("ATM", "OTM1", "OTM2")
+    ]
+    pe_oi_values = [
+        _number(contracts.get("PE", {}).get(label, {}).get("oi_percentile"))
+        for label in ("ATM", "OTM1", "OTM2")
+    ]
+    ce_rel = [value for value in ce_rel_values if value is not None]
+    pe_rel = [value for value in pe_rel_values if value is not None]
+    ce_pct = [value for value in ce_oi_values if value is not None]
+    pe_pct = [value for value in pe_oi_values if value is not None]
+    return {
+        "symbol": symbol,
+        "security_id": str(security_id),
+        "spot": _round(spot),
+        "expiry": expiry,
+        "atm_strike": atm_strike,
+        "strike_interval": strike_interval,
+        "bull_score": bull["score"],
+        "bear_score": bear["score"],
+        "bull_live_score": bull["live_score"],
+        "bear_live_score": bear["live_score"],
+        "net_score": bull["score"] - bear["score"],
+        "signal": status,
+        "confidence": confidence,
+        "score_basis": (
+            "FULL"
+            if bull["score_basis"] == bear["score_basis"] == "FULL"
+            else "LIVE + PARTIAL BASELINE"
+            if historical_coverage
+            else "LIVE"
+        ),
+        "baseline_status": baseline_status,
+        "atm_ce_action": atm_ce.get("classification", "UNAVAILABLE"),
+        "atm_pe_action": atm_pe.get("classification", "UNAVAILABLE"),
+        "ce_relative_volume": _round(statistics.mean(ce_rel)) if ce_rel else None,
+        "pe_relative_volume": _round(statistics.mean(pe_rel)) if pe_rel else None,
+        "ce_oi_percentile": _round(statistics.mean(ce_pct), 1) if ce_pct else None,
+        "pe_oi_percentile": _round(statistics.mean(pe_pct), 1) if pe_pct else None,
+        "strike_progression": progression,
+        "conflicts": conflicts,
+        "explanation": explanation,
+        "bull_breakdown": bull,
+        "bear_breakdown": bear,
+        "contracts": contracts,
+        "strikes": rows,
+        "data_quality": quality,
+        "last_updated": now.isoformat(),
+    }
+
+
+def summary_from_analysis(analysis: Mapping[str, Any]) -> Dict[str, Any]:
+    keys = (
+        "symbol",
+        "security_id",
+        "spot",
+        "expiry",
+        "atm_strike",
+        "strike_interval",
+        "bull_score",
+        "bear_score",
+        "bull_live_score",
+        "bear_live_score",
+        "net_score",
+        "signal",
+        "confidence",
+        "score_basis",
+        "baseline_status",
+        "atm_ce_action",
+        "atm_pe_action",
+        "ce_relative_volume",
+        "pe_relative_volume",
+        "ce_oi_percentile",
+        "pe_oi_percentile",
+        "strike_progression",
+        "conflicts",
+        "last_updated",
+    )
+    return {key: analysis.get(key) for key in keys}
+
+
+def _is_near_expiry_observation(day: date, near_business_days: int) -> bool:
+    """Approximate historical monthly-expiry effects without inventing an expiry date.
+
+    Rolling-option responses do not include the historical contract expiry. We mark the
+    last N weekdays of each month as a separate bucket, a conservative approximation
+    that remains valid if the exchange changes the exact monthly expiry weekday.
+    """
+    last_day = date(day.year, day.month, calendar.monthrange(day.year, day.month)[1])
+    business_days = []
+    cursor = last_day
+    while len(business_days) < near_business_days:
+        if cursor.weekday() < 5:
+            business_days.append(cursor)
+        cursor -= timedelta(days=1)
+    return day >= min(business_days)
+
+
+def _distribution_stats(
+    volumes: Sequence[float],
+    oi_values: Sequence[float],
+    oi_changes: Sequence[float],
+    time_key: str,
+    expiry_bucket: str,
+) -> Dict[str, Any]:
+    clean_volumes = sorted(float(x) for x in volumes if _number(x) is not None)
+    clean_oi = sorted(float(x) for x in oi_values if _number(x) is not None)
+    clean_changes = sorted(float(x) for x in oi_changes if _number(x) is not None)
+    return {
+        "sample_size": min(len(clean_volumes), len(clean_oi), len(clean_changes)),
+        "time_key": time_key,
+        "expiry_bucket": expiry_bucket,
+        "median_volume": _round(statistics.median(clean_volumes)) if clean_volumes else None,
+        "median_oi": _round(statistics.median(clean_oi)) if clean_oi else None,
+        "median_oi_change": _round(statistics.median(clean_changes)) if clean_changes else None,
+        "volume_p80": _round(percentile(clean_volumes, 80)),
+        "volume_p90": _round(percentile(clean_volumes, 90)),
+        "volume_p95": _round(percentile(clean_volumes, 95)),
+        "oi_change_p80": _round(percentile(clean_changes, 80)),
+        "oi_change_p90": _round(percentile(clean_changes, 90)),
+        "oi_change_p95": _round(percentile(clean_changes, 95)),
+        "volume_distribution": [round(x, 4) for x in clean_volumes],
+        "oi_change_distribution": [round(x, 4) for x in clean_changes],
+    }
+
+
+def build_historical_baseline(
+    symbol: str,
+    series_payloads: Mapping[str, Sequence[Mapping[str, Any]]],
+    generated_at: Optional[datetime] = None,
+    config: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Aggregate Dhan rolling-option candles by moneyness, time and expiry bucket."""
+    cfg = merged_config(config)
+    observations: Dict[Tuple[str, str, str, str], Dict[str, List[float]]] = defaultdict(
+        lambda: {"volume": [], "oi": [], "oi_change": []}
+    )
+    for key, payloads in series_payloads.items():
+        try:
+            side, label = key.split(":", 1)
+        except ValueError:
+            continue
+        records_by_day: Dict[date, List[Tuple[datetime, Optional[float], Optional[float]]]] = defaultdict(list)
+        for payload in payloads:
+            data = payload.get("data", payload) if isinstance(payload, Mapping) else {}
+            if not isinstance(data, Mapping):
+                continue
+            series = data.get("ce") if side == "CE" else data.get("pe")
+            if not isinstance(series, Mapping):
+                series = data.get("pe") if side == "CE" else data.get("ce")
+            if not isinstance(series, Mapping):
+                continue
+            timestamps = series.get("timestamp", []) or []
+            volumes = series.get("volume", []) or []
+            oi_values = series.get("oi", series.get("open_interest", [])) or []
+            for index, timestamp in enumerate(timestamps):
+                timestamp_num = _number(timestamp)
+                if timestamp_num is None:
+                    continue
+                moment = datetime.fromtimestamp(timestamp_num, tz=IST)
+                volume = _number(volumes[index]) if index < len(volumes) else None
+                oi = _number(oi_values[index]) if index < len(oi_values) else None
+                records_by_day[moment.date()].append((moment, volume, oi))
+
+        for day, records in records_by_day.items():
+            records.sort(key=lambda item: item[0])
+            first_oi = next((oi for _, _, oi in records if oi is not None), None)
+            cumulative_volume = 0.0
+            bucket = (
+                "near_expiry"
+                if _is_near_expiry_observation(day, int(cfg["near_expiry_days"]))
+                else "normal"
+            )
+            for moment, volume, oi in records:
+                if volume is not None:
+                    cumulative_volume += max(0.0, volume)
+                if oi is None or first_oi is None:
+                    continue
+                time_key = _floor_time_key(moment, int(cfg["baseline_interval"]))
+                item = observations[(bucket, time_key, side, label)]
+                item["volume"].append(cumulative_volume)
+                item["oi"].append(oi)
+                item["oi_change"].append(oi - first_oi)
+
+    categories: Dict[str, Dict[str, Dict[str, Dict[str, Any]]]] = {
+        "normal": {},
+        "near_expiry": {},
+    }
+    for (bucket, time_key, side, label), values in observations.items():
+        categories.setdefault(bucket, {}).setdefault(time_key, {}).setdefault(side, {})[
+            label
+        ] = _distribution_stats(
+            values["volume"], values["oi"], values["oi_change"], time_key, bucket
+        )
+    now = generated_at or datetime.now(IST)
+    sample_sizes = [
+        metrics.get("sample_size", 0)
+        for bucket in categories.values()
+        for time_data in bucket.values()
+        for side_data in time_data.values()
+        for metrics in side_data.values()
+    ]
+    return {
+        "version": 1,
+        "symbol": symbol,
+        "source": "dhan_rollingoption",
+        "generated_at": now.astimezone(IST).isoformat(),
+        "baseline_days": cfg["baseline_days"],
+        "interval_minutes": int(cfg["baseline_interval"]),
+        "expiry_handling": (
+            f"Nearest monthly rolling contract; last {cfg['near_expiry_days']} weekdays "
+            "of each month stored separately from normal observations"
+        ),
+        "categories": categories,
+        "metric_sets": len(sample_sizes),
+        "max_sample_size": max(sample_sizes, default=0),
+    }
+
+
+def baseline_overview(baseline: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    if not baseline:
+        return {"status": "unavailable", "source": None, "metric_sets": 0}
+    categories = baseline.get("categories", {})
+    sample_sizes = []
+    for bucket in categories.values() if isinstance(categories, Mapping) else []:
+        for time_data in bucket.values() if isinstance(bucket, Mapping) else []:
+            for side_data in time_data.values() if isinstance(time_data, Mapping) else []:
+                for metrics in side_data.values() if isinstance(side_data, Mapping) else []:
+                    if isinstance(metrics, Mapping):
+                        sample_sizes.append(int(metrics.get("sample_size", 0)))
+    return {
+        "status": "available" if sample_sizes else "unavailable",
+        "source": baseline.get("source"),
+        "generated_at": baseline.get("generated_at"),
+        "baseline_days": baseline.get("baseline_days"),
+        "interval_minutes": baseline.get("interval_minutes"),
+        "expiry_handling": baseline.get("expiry_handling"),
+        "metric_sets": len(sample_sizes),
+        "max_sample_size": max(sample_sizes, default=0),
+    }
+
+
+class BaselineStore:
+    def __init__(self, root: os.PathLike[str] | str):
+        self.root = Path(root) / "baselines"
+        self._cache: Dict[str, Dict[str, Any]] = {}
+        self._lock = threading.RLock()
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+
+    def _path(self, symbol: str) -> Path:
+        safe = "".join(ch for ch in symbol.upper() if ch.isalnum() or ch in ("-", "_"))
+        return self.root / f"{safe}.json"
+
+    def get(self, symbol: str) -> Optional[Dict[str, Any]]:
+        symbol = symbol.upper()
+        with self._lock:
+            if symbol in self._cache:
+                return self._cache[symbol]
+            try:
+                data = json.loads(self._path(symbol).read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    self._cache[symbol] = data
+                    return data
+            except (OSError, ValueError):
+                return None
+        return None
+
+    def set(self, symbol: str, baseline: Mapping[str, Any]) -> None:
+        symbol = symbol.upper()
+        data = dict(baseline)
+        with self._lock:
+            self._cache[symbol] = data
+            try:
+                temporary = self._path(symbol).with_suffix(".tmp")
+                temporary.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
+                temporary.replace(self._path(symbol))
+            except OSError:
+                pass
+
+
+class SnapshotStore:
+    def __init__(self, root: os.PathLike[str] | str, max_per_symbol: int = 220):
+        self.root = Path(root) / "snapshots"
+        self.max_per_symbol = max_per_symbol
+        self._items: Dict[str, deque] = defaultdict(lambda: deque(maxlen=max_per_symbol))
+        self._lock = threading.RLock()
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        self._load_today()
+
+    def _today_path(self) -> Path:
+        return self.root / f"oi-action-{datetime.now(IST):%Y%m%d}.jsonl"
+
+    def _load_today(self) -> None:
+        try:
+            lines = self._today_path().read_text(encoding="utf-8").splitlines()[-10000:]
+        except OSError:
+            return
+        for line in lines:
+            try:
+                snapshot = json.loads(line)
+                symbol = str(snapshot.get("symbol", "")).upper()
+                if symbol:
+                    self._items[symbol].append(snapshot)
+            except (TypeError, ValueError):
+                continue
+
+    def append(self, analysis: Mapping[str, Any]) -> None:
+        snapshot = make_snapshot(analysis)
+        symbol = str(snapshot.get("symbol", "")).upper()
+        if not symbol:
+            return
+        with self._lock:
+            self._items[symbol].append(snapshot)
+            try:
+                with self._today_path().open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(snapshot, separators=(",", ":")) + "\n")
+            except OSError:
+                pass
+
+    def history(self, symbol: str) -> List[Dict[str, Any]]:
+        with self._lock:
+            return list(self._items.get(symbol.upper(), []))
+
+
+# ============================================================================
+# OI ACTION FASTAPI / DHAN INTEGRATION (MERGED)
+# ============================================================================
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+class OIActionService:
+    def __init__(
+        self,
+        app: Any,
+        scheduler: Any,
+        dhan_base: str,
+        creds: Dict[str, str],
+        get_symbols: Callable[[], List[dict]],
+        ensure_symbols: Callable[[str], bool],
+        get_nearest_expiry: Callable[[str, str, Any], Optional[str]],
+        ist_now: Callable[[], Any],
+        is_market_open: Callable[[], bool],
+    ) -> None:
+        self.app = app
+        self.scheduler = scheduler
+        self.dhan_base = dhan_base
+        self.creds = creds
+        self.get_symbols = get_symbols
+        self.ensure_symbols = ensure_symbols
+        self.get_nearest_expiry = get_nearest_expiry
+        self.ist_now = ist_now
+        self.is_market_open = is_market_open
+        self.config = merged_config(
+            {
+                "refresh_seconds": _env_int("OI_ACTION_REFRESH_SECONDS", 180),
+                "scan_batch_size": _env_int("OI_ACTION_BATCH_SIZE", 6),
+                "scan_batch_pause_seconds": _env_float("OI_ACTION_BATCH_PAUSE", 3.1),
+                "baseline_symbols_per_cycle": _env_int(
+                    "OI_ACTION_BASELINES_PER_CYCLE", 1
+                ),
+                "baseline_min_observations": _env_int(
+                    "OI_ACTION_BASELINE_MIN_DAYS", 20
+                ),
+            }
+        )
+        data_dir = os.getenv(
+            "OI_ACTION_DATA_DIR",
+            os.path.join(
+                os.getenv("TEMP") or os.getenv("TMP") or "/tmp", "tradeas_oi_action"
+            ),
+        )
+        self.baselines = BaselineStore(data_dir)
+        self.snapshots = SnapshotStore(data_dir)
+        self.scan_lock = threading.Lock()
+        self.baseline_lock = threading.Lock()
+        self.state_lock = threading.RLock()
+        self.details: Dict[str, dict] = {}
+        self.baseline_state: Dict[str, dict] = {}
+        self.cache: Dict[str, Any] = {
+            "status": "idle",
+            "data": [],
+            "count": 0,
+            "updated_at": None,
+            "updated_epoch": None,
+            "expiry": None,
+            "market_open": False,
+            "errors": [],
+            "progress": 0,
+            "total": 0,
+            "baseline_note": (
+                "Historical scores use Dhan rolling expired-options data, normalized "
+                "by moneyness, time of day and near-expiry/normal bucket. Results are "
+                "explicitly LIVE until a baseline is available."
+            ),
+        }
+        self._register()
+
+    def _register(self) -> None:
+        self.scheduler.add_job(
+            self.scheduled_scan,
+            "interval",
+            seconds=int(self.config["refresh_seconds"]),
+            id="oi_action_scanner",
+            replace_existing=True,
+        )
+        self.app.add_api_route(
+            "/api/oi-action", self.get_summary, methods=["GET"], name="get_oi_action"
+        )
+        self.app.add_api_route(
+            "/api/oi-action/{symbol}/history",
+            self.get_history,
+            methods=["GET"],
+            name="get_oi_action_history",
+        )
+        self.app.add_api_route(
+            "/api/oi-action/{symbol}",
+            self.get_detail,
+            methods=["GET"],
+            name="get_oi_action_detail",
+        )
+
+    def stale(self) -> bool:
+        updated = self.cache.get("updated_epoch")
+        return not updated or time.time() - float(updated) > self.config["stale_after_seconds"]
+
+    @staticmethod
+    def _headers(tok: str, cid: str) -> dict:
+        return {
+            "access-token": tok,
+            "client-id": cid,
+            "Content-Type": "application/json",
+        }
+
+    def _choose_expiry(self, tok: str, cid: str, symbols: List[dict]) -> str:
+        for item in symbols[:10]:
+            expiry = self.get_nearest_expiry(tok, cid, item["security_id"])
+            if expiry:
+                return expiry
+        return ""
+
+    def _fetch_chain(self, item: dict, expiry: str, tok: str, cid: str) -> tuple:
+        symbol = item["symbol"]
+        security_id = item["security_id"]
+        payload = {
+            "UnderlyingScrip": int(security_id),
+            "UnderlyingSeg": "NSE_EQ",
+            "Expiry": expiry,
+        }
+        last_error = None
+        for attempt in range(3):
+            try:
+                response = requests.post(
+                    f"{self.dhan_base}/v2/optionchain",
+                    json=payload,
+                    headers=self._headers(tok, cid),
+                    timeout=18,
+                )
+                if response.status_code == 200:
+                    body = response.json()
+                    if body.get("status") == "success" and body.get("data", {}).get("oc"):
+                        return symbol, security_id, body, None
+                    last_error = str(body.get("remarks") or "empty option chain")
+                elif response.status_code == 429:
+                    last_error = "rate limited"
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                elif response.status_code >= 500:
+                    last_error = f"Dhan {response.status_code}"
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                else:
+                    last_error = f"Dhan {response.status_code}"
+                break
+            except Exception as exc:
+                last_error = str(exc)
+                time.sleep(1.5 * (attempt + 1))
+        return symbol, security_id, None, last_error or "option chain failed"
+
+    @staticmethod
+    def _rolling_strike(side: str, label: str) -> str:
+        offsets = {
+            "CE": {"ITM2": -2, "ITM1": -1, "ATM": 0, "OTM1": 1, "OTM2": 2},
+            "PE": {"ITM2": 2, "ITM1": 1, "ATM": 0, "OTM1": -1, "OTM2": -2},
+        }
+        offset = offsets[side][label]
+        return "ATM" if offset == 0 else f"ATM{'+' if offset > 0 else ''}{offset}"
+
+    def _history_windows(self) -> list:
+        end = self.ist_now().date()
+        start = end - timedelta(days=int(self.config["baseline_days"]))
+        cursor = start
+        windows = []
+        while cursor < end:
+            next_cursor = min(
+                cursor + timedelta(days=int(self.config["history_chunk_days"])), end
+            )
+            windows.append((cursor.isoformat(), next_cursor.isoformat()))
+            cursor = next_cursor
+        return windows
+
+    def _fetch_rolling_window(
+        self,
+        security_id: str,
+        side: str,
+        label: str,
+        from_date: str,
+        to_date: str,
+        tok: str,
+        cid: str,
+    ) -> dict:
+        payload = {
+            "exchangeSegment": "NSE_FNO",
+            "interval": str(self.config["baseline_interval"]),
+            "securityId": int(security_id),
+            "instrument": "OPTSTK",
+            "expiryFlag": "MONTH",
+            "expiryCode": 1,
+            "strike": self._rolling_strike(side, label),
+            "drvOptionType": "CALL" if side == "CE" else "PUT",
+            "requiredData": ["close", "volume", "oi", "strike", "spot"],
+            "fromDate": from_date,
+            "toDate": to_date,
+        }
+        for attempt in range(3):
+            try:
+                response = requests.post(
+                    f"{self.dhan_base}/v2/charts/rollingoption",
+                    json=payload,
+                    headers=self._headers(tok, cid),
+                    timeout=30,
+                )
+                if response.status_code == 200:
+                    body = response.json()
+                    return body if isinstance(body, dict) else {}
+                if response.status_code == 429:
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                if response.status_code >= 500:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                return {}
+            except Exception:
+                time.sleep(1.5 * (attempt + 1))
+        return {}
+
+    def _build_baseline(self, item: dict, tok: str, cid: str) -> None:
+        symbol = item["symbol"]
+        self.baseline_state[symbol] = {
+            "status": "building",
+            "started_at": self.ist_now().isoformat(),
+        }
+        try:
+            series_payloads: Dict[str, list] = {}
+            for side in ("CE", "PE"):
+                for label in ("ITM2", "ITM1", "ATM", "OTM1", "OTM2"):
+                    key = f"{side}:{label}"
+                    series_payloads[key] = []
+                    for from_date, to_date in self._history_windows():
+                        body = self._fetch_rolling_window(
+                            item["security_id"],
+                            side,
+                            label,
+                            from_date,
+                            to_date,
+                            tok,
+                            cid,
+                        )
+                        if body.get("data"):
+                            series_payloads[key].append(body)
+                        time.sleep(0.25)  # stay under the documented 5 data calls/s
+            baseline = build_historical_baseline(
+                symbol,
+                series_payloads,
+                generated_at=self.ist_now(),
+                config=self.config,
+            )
+            if baseline.get("metric_sets", 0):
+                self.baselines.set(symbol, baseline)
+                self.baseline_state[symbol] = {
+                    **baseline_overview(baseline),
+                    "status": "available",
+                    "updated_at": self.ist_now().isoformat(),
+                }
+                print(
+                    f"[oi-action] baseline ready {symbol}: "
+                    f"{baseline.get('metric_sets')} metric sets"
+                )
+            else:
+                self.baseline_state[symbol] = {
+                    "status": "unavailable",
+                    "updated_at": self.ist_now().isoformat(),
+                    "reason": "Dhan rolling options returned no usable observations",
+                }
+                print(f"[oi-action] baseline unavailable {symbol}")
+        except Exception as exc:
+            self.baseline_state[symbol] = {
+                "status": "error",
+                "updated_at": self.ist_now().isoformat(),
+                "reason": str(exc),
+            }
+            print(f"[oi-action] baseline {symbol} error: {exc}")
+
+    def _baseline_queue(self, symbols: List[str], tok: str, cid: str) -> None:
+        with self.baseline_lock:
+            symbol_map = {item["symbol"]: item for item in self.get_symbols()}
+            for symbol in symbols:
+                item = symbol_map.get(symbol)
+                if item and not self.baselines.get(symbol):
+                    self._build_baseline(item, tok, cid)
+
+    def start_baselines(self, symbols: List[str], tok: str, cid: str) -> None:
+        pending = [
+            symbol
+            for symbol in symbols
+            if not self.baselines.get(symbol)
+            and self.baseline_state.get(symbol, {}).get("status") != "building"
+        ]
+        if not pending or self.baseline_lock.locked():
+            return
+        threading.Thread(
+            target=self._baseline_queue,
+            args=(pending, tok, cid),
+            daemon=True,
+        ).start()
+
+    def scan(self, tok: str, cid: str) -> None:
+        if not tok or not cid:
+            self.cache["status"] = "no_credentials"
+            return
+        self.ensure_symbols(tok)
+        symbols = list(self.get_symbols())
+        max_symbols = _env_int("OI_ACTION_MAX_SYMBOLS", 0)
+        if max_symbols > 0:
+            symbols = symbols[:max_symbols]
+        if not symbols:
+            self.cache.update({"status": "error", "errors": ["F&O universe unavailable"]})
+            return
+        self.cache.update(
+            {
+                "status": "fetching",
+                "progress": 0,
+                "total": len(symbols),
+                "errors": [],
+            }
+        )
+        expiry = self._choose_expiry(tok, cid, symbols)
+        if not expiry:
+            self.cache.update(
+                {"status": "error", "errors": ["Nearest expiry unavailable"]}
+            )
+            return
+
+        print(f"[oi-action] scanning {len(symbols)} symbols, expiry={expiry}")
+        details: Dict[str, dict] = {}
+        errors = []
+        completed = 0
+        batch_size = max(1, int(self.config["scan_batch_size"]))
+        for start in range(0, len(symbols), batch_size):
+            batch = symbols[start : start + batch_size]
+            with ThreadPoolExecutor(max_workers=len(batch)) as executor:
+                futures = [
+                    executor.submit(self._fetch_chain, item, expiry, tok, cid)
+                    for item in batch
+                ]
+                for future in as_completed(futures):
+                    symbol, security_id, body, error = future.result()
+                    completed += 1
+                    self.cache["progress"] = round(100 * completed / len(symbols))
+                    if error or not body:
+                        errors.append({"symbol": symbol, "error": error or "no data"})
+                        continue
+                    try:
+                        detail = analyse_option_chain(
+                            symbol,
+                            security_id,
+                            expiry,
+                            body,
+                            baseline=self.baselines.get(symbol),
+                            snapshots=self.snapshots.history(symbol),
+                            now=self.ist_now(),
+                            config=self.config,
+                        )
+                        details[symbol] = detail
+                        self.snapshots.append(detail)
+                    except Exception as exc:
+                        errors.append({"symbol": symbol, "error": str(exc)})
+            if start + batch_size < len(symbols):
+                time.sleep(float(self.config["scan_batch_pause_seconds"]))
+
+        summaries = [summary_from_analysis(detail) for detail in details.values()]
+        summaries.sort(
+            key=lambda item: (
+                abs(item.get("net_score") or 0),
+                max(item.get("bull_score") or 0, item.get("bear_score") or 0),
+            ),
+            reverse=True,
+        )
+        with self.state_lock:
+            self.details = details
+            self.cache.update(
+                {
+                    "status": "ok" if details else "error",
+                    "data": summaries,
+                    "count": len(summaries),
+                    "updated_at": self.ist_now().isoformat(),
+                    "updated_epoch": time.time(),
+                    "expiry": expiry,
+                    "market_open": self.is_market_open(),
+                    "errors": errors[:50],
+                    "progress": 100,
+                    "total": len(symbols),
+                }
+            )
+        print(f"[oi-action] done: {len(summaries)} analysed, {len(errors)} errors")
+
+        limit = max(0, int(self.config["baseline_symbols_per_cycle"]))
+        if limit:
+            missing = [
+                item["symbol"]
+                for item in summaries
+                if not self.baselines.get(item["symbol"])
+            ]
+            self.start_baselines(missing[:limit], tok, cid)
+
+    def _run_locked(self, tok: str, cid: str) -> None:
+        with self.scan_lock:
+            self.scan(tok, cid)
+
+    def trigger(self, tok: str, cid: str) -> bool:
+        if self.scan_lock.locked():
+            return False
+        threading.Thread(target=self._run_locked, args=(tok, cid), daemon=True).start()
+        return True
+
+    def scheduled_scan(self) -> None:
+        tok = self.creds.get("access_token", "")
+        cid = self.creds.get("client_id", "")
+        if tok and cid and self.is_market_open() and not self.scan_lock.locked():
+            self.trigger(tok, cid)
+
+    def get_summary(
+        self,
+        x_client_id: str = Header(None),
+        x_access_token: str = Header(None),
+        refresh: bool = Query(False),
+    ) -> dict:
+        cid = x_client_id or self.creds.get("client_id", "")
+        tok = x_access_token or self.creds.get("access_token", "")
+        if not cid or not tok:
+            return {"status": "no_credentials", "data": [], "count": 0}
+        self.creds["client_id"] = cid
+        self.creds["access_token"] = tok
+        if (refresh or self.stale()) and not self.scan_lock.locked():
+            self.trigger(tok, cid)
+        stale = self.stale()
+        with self.state_lock:
+            payload = dict(self.cache)
+            payload["data"] = [
+                {
+                    **item,
+                    "stale": stale,
+                    "confidence": (
+                        "LOW" if stale and item.get("last_updated") else item.get("confidence")
+                    ),
+                }
+                for item in self.cache.get("data", [])
+            ]
+        payload["stale"] = stale
+        payload["config"] = {
+            key: self.config[key]
+            for key in (
+                "relative_volume_elevated",
+                "relative_volume_strong",
+                "relative_volume_exceptional",
+                "oi_percentile_high",
+                "oi_percentile_extreme",
+                "strong_score",
+                "directional_score",
+                "mixed_score_difference",
+                "snapshot_intervals",
+                "refresh_seconds",
+            )
+        }
+        return payload
+
+    def get_history(
+        self,
+        symbol: str,
+        x_client_id: str = Header(None),
+        x_access_token: str = Header(None),
+        refresh_baseline: bool = Query(False),
+    ) -> dict:
+        symbol = symbol.upper()
+        cid = x_client_id or self.creds.get("client_id", "")
+        tok = x_access_token or self.creds.get("access_token", "")
+        baseline = self.baselines.get(symbol)
+        state = self.baseline_state.get(symbol, {})
+        if cid and tok and (refresh_baseline or (not baseline and state.get("status") not in ("building", "unavailable"))):
+            self.start_baselines([symbol], tok, cid)
+            state = {"status": "building"}
+        return {
+            "status": "ok",
+            "symbol": symbol,
+            "snapshots": self.snapshots.history(symbol),
+            "snapshot_intervals": self.config["snapshot_intervals"],
+            "baseline": baseline_overview(baseline),
+            "baseline_build": state
+            or {"status": "available" if baseline else "unavailable"},
+            "expiry_note": (
+                "Current DTE <= 4 days uses the near-expiry bucket. Historical rolling "
+                "data separates the last four weekdays of each month from normal observations."
+            ),
+        }
+
+    def get_detail(
+        self,
+        symbol: str,
+        x_client_id: str = Header(None),
+        x_access_token: str = Header(None),
+    ) -> dict:
+        symbol = symbol.upper()
+        cid = x_client_id or self.creds.get("client_id", "")
+        tok = x_access_token or self.creds.get("access_token", "")
+        with self.state_lock:
+            detail = self.details.get(symbol)
+            detail = dict(detail) if detail else None
+        if not detail:
+            return {"status": "not_found", "symbol": symbol, "detail": None}
+        stale = self.stale()
+        if stale:
+            detail["confidence"] = "LOW"
+            detail["data_quality"] = {**detail.get("data_quality", {}), "stale": True}
+        baseline = self.baselines.get(symbol)
+        if not baseline and cid and tok:
+            self.start_baselines([symbol], tok, cid)
+        return {
+            "status": "ok",
+            "detail": detail,
+            "stale": stale,
+            "baseline": baseline_overview(baseline),
+            "baseline_build": self.baseline_state.get(symbol, {}),
+        }
+
+
+def install_oi_action(
+    app: Any,
+    scheduler: Any,
+    dhan_base: str,
+    creds: Dict[str, str],
+    get_symbols: Callable[[], List[dict]],
+    ensure_symbols: Callable[[str], bool],
+    get_nearest_expiry: Callable[[str, str, Any], Optional[str]],
+    ist_now: Callable[[], Any],
+    is_market_open: Callable[[], bool],
+) -> OIActionService:
+    return OIActionService(
+        app,
+        scheduler,
+        dhan_base,
+        creds,
+        get_symbols,
+        ensure_symbols,
+        get_nearest_expiry,
+        ist_now,
+        is_market_open,
+    )
+
+
+# Register the options-only OI Action service after all shared helpers/routes exist.
+# The installer receives callbacks instead of duplicating authentication, symbol or
+# scheduler infrastructure from this application.
+_oi_action_service = install_oi_action(
+    app=app,
+    scheduler=scheduler,
+    dhan_base=DHAN_BASE,
+    creds=CREDS,
+    get_symbols=lambda: SYMBOLS,
+    ensure_symbols=ensure_symbols,
+    get_nearest_expiry=_get_nearest_expiry,
+    ist_now=ist_now,
+    is_market_open=is_market_open,
+)
