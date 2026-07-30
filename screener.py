@@ -1067,6 +1067,97 @@ def _last_trading_day() -> str:
         d -= timedelta(days=1)
     return d.strftime("%Y-%m-%d")
 
+
+# Keep the last non-empty Power Strike / OI Strategy / IA result outside the
+# scanner logic.  This lets the original rules continue to decide signals,
+# while a zero-result scan after market close cannot erase the completed
+# session that users still need to review.
+_SIGNAL_SNAPSHOT_DIR = Path(os.getenv(
+    "TRADEAS_SIGNAL_CACHE_DIR", str(Path(__file__).resolve().parent)
+))
+
+
+def _signal_snapshot_path(name: str) -> Path:
+    return _SIGNAL_SNAPSHOT_DIR / f"{name}_last_signals.json"
+
+
+def _load_signal_snapshot(name: str) -> Optional[dict]:
+    try:
+        payload = json.loads(_signal_snapshot_path(name).read_text(encoding="utf-8"))
+        session_date = str(payload.get("session_date") or "")
+        saved_cache = payload.get("cache")
+        if session_date != _last_trading_day():
+            return None
+        if not isinstance(saved_cache, dict) or not saved_cache.get("data"):
+            return None
+        restored = deepcopy(saved_cache)
+        restored.update({
+            "status": "ok",
+            "market_open": False,
+            "mode": "previous_session",
+            "source": "previous_session_snapshot",
+            "snapshot_date": session_date,
+        })
+        print(f"[{name}] restored {len(restored['data'])} previous-session rows")
+        return restored
+    except Exception:
+        return None
+
+
+def _save_signal_snapshot(name: str, state: dict) -> None:
+    if not state.get("data"):
+        return
+    try:
+        session_date = str(state.get("snapshot_date") or _last_trading_day())
+        snapshot = deepcopy(state)
+        snapshot["snapshot_date"] = session_date
+        payload = {
+            "session_date": session_date,
+            "saved_at": ist_now().isoformat(),
+            "cache": snapshot,
+        }
+        path = _signal_snapshot_path(name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        temporary.replace(path)
+    except Exception as exc:
+        print(f"[{name}] could not save previous-session snapshot: {exc}")
+
+
+def _retain_closed_session(name: str, state: dict, previous: Optional[dict]) -> None:
+    """Save non-empty results; after close restore the last non-empty result."""
+    market_open = is_market_open()
+    should_restore = (
+        not market_open
+        and previous
+        and previous.get("data")
+        and (not state.get("data") or state.get("status") != "ok")
+    )
+    if should_restore:
+        restored = deepcopy(previous)
+        restored.update({
+            "status": "ok",
+            "updated_at": ist_now().strftime("%H:%M:%S IST"),
+            "market_open": False,
+            "mode": "previous_session",
+            "source": "previous_session_snapshot",
+            "snapshot_date": str(previous.get("snapshot_date") or _last_trading_day()),
+        })
+        state.clear()
+        state.update(restored)
+        _save_signal_snapshot(name, state)
+        print(f"[{name}] retained {len(state['data'])} rows from the completed session")
+        return
+    if state.get("data"):
+        # A live scanner that deliberately skipped must not relabel yesterday's
+        # loaded snapshot as today's data while Power Strike is still warming up.
+        if market_open and state.get("status") != "ok":
+            return
+        state["snapshot_date"] = _last_trading_day()
+        _save_signal_snapshot(name, state)
+        return
+
 def _parse_ts(ts_val):
     """Parse Dhan timestamp to HH:MM — handles both epoch int and string formats."""
     try:
@@ -1296,6 +1387,9 @@ def get_breakout(x_client_id:str=Header(None), x_access_token:str=Header(None),
 # Flags stocks with: large move + vol spike + OI buildup at nearest strike
 # ══════════════════════════════════════════════════════════════════════════════
 _ps_cache = {"data": [], "status": "idle", "updated_at": None, "count": 0}
+_saved_ps_cache = _load_signal_snapshot("ps")
+if _saved_ps_cache:
+    _ps_cache.update(_saved_ps_cache)
 _ps_lock  = threading.Lock()
 
 def _fetch_option_score(tok, cid, sym_info, spot, direction, nearest_expiry, headers):
@@ -1696,7 +1790,12 @@ def get_next_day(x_client_id:str=Header(None), x_access_token:str=Header(None),
     return _nd_cache
 
 def _run_ps_locked(tok):
-    with _ps_lock: _compute_power_strike(tok)
+    with _ps_lock:
+        previous = deepcopy(_ps_cache) if _ps_cache.get("data") else None
+        try:
+            _compute_power_strike(tok)
+        finally:
+            _retain_closed_session("ps", _ps_cache, previous)
 
 def _ps_stale():
     last = _ps_cache.get("updated_at")
@@ -1786,6 +1885,9 @@ _ois_cache = {
     "data": [], "status": "idle", "updated_at": None,
     "count": 0, "bulls": 0, "bears": 0, "strong": 0, "market_open": False,
 }
+_saved_ois_cache = _load_signal_snapshot("ois")
+if _saved_ois_cache:
+    _ois_cache.update(_saved_ois_cache)
 _ois_lock = threading.Lock()
 
 
@@ -1973,7 +2075,9 @@ def _compute_ois(tok: str):
             time.sleep(10); wait += 10
         source_data = _ps_cache.get("data", [])
         if not source_data:
-            print(f"[ois] PS has no data — using live screener fallback")
+            print(f"[ois] PS has no data — skipping")
+            _ois_cache["status"] = "idle"
+            return
     else:
         # Closed market — use PS data if available (has option chains), else screener
         source_data = _ps_cache.get("data", [])
@@ -2160,7 +2264,12 @@ def _compute_ois(tok: str):
 
 
 def _run_ois_locked(tok: str):
-    with _ois_lock: _compute_ois(tok)
+    with _ois_lock:
+        previous = deepcopy(_ois_cache) if _ois_cache.get("data") else None
+        try:
+            _compute_ois(tok)
+        finally:
+            _retain_closed_session("ois", _ois_cache, previous)
 
 
 def _ois_stale() -> bool:
@@ -2244,6 +2353,9 @@ _ia_cache = {
     "institutional": 0, "market_open": False, "mode": "closed",
     "next_refresh": None,
 }
+_saved_ia_cache = _load_signal_snapshot("ia")
+if _saved_ia_cache:
+    _ia_cache.update(_saved_ia_cache)
 _ia_lock = threading.Lock()
 
 _IA_STRIKE_VOL_MIN  = 3.0   # strike vol ratio threshold — institutional footprint
@@ -2537,37 +2649,9 @@ def _compute_ia(tok: str):
 
         ps_data = list(_ps_cache.get("data", []))
         if not ps_data:
-            # Preserve the earlier working IA behaviour: if Power Strike has no
-            # candidates yet, use the strongest live equity movers and validate
-            # them against a fresh option chain below.  IA gates still decide
-            # whether a row is emitted; this only restores candidate discovery.
-            fallback_rows = sorted(
-                cache.get("data", []),
-                key=lambda item: abs(float(item.get("change") or 0)),
-                reverse=True,
-            )
-            for row in fallback_rows:
-                change = float(row.get("change") or 0)
-                if not row.get("ltp") or abs(change) < chg_min:
-                    continue
-                candidate = dict(row)
-                candidate.update({
-                    "direction": "bull" if change > 0 else "bear",
-                    "volRatio": row.get("volumeRatio", 0),
-                    "eq_score": 2 if abs(change) >= 2.5 else 1,
-                    "opt_data": {}, "strikes": [],
-                })
-                ps_data.append(candidate)
-                if len(ps_data) >= 12:
-                    break
-            print(f"[ia] PS empty — validating {len(ps_data)} top live movers directly")
-            if not ps_data:
-                _ia_cache.update({
-                    "data": [], "status": "ok", "updated_at": ist_now().strftime("%H:%M:%S IST"),
-                    "count": 0, "ce_signals": 0, "pe_signals": 0, "institutional": 0,
-                    "market_open": True, "mode": "live", "source": "screener_fallback",
-                })
-                return
+            print(f"[ia] PS has no candidates yet — skipping this IA run")
+            _ia_cache["status"] = "idle"
+            return
 
         # ── LIVE: Re-fetch FRESH option chains for each PS candidate ──────────
         # This is the key — we don't reuse stale PS option data from 5 min ago
@@ -2657,62 +2741,6 @@ def _compute_ia(tok: str):
                     "todayVol":  tv,
                 })
 
-        # A backend restart after the bell has no in-memory Power Strike option
-        # cache. Rebuild the final-session IA snapshot from fresh option chains
-        # for a bounded set of the strongest screener candidates.
-        needs_close_chain = source and not any(row.get("opt_data") for row in source)
-        if needs_close_chain:
-            source = sorted(source, key=lambda item: abs(float(item.get("change") or 0)), reverse=True)[:12]
-            sym_map = {s["symbol"]: s for s in SYMBOLS}
-            nearest_expiry = None
-            for candidate in source[:3]:
-                si = sym_map.get(candidate.get("symbol"))
-                if not si:
-                    continue
-                try:
-                    response = requests.post(
-                        f"{DHAN_BASE}/v2/optionchain/expirylist",
-                        json={"UnderlyingScrip": int(si["security_id"]), "UnderlyingSeg": "NSE_EQ"},
-                        headers=headers, timeout=10,
-                    )
-                    time.sleep(3)
-                    if response.status_code == 200:
-                        dates = response.json().get("data", [])
-                        if dates:
-                            nearest_expiry = dates[0]
-                            break
-                except Exception:
-                    continue
-
-            if nearest_expiry:
-                enriched = []
-                for candidate in source:
-                    si = sym_map.get(candidate.get("symbol"))
-                    if not si:
-                        enriched.append(candidate)
-                        continue
-                    fresh_opt, fresh_strikes = _ia_fetch_fresh_option_chain(
-                        tok, cid, si, candidate["ltp"], candidate["direction"],
-                        nearest_expiry, headers,
-                    )
-                    updated = dict(candidate)
-                    if fresh_opt:
-                        updated["opt_data"] = fresh_opt
-                        updated["strikes"] = fresh_strikes
-                        best = fresh_opt.get("best_strike")
-                        if best:
-                            is_bull = candidate["direction"] == "bull"
-                            updated.update({
-                                "best_strike": best["strike"],
-                                "best_ltp": best["ce_ltp"] if is_bull else best["pe_ltp"],
-                                "best_delta": best["ce_delta"] if is_bull else best["pe_delta"],
-                                "best_gamma": best["ce_gamma"] if is_bull else best["pe_gamma"],
-                                "best_iv": best["ce_iv"] if is_bull else best["pe_iv"],
-                            })
-                    enriched.append(updated)
-                source = enriched
-                source_type = "market_close_fresh"
-                print(f"[ia] rebuilt {len(source)} closed-market option candidates")
         print(f"[ia] {len(source)} candidates from {source_type} (closed market)")
 
     # ── Score each candidate ──────────────────────────────────────────────────
@@ -2848,7 +2876,12 @@ def _compute_ia(tok: str):
 
 
 def _run_ia_locked(tok: str):
-    with _ia_lock: _compute_ia(tok)
+    with _ia_lock:
+        previous = deepcopy(_ia_cache) if _ia_cache.get("data") else None
+        try:
+            _compute_ia(tok)
+        finally:
+            _retain_closed_session("ia", _ia_cache, previous)
 
 
 def _ia_stale() -> bool:
