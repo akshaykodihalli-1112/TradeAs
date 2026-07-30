@@ -2,7 +2,7 @@ from fastapi import FastAPI, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.background import BackgroundScheduler
 from contextlib import asynccontextmanager
-import requests, threading, time, os, json, csv, traceback
+import requests, threading, time, os, json, csv, traceback, re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from io import StringIO
@@ -5320,15 +5320,21 @@ _oi_action_service = install_oi_action(
 def get_rule_alerts():
     """Compact, cache-only alert feed for the dashboard floating notifier."""
     alerts = []
+    market_open = is_market_open()
 
     def add(source, symbol, title, message, tone, event_time, priority):
+        matches = re.findall(r"(\d{1,2}):(\d{2})", str(event_time or ""))
+        latest_minutes = (int(matches[-1][0]) * 60 + int(matches[-1][1])) if matches else -1
         alerts.append({
             "source": source, "symbol": symbol, "title": title,
             "message": message, "tone": tone, "time": event_time or "—",
-            "priority": priority,
+            "priority": priority, "time_order": latest_minutes,
         })
 
-    for row in list(_oi_action_service.cache.get("data", []))[:12]:
+    oi_rows = list(_oi_action_service.cache.get("data", []))[:12]
+    if market_open and not _oi_action_service.cache.get("market_open"):
+        oi_rows = []
+    for row in oi_rows:
         signal = str(row.get("signal", "NEUTRAL"))
         if signal == "NEUTRAL":
             continue
@@ -5339,7 +5345,10 @@ def get_rule_alerts():
             f"OI rules met · Bull {bull} / Bear {bear}", tone,
             row.get("signal_time"), 300 + abs(bull - bear))
 
-    for row in list(_ia_cache.get("data", []))[:10]:
+    ia_rows = list(_ia_cache.get("data", []))[:10]
+    if market_open and not _ia_cache.get("market_open"):
+        ia_rows = []
+    for row in ia_rows:
         direction = row.get("direction", "bull")
         tone = "bull" if direction == "bull" else "bear"
         score = int(row.get("score") or 0)
@@ -5347,7 +5356,10 @@ def get_rule_alerts():
             f"{row.get('grade', 'signal').title()} · {row.get('action', 'rule met')}",
             tone, row.get("signal_time"), 200 + score)
 
-    for row in list(_ois_cache.get("data", []))[:10]:
+    ois_rows = list(_ois_cache.get("data", []))[:10]
+    if market_open and not _ois_cache.get("market_open"):
+        ois_rows = []
+    for row in ois_rows:
         direction = row.get("direction", "bull")
         tone = "bull" if direction == "bull" else "bear"
         score = int(row.get("ois_score") or 0)
@@ -5355,7 +5367,10 @@ def get_rule_alerts():
             f"Score {score}/100 · {row.get('action', 'rule met')}",
             tone, row.get("signal_time"), 100 + score)
 
-    for row in list(_bk_cache.get("data", []))[:8]:
+    breakout_rows = list(_bk_cache.get("data", []))[:8]
+    if market_open and not _bk_cache.get("market_open"):
+        breakout_rows = []
+    for row in breakout_rows:
         direction = row.get("direction", "bull")
         tone = "bull" if direction == "bull" else "bear"
         move = abs(float(row.get("move_pct") or 0))
@@ -5364,11 +5379,13 @@ def get_rule_alerts():
             f"Opening-range rule met · {move:.2f}%", tone,
             row.get("signal_time"), 50 + move)
 
-    alerts.sort(key=lambda item: item["priority"], reverse=True)
+    alerts.sort(key=lambda item: (item["time_order"], item["priority"]), reverse=True)
     for item in alerts:
         item.pop("priority", None)
+        item.pop("time_order", None)
     return {
         "status": "ok", "data": alerts[:20], "count": len(alerts),
-        "market_open": is_market_open(),
+        "market_open": market_open,
+        "session_date": _last_trading_day(),
         "updated_at": ist_now().strftime("%H:%M:%S IST"),
     }
