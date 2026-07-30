@@ -522,21 +522,33 @@ def run_screener(tok, force=False):
 
                 prev_close = q.get("prev_close", 0.0)
                 change_source = q.get("prev_source", "quote")
+                try:
+                    quote_net_change = float(q.get("net_change"))
+                except (TypeError, ValueError):
+                    quote_net_change = 0.0
+                # Dhan defines net_change as the absolute move from the previous
+                # session close. Keep that direct reference whenever it is valid;
+                # historical candles are only a fallback for missing/settled-zero
+                # quote responses.
+                quote_prev_reliable = (
+                    change_source == "net_change"
+                    and prev_close > 0
+                    and abs(quote_net_change) > 1e-9
+                )
                 if hist:
                     closes  = hist.get("close",  [])
                     volumes = hist.get("volume", [])
 
-                    # Historical candles are not the daily-change source. They are
-                    # retained only for momentum and average-volume calculations.
+                    # Historical candles primarily support momentum and average
+                    # volume; they also provide the previous-close fallback below.
                     if closes and abs(closes[-1] - ltp) / max(ltp, 0.01) < 0.001:
                         ref_closes = closes  # today already appended by Dhan
                     else:
                         ref_closes = closes + [ltp]  # append today manually
-                    # After close use completed daily candles as the authoritative
-                    # session reference.  This prevents a settled net_change=0
-                    # response from turning every stock into a 0.00% mover.
+                    # Fall back to completed daily candles only when Dhan did not
+                    # provide a usable non-zero net_change reference.
                     hist_prev, hist_source = _historical_previous_close(hist, ltp)
-                    if hist_prev > 0:
+                    if not quote_prev_reliable and hist_prev > 0:
                         prev_close = hist_prev
                         change_source = hist_source
 
