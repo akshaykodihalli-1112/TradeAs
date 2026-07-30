@@ -2278,9 +2278,9 @@ def _ois_stale() -> bool:
     try:
         t = datetime.strptime(last, "%H:%M:%S IST").replace(
             year=ist_now().year, month=ist_now().month, day=ist_now().day, tzinfo=IST)
-        # Keep the visible OI Strategy page on a real two-minute cadence even
-        # after the market closes. Market-closed calculations use settled data.
-        return (ist_now() - t).seconds > 120
+        # The HTML still checks every two minutes, but settled after-hours data
+        # is served from cache so it does not repeatedly consume Dhan credits.
+        return (ist_now() - t).seconds > (120 if is_market_open() else 3600)
     except:
         return True
 
@@ -2885,14 +2885,14 @@ def _run_ia_locked(tok: str):
 
 
 def _ia_stale() -> bool:
-    """Stale after two minutes in both live and settled-market modes."""
+    """Refresh live scans in two minutes; reuse settled data after hours."""
     last = _ia_cache.get("updated_at")
     if not last: return True
     try:
         t = datetime.strptime(last, "%H:%M:%S IST").replace(
             year=ist_now().year, month=ist_now().month,
             day=ist_now().day, tzinfo=IST)
-        return (ist_now() - t).seconds > 120
+        return (ist_now() - t).seconds > (120 if is_market_open() else 3600)
     except:
         return True
 
