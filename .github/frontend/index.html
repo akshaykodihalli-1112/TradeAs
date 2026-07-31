@@ -291,8 +291,12 @@ tbody tr{border-color:rgba(27,39,56,.85)}tbody tr:nth-child(even){background:rgb
 
 .density-comfortable td{height:49px;padding-top:10px;padding-bottom:10px}.density-comfortable thead th{height:40px}.density-comfortable .nav-item{height:43px}
 @media(max-width:1100px){.page-context,.session-clock,.density-label{display:none}.sidebar{width:196px}.grid{grid-template-columns:1.35fr 1fr}.grid>.panel:last-child{display:none}}
-@media(max-width:760px){.oia-breakdowns{grid-template-columns:1fr}.oia-modal{padding:12px}.sidebar{width:66px}.nav-group-title,.nav-label,.sidebar-footer{display:none}.nav-item{padding:0 11px}.brand-sub,.topbar .hm{display:none}.topbar{padding:0 9px}.top-actions .btn:not(.p){display:none}.stats,.bk-stats{padding:8px;gap:7px}.grid,.bk-grid{padding:0 8px 8px;grid-template-columns:1fr}.grid>.panel:not(:first-child){display:none}}
-@media(max-width:520px){.rule-alert-wrap{right:12px}.rule-alert-peek{position:fixed;left:12px;right:12px;bottom:108px;width:auto}}
+@media(max-width:760px){
+  .oia-breakdowns{grid-template-columns:1fr}.oia-modal{padding:12px}.sidebar{width:66px}.nav-group-title,.nav-label,.sidebar-footer{display:none}.nav-item{padding:0 11px}.brand-sub,.topbar .hm{display:none}.topbar{padding:0 9px}.top-actions .btn:not(.p):not(.mobile-connect){display:none}.stats,.bk-stats{padding:8px;gap:7px}.grid,.bk-grid{padding:0 8px 8px;grid-template-columns:1fr}.grid>.panel:not(:first-child){display:none}
+  .mobile-connect{display:inline-flex!important;width:38px;padding:0;align-items:center;justify-content:center}.mobile-connect .btn-icon{margin:0}.connection-label{display:none}
+  .creds{padding:10px;align-items:flex-start;overflow-y:auto;-webkit-overflow-scrolling:touch}.credentials-card{margin-top:max(10px,env(safe-area-inset-top));padding:16px;max-height:calc(100vh - 20px);max-height:calc(100dvh - 20px);overflow-y:auto}.credentials-grid{grid-template-columns:1fr;gap:12px}.credentials-card .ci{height:46px;font-size:16px}.credentials-actions{position:sticky;bottom:-16px;margin:18px -16px -16px;padding:12px 16px calc(12px + env(safe-area-inset-bottom));background:#0b1018;border-top:1px solid var(--border)}.credentials-actions .btn{display:inline-flex;align-items:center;justify-content:center;min-height:42px}
+}
+@media(max-width:520px){.bname,.top-divider{display:none}.top-actions{gap:6px}.rule-alert-wrap{right:12px}.rule-alert-peek{position:fixed;left:12px;right:12px;bottom:108px;width:auto}}
 </style>
 <body>
 <div class="shell">
@@ -320,7 +324,7 @@ tbody tr{border-color:rgba(27,39,56,.85)}tbody tr:nth-child(even){background:rgb
   </div>
   <div class="top-actions">
     <button class="btn" id="densityBtn" onclick="toggleDensity()" title="Switch table density"><span class="btn-icon">&#8645;</span><span class="density-label">Compact</span></button>
-    <button class="btn" onclick="toggleCreds()"><span class="btn-icon">&#9881;</span>Connection</button>
+    <button class="btn mobile-connect" id="connectionBtn" onclick="toggleCreds()" aria-label="Open connection settings" title="Connection"><span class="btn-icon">&#9881;</span><span class="connection-label">Connection</span></button>
     <button class="btn" onclick="doExport()"><span class="btn-icon">&#8595;</span>CSV</button>
     <button class="btn p" onclick="manualRefresh()"><span class="btn-icon">&#8635;</span>Refresh</button>
   </div>
@@ -1123,6 +1127,9 @@ document.addEventListener("keydown",event=>{
 if(C.url)document.getElementById("iUrl").value=C.url;
 if(C.cid)document.getElementById("iCid").value=C.cid;
 if(C.tok)document.getElementById("iTok").value=C.tok;
+if(!C.url&&window.matchMedia("(max-width:760px)").matches){
+  setTimeout(()=>document.getElementById("cBar").classList.add("open"),250);
+}
 switchPage(currentPage,true);
 if(C.url&&C.tok){document.getElementById("fUrl").textContent=C.url;setTimeout(()=>{fetchAll();startLtpTimer();startRuleAlerts();if(currentPage==="oi-action")fetchOIAction(false);else if(currentPage==="oistrategy")fetchOIS(false);else if(currentPage==="institutional")fetchIA(false);},300);}
 
